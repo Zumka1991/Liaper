@@ -1,3 +1,7 @@
+mod archives;
+mod attachments;
+#[cfg(test)]
+mod persistence_tests;
 mod state;
 mod ws;
 
@@ -24,6 +28,7 @@ use crate::state::{ControlState, StoredUser};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -40,11 +45,22 @@ async fn main() -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all("releases");
     let state = ControlState::new(storage_path);
     if let Ok(db_url) = std::env::var("DATABASE_URL") {
-        state.init_postgres(&db_url).await;
+        state.init_postgres(&db_url).await?;
     }
 
     let app = Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/storage/usage", get(attachments::usage))
+        .route("/api/storage/committed", post(attachments::node_commit))
+        .route("/api/attachments", post(attachments::reserve))
+        .route("/api/attachments/:id/complete", post(attachments::complete))
+        .route("/api/attachments/:id/download", get(attachments::download))
+        .route("/api/lesson-archives", get(archives::list))
+        .route("/api/lesson-archives/unlock", post(archives::unlock))
+        .route(
+            "/api/lesson-archives/:archive_id",
+            axum::routing::put(archives::put),
+        )
         // Авторизация и каталог @ников
         .route("/api/auth/register", post(register_handler))
         .route("/api/auth/login", post(login_handler))
@@ -76,10 +92,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn health_handler() -> Json<serde_json::Value> {
+async fn health_handler(State(state): State<Arc<ControlState>>) -> Json<serde_json::Value> {
+    let database_connected = state
+        .pg_client
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|client| !client.is_closed());
     Json(serde_json::json!({
         "status": "ok",
         "service": "liaper-control-server",
+        "storage": if database_connected { "postgresql" } else { "json" },
+        "database_connected": database_connected,
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -96,7 +120,9 @@ async fn register_handler(
     if username.len() < 3 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Ник должен содержать минимум 3 символа (латиница, цифры, _)" })),
+            Json(
+                serde_json::json!({ "error": "Ник должен содержать минимум 3 символа (латиница, цифры, _)" }),
+            ),
         ));
     }
     if req.password.len() < 4 {
@@ -132,6 +158,13 @@ async fn register_handler(
         key_fingerprint: req.key_fingerprint,
     };
 
+    state.persist_user(&stored).await.map_err(|e| {
+        tracing::error!("User persistence failed: {}", e);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"Не удалось сохранить профиль в базе"})),
+        )
+    })?;
     state.user_id_by_username.insert(username, user_id);
     state.users_by_id.insert(user_id, stored.clone());
     state.save_users_to_disk();
@@ -197,7 +230,15 @@ async fn login_handler(
     }
 
     let public_profile = user.to_public(true);
+    let updated_user = user.clone();
     drop(user);
+    state.persist_user(&updated_user).await.map_err(|e| {
+        tracing::error!("User persistence failed: {}", e);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error":"База данных недоступна"})),
+        )
+    })?;
     state.save_users_to_disk();
 
     let token = ControlState::generate_token();
@@ -336,7 +377,7 @@ async fn publish_release_handler(
     State(state): State<Arc<ControlState>>,
     Json(req): Json<PublishReleaseRequest>,
 ) -> Result<Json<AppReleaseManifest>, (StatusCode, Json<serde_json::Value>)> {
-    if req.admin_secret != state.admin_secret {
+    if state.admin_secret.as_deref() != Some(req.admin_secret.as_str()) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "Неверный секретный ключ администратора релизов" })),
@@ -380,6 +421,43 @@ async fn ws_upgrade_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn release_publication_requires_configured_secret() {
+        let dir = std::env::temp_dir().join(format!("liaper_publish_test_{}", Uuid::new_v4()));
+        let mut state = ControlState::new(dir.join("users.json"));
+        Arc::get_mut(&mut state).unwrap().admin_secret = None;
+        let manifest = state
+            .releases
+            .get(&AppPlatform::AndroidArm64)
+            .unwrap()
+            .clone();
+        for secret in ["", "liaper-release-secret-2026"] {
+            let result = publish_release_handler(
+                State(state.clone()),
+                Json(PublishReleaseRequest {
+                    admin_secret: secret.to_string(),
+                    manifest: manifest.clone(),
+                }),
+            )
+            .await;
+            assert_eq!(
+                result.err().map(|(status, _)| status),
+                Some(StatusCode::FORBIDDEN)
+            );
+        }
+        Arc::get_mut(&mut state).unwrap().admin_secret = Some("test-only-secret".to_string());
+        let result = publish_release_handler(
+            State(state.clone()),
+            Json(PublishReleaseRequest {
+                admin_secret: "test-only-secret".to_string(),
+                manifest,
+            }),
+        )
+        .await;
+        assert!(result.is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn test_node_load_balancer_routes_to_least_loaded() {

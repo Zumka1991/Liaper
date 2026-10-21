@@ -1,17 +1,30 @@
-# liaper_android
+# Liaper для Android
 
-A new Flutter project.
+Мобильный клиент для репетиторов и учеников: контакты, уроки, личные сообщения и локальный архив переписки.
 
-## Getting Started
+## Запуск и проверки
 
-This project is a starting point for a Flutter application.
+Из `clients/android`:
 
-A few resources to get you started if this is your first Flutter project:
+```powershell
+flutter pub get
+flutter analyze
+flutter test
+flutter build apk --debug
+```
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+Тестовый APK: `build/app/outputs/flutter-apk/app-debug.apk`. Это отладочная сборка; для распространения нужна отдельная release-подпись.
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+## Подключение
+
+На экране входа откройте «Настроить адрес сервера». На физическом телефоне укажите адрес компьютера в локальной сети, например `http://192.168.1.10:4000`, либо HTTPS-адрес развёрнутого сервера. `127.0.0.1` на телефоне указывает на сам телефон. Для стандартного Android Emulator адрес хоста — `10.0.2.2`.
+
+Адрес медиа-ноды, который возвращает сервер, тоже должен быть доступен телефону. В Docker настройте `PUBLIC_HOST`; для внешнего подключения нужен TLS для API и медиа-сокета.
+
+Камера и микрофон запрашиваются при начале звонка. Если доступ запрещён, проверьте разрешения Liaper в настройках Android.
+
+## Архивы
+
+Новые архивы хранятся отдельно для каждого аккаунта на устройстве. Старый общий ключ `liaper_chat_archives` сохранён, но автоматически не импортируется: в нём нет сведений о владельце. Архивы не синхронизируются между устройствами.
+
+Результаты проверки интерфейса и ограничения текущего протокола описаны в [аудите](../../docs/UX_UI_AUDIT.md).

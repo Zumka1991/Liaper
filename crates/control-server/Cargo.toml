@@ -22,7 +22,9 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+reqwest.workspace = true
 sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
+dotenvy = "0.15"
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"] }

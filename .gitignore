@@ -6,6 +6,7 @@
 node_modules/
 clients/web-desktop/dist/
 clients/web-desktop/src-tauri/target/
+clients/web-desktop/src-tauri/gen/
 
 # Flutter / Android
 clients/android/build/
@@ -19,6 +20,10 @@ clients/android/android/.kotlin/
 
 # Runtime data & large binary release artifacts
 /data/*.json
+/data/postgres/
+/data/*.postgres-imported
+.env
+.env.local
 /releases/*.apk
 /releases/*.exe
 /releases/*.AppImage
@@ -30,3 +35,4 @@ Thumbs.db
 .idea/
 .vscode/
 *.log
+/data/files/

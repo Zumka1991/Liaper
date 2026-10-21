@@ -64,6 +64,7 @@ pub struct ControlState {
     pub contact_requests: DashMap<Uuid, StoredContactRequest>,
     pub media_nodes: DashMap<String, MediaNodeInfo>,
     pub rooms: DashMap<Uuid, RoomInfo>,
+    pub room_invitations: DashMap<Uuid, HashSet<Uuid>>,
     pub room_key_envelopes: DashMap<(Uuid, Uuid), Vec<E2eeKeyEnvelope>>,
     pub room_chats: DashMap<Uuid, Vec<EncryptedChatMessage>>,
     pub releases: DashMap<AppPlatform, AppReleaseManifest>,
@@ -71,8 +72,9 @@ pub struct ControlState {
     pub contacts_path: PathBuf,
     pub chats_path: PathBuf,
     pub releases_path: PathBuf,
-    pub admin_secret: String,
+    pub admin_secret: Option<String>,
     pub pg_client: tokio::sync::RwLock<Option<Arc<tokio_postgres::Client>>>,
+    pub contact_mutations: tokio::sync::Mutex<()>,
 }
 
 impl ControlState {
@@ -84,7 +86,8 @@ impl ControlState {
         let chats_path = base_dir.join("chats.json");
         let releases_path = base_dir.join("releases.json");
         let admin_secret = std::env::var("LIAPER_ADMIN_SECRET")
-            .unwrap_or_else(|_| "liaper-release-secret-2026".to_string());
+            .ok()
+            .filter(|secret| !secret.trim().is_empty());
 
         let state = Arc::new(Self {
             users_by_id: DashMap::new(),
@@ -95,6 +98,7 @@ impl ControlState {
             contact_requests: DashMap::new(),
             media_nodes: DashMap::new(),
             rooms: DashMap::new(),
+            room_invitations: DashMap::new(),
             room_key_envelopes: DashMap::new(),
             room_chats: DashMap::new(),
             releases: DashMap::new(),
@@ -104,6 +108,7 @@ impl ControlState {
             releases_path,
             admin_secret,
             pg_client: tokio::sync::RwLock::new(None),
+            contact_mutations: tokio::sync::Mutex::new(()),
         });
         state.load_users_from_disk();
         state.load_contacts_from_disk();
@@ -112,105 +117,134 @@ impl ControlState {
         state
     }
 
-    /// Подключение к PostgreSQL (если задан DATABASE_URL в Docker или окружении)
-    pub async fn init_postgres(&self, database_url: &str) {
-        match tokio_postgres::connect(database_url, tokio_postgres::NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move {
-                    if let Err(e) = connection.await {
-                        tracing::error!("PostgreSQL connection error: {}", e);
-                    }
-                });
-
-                let schema_sql = include_str!("../../../docker/init.sql");
-                if let Err(e) = client.batch_execute(schema_sql).await {
-                    tracing::warn!("PostgreSQL schema init warning: {}", e);
-                }
-
-                // Загружаем пользователей из PostgreSQL
-                if let Ok(rows) = client
-                    .query(
-                        "SELECT id, username, display_name, role, password_hash, password_salt, e2ee_public_key, key_fingerprint FROM users",
-                        &[],
-                    )
-                    .await
-                {
-                    for row in rows {
-                        let id: Uuid = row.get(0);
-                        let username: String = row.get(1);
-                        let display_name: String = row.get(2);
-                        let role_str: String = row.get(3);
-                        let password_hash: String = row.get(4);
-                        let salt_b64: String = row.get(5);
-                        let e2ee_public_key: String = row.get(6);
-                        let key_fingerprint: String = row.get(7);
-                        let role = if role_str == "tutor" {
-                            UserRole::Tutor
-                        } else {
-                            UserRole::Student
-                        };
-                        self.user_id_by_username.insert(username.clone(), id);
-                        self.users_by_id.insert(
-                            id,
-                            StoredUser {
-                                id,
-                                username,
-                                display_name,
-                                password_hash,
-                                salt_b64,
-                                role,
-                                e2ee_public_key,
-                                key_fingerprint,
-                            },
-                        );
-                    }
-                }
-
-                // Загружаем взаимные контакты из PostgreSQL
-                if let Ok(rows) = client.query("SELECT user_a, user_b FROM contacts", &[]).await {
-                    for row in rows {
-                        let a: Uuid = row.get(0);
-                        let b: Uuid = row.get(1);
-                        self.contacts_by_user.entry(a).or_default().insert(b);
-                        self.contacts_by_user.entry(b).or_default().insert(a);
-                    }
-                }
-
-                // Загружаем историю сообщений из PostgreSQL
-                if let Ok(rows) = client
-                    .query(
-                        "SELECT id, room_id, sender_id, sender_username, sender_display_name, ciphertext_b64, iv_b64, room_key_id, created_at FROM chat_messages ORDER BY created_at ASC",
-                        &[],
-                    )
-                    .await
-                {
-                    for row in rows {
-                        let msg = EncryptedChatMessage {
-                            id: row.get(0),
-                            room_id: row.get(1),
-                            sender_id: row.get(2),
-                            sender_username: row.get(3),
-                            sender_display_name: row.get(4),
-                            ciphertext_b64: row.get(5),
-                            iv_b64: row.get(6),
-                            room_key_id: row.get(7),
-                            created_at: row.get(8),
-                        };
-                        self.room_chats.entry(msg.room_id).or_default().push(msg);
-                    }
-                }
-
-                let mut guard = self.pg_client.write().await;
-                *guard = Some(Arc::new(client));
-                tracing::info!("Connected to PostgreSQL database successfully");
+    /// Import existing local records once, then load PostgreSQL as the source of truth.
+    pub async fn init_postgres(&self, database_url: &str) -> anyhow::Result<()> {
+        let (client, connection) =
+            tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                tracing::error!("PostgreSQL connection lost: {}", e);
             }
-            Err(err) => {
-                tracing::warn!(
-                    "PostgreSQL not reachable ({}), using local JSON storage in data/",
-                    err
-                );
+        });
+        client
+            .batch_execute(include_str!("../../../docker/init.sql"))
+            .await?;
+        let client = Arc::new(client);
+        // Import legacy JSON once for this database, not on every restart.
+        let migration_path = self.storage_path.with_extension("postgres-imported");
+        let migration_id = format!("{:x}", Sha256::digest(database_url.as_bytes()));
+        let needs_import =
+            std::fs::read_to_string(&migration_path).ok().as_deref() != Some(migration_id.as_str());
+        if needs_import {
+            for entry in self.users_by_id.iter() {
+                let user = entry.value().clone();
+                self.write_user(&client, &user).await?;
+            }
+            for entry in self.contacts_by_user.iter() {
+                let a = *entry.key();
+                for b in entry.value().iter() {
+                    if a < *b {
+                        client.execute("INSERT INTO contacts (user_a,user_b) VALUES ($1,$2) ON CONFLICT DO NOTHING", &[&a,b]).await?;
+                    }
+                }
+            }
+            for entry in self.contact_requests.iter() {
+                let req = entry.value().clone();
+                client.execute("INSERT INTO contact_requests (id,from_user_id,to_user_id,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING", &[&req.id,&req.from_user_id,&req.to_user_id,&req.created_at]).await?;
+            }
+            for entry in self.room_chats.iter() {
+                let messages = entry.value().clone();
+                for msg in messages {
+                    Self::write_chat(&client, &msg).await?;
+                }
             }
         }
+        // Clear local copies before loading; otherwise JSON + PG duplicated every message.
+        self.users_by_id.clear();
+        self.user_id_by_username.clear();
+        for row in client.query("SELECT id,username,display_name,role,password_hash,password_salt,e2ee_public_key,key_fingerprint FROM users", &[]).await? {
+            let user = StoredUser {
+                id: row.get(0), username: row.get(1), display_name: row.get(2),
+                role: if row.get::<_,String>(3) == "tutor" { UserRole::Tutor } else { UserRole::Student },
+                password_hash: row.get(4), salt_b64: row.get(5), e2ee_public_key: row.get(6), key_fingerprint: row.get(7),
+            };
+            self.user_id_by_username.insert(user.username.clone(),user.id);
+            self.users_by_id.insert(user.id,user);
+        }
+        self.contacts_by_user.clear();
+        for row in client
+            .query("SELECT user_a,user_b FROM contacts", &[])
+            .await?
+        {
+            let a: Uuid = row.get(0);
+            let b: Uuid = row.get(1);
+            self.contacts_by_user.entry(a).or_default().insert(b);
+            self.contacts_by_user.entry(b).or_default().insert(a);
+        }
+        self.contact_requests.clear();
+        for row in client
+            .query(
+                "SELECT id,from_user_id,to_user_id,created_at FROM contact_requests",
+                &[],
+            )
+            .await?
+        {
+            let req = StoredContactRequest {
+                id: row.get(0),
+                from_user_id: row.get(1),
+                to_user_id: row.get(2),
+                created_at: row.get(3),
+            };
+            self.contact_requests.insert(req.id, req);
+        }
+        self.room_chats.clear();
+        for row in client.query("SELECT id,room_id,sender_id,sender_username,sender_display_name,ciphertext_b64,iv_b64,room_key_id,created_at FROM chat_messages ORDER BY created_at ASC", &[]).await? {
+            let msg=EncryptedChatMessage{id:row.get(0),room_id:row.get(1),sender_id:row.get(2),sender_username:row.get(3),sender_display_name:row.get(4),ciphertext_b64:row.get(5),iv_b64:row.get(6),room_key_id:row.get(7),created_at:row.get(8)};
+            self.room_chats.entry(msg.room_id).or_default().push(msg);
+        }
+        if let Some(parent) = migration_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&migration_path, migration_id)?;
+        *self.pg_client.write().await = Some(client);
+        tracing::info!("PostgreSQL ready: users, contacts, encrypted messages and lesson archives");
+        Ok(())
+    }
+
+    async fn write_user(
+        &self,
+        client: &tokio_postgres::Client,
+        u: &StoredUser,
+    ) -> Result<(), tokio_postgres::Error> {
+        let role = if u.role == UserRole::Tutor {
+            "tutor"
+        } else {
+            "student"
+        };
+        client.execute("INSERT INTO users (id,username,display_name,role,password_hash,password_salt,e2ee_public_key,key_fingerprint) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET display_name=EXCLUDED.display_name,e2ee_public_key=EXCLUDED.e2ee_public_key,key_fingerprint=EXCLUDED.key_fingerprint", &[&u.id,&u.username,&u.display_name,&role,&u.password_hash,&u.salt_b64,&u.e2ee_public_key,&u.key_fingerprint]).await?;
+        Ok(())
+    }
+
+    pub async fn persist_user(&self, user: &StoredUser) -> anyhow::Result<()> {
+        if let Some(client) = self.pg_client.read().await.clone() {
+            self.write_user(&client, user).await?;
+        }
+        Ok(())
+    }
+
+    async fn write_chat(
+        client: &tokio_postgres::Client,
+        m: &EncryptedChatMessage,
+    ) -> Result<(), tokio_postgres::Error> {
+        client.execute("INSERT INTO chat_messages (id,room_id,sender_id,sender_username,sender_display_name,ciphertext_b64,iv_b64,room_key_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING", &[&m.id,&m.room_id,&m.sender_id,&m.sender_username,&m.sender_display_name,&m.ciphertext_b64,&m.iv_b64,&m.room_key_id,&m.created_at]).await?;
+        Ok(())
+    }
+
+    pub async fn persist_chat(&self, msg: &EncryptedChatMessage) -> anyhow::Result<()> {
+        if let Some(client) = self.pg_client.read().await.clone() {
+            Self::write_chat(&client, msg).await?;
+        }
+        Ok(())
     }
 
     pub fn normalize_username(raw: &str) -> String {
@@ -266,39 +300,6 @@ impl ControlState {
         if let Ok(json) = serde_json::to_string_pretty(&all_users) {
             let _ = std::fs::write(&self.storage_path, json);
         }
-
-        if let Ok(guard) = self.pg_client.try_read() {
-            if let Some(client) = guard.clone() {
-                tokio::spawn(async move {
-                    for u in all_users {
-                        let role_str = match u.role {
-                            UserRole::Tutor => "tutor",
-                            UserRole::Student => "student",
-                        };
-                        let _ = client
-                            .execute(
-                                "INSERT INTO users (id, username, display_name, role, password_hash, password_salt, e2ee_public_key, key_fingerprint)
-                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                                 ON CONFLICT (id) DO UPDATE SET
-                                    display_name = EXCLUDED.display_name,
-                                    e2ee_public_key = EXCLUDED.e2ee_public_key,
-                                    key_fingerprint = EXCLUDED.key_fingerprint",
-                                &[
-                                    &u.id,
-                                    &u.username,
-                                    &u.display_name,
-                                    &role_str,
-                                    &u.password_hash,
-                                    &u.salt_b64,
-                                    &u.e2ee_public_key,
-                                    &u.key_fingerprint,
-                                ],
-                            )
-                            .await;
-                    }
-                });
-            }
-        }
     }
 
     pub fn load_contacts_from_disk(&self) {
@@ -340,21 +341,88 @@ impl ControlState {
         if let Ok(json) = serde_json::to_string_pretty(&snap) {
             let _ = std::fs::write(&self.contacts_path, json);
         }
+    }
 
-        if let Ok(guard) = self.pg_client.try_read() {
-            if let Some(client) = guard.clone() {
-                tokio::spawn(async move {
-                    for (a, b) in pairs {
-                        let _ = client
-                            .execute(
-                                "INSERT INTO contacts (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                                &[&a, &b],
-                            )
-                            .await;
+    pub async fn persist_contact_request(&self, req: &StoredContactRequest) -> anyhow::Result<()> {
+        if let Some(client) = self.pg_client.read().await.clone() {
+            client.execute("INSERT INTO contact_requests (id,from_user_id,to_user_id,created_at) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING", &[&req.id,&req.from_user_id,&req.to_user_id,&req.created_at]).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn persist_contact_decision(
+        &self,
+        a: Uuid,
+        b: Uuid,
+        request_id: Uuid,
+        accept: bool,
+    ) -> anyhow::Result<()> {
+        if accept {
+            self.validate_student_addition(a, b)?;
+        }
+        if let Some(client) = self.pg_client.read().await.clone() {
+            if accept {
+                let result: String = client
+                    .query_one("SELECT accept_tutor_student($1,$2)", &[&request_id, &b])
+                    .await?
+                    .get(0);
+                anyhow::ensure!(
+                    result == "accepted",
+                    match result.as_str() {
+                        "limit" =>
+                            "У преподавателя уже 10 учеников. Сначала удалите одного из списка",
+                        "role" =>
+                            "Добавлять в контакты может только преподаватель и только учеников",
+                        _ => "Заявка больше не доступна",
                     }
-                });
+                );
+            } else {
+                client
+                    .execute("DELETE FROM contact_requests WHERE id=$1", &[&request_id])
+                    .await?;
             }
         }
+        Ok(())
+    }
+
+    pub fn student_count(&self, tutor: Uuid) -> usize {
+        self.contacts_by_user
+            .get(&tutor)
+            .map(|contacts| {
+                contacts
+                    .iter()
+                    .filter(|id| {
+                        self.users_by_id
+                            .get(id)
+                            .is_some_and(|u| u.role == UserRole::Student)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+    pub fn validate_student_addition(&self, tutor: Uuid, student: Uuid) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.users_by_id
+                .get(&tutor)
+                .is_some_and(|u| u.role == UserRole::Tutor)
+                && self
+                    .users_by_id
+                    .get(&student)
+                    .is_some_and(|u| u.role == UserRole::Student),
+            "Добавлять в контакты может только преподаватель и только учеников"
+        );
+        anyhow::ensure!(
+            self.are_contacts(&tutor, &student) || self.student_count(tutor) < 10,
+            "У преподавателя уже 10 учеников. Сначала удалите одного из списка"
+        );
+        Ok(())
+    }
+
+    pub async fn persist_contact_removal(&self, a: Uuid, b: Uuid) -> anyhow::Result<()> {
+        if let Some(client) = self.pg_client.read().await.clone() {
+            client.execute("DELETE FROM contacts WHERE (user_a=$1 AND user_b=$2) OR (user_a=$2 AND user_b=$1)", &[&a,&b]).await?;
+        }
+        Ok(())
     }
 
     pub fn load_chats_from_disk(&self) {
@@ -367,7 +435,7 @@ impl ControlState {
         }
     }
 
-    pub fn save_chats_to_disk(&self, new_msg: Option<EncryptedChatMessage>) {
+    pub fn save_chats_to_disk(&self) {
         if let Some(parent) = self.chats_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -377,33 +445,6 @@ impl ControlState {
         }
         if let Ok(json) = serde_json::to_string_pretty(&all_msgs) {
             let _ = std::fs::write(&self.chats_path, json);
-        }
-
-        if let Some(msg) = new_msg {
-            if let Ok(guard) = self.pg_client.try_read() {
-                if let Some(client) = guard.clone() {
-                    tokio::spawn(async move {
-                        let _ = client
-                            .execute(
-                                "INSERT INTO chat_messages (id, room_id, sender_id, sender_username, sender_display_name, ciphertext_b64, iv_b64, room_key_id, created_at)
-                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-                                 ON CONFLICT (id) DO NOTHING",
-                                &[
-                                    &msg.id,
-                                    &msg.room_id,
-                                    &msg.sender_id,
-                                    &msg.sender_username,
-                                    &msg.sender_display_name,
-                                    &msg.ciphertext_b64,
-                                    &msg.iv_b64,
-                                    &msg.room_key_id,
-                                    &msg.created_at,
-                                ],
-                            )
-                            .await;
-                    });
-                }
-            }
         }
     }
 
@@ -424,8 +465,14 @@ impl ControlState {
     }
 
     pub fn add_mutual_contact(&self, user_a: Uuid, user_b: Uuid) {
-        self.contacts_by_user.entry(user_a).or_default().insert(user_b);
-        self.contacts_by_user.entry(user_b).or_default().insert(user_a);
+        self.contacts_by_user
+            .entry(user_a)
+            .or_default()
+            .insert(user_b);
+        self.contacts_by_user
+            .entry(user_b)
+            .or_default()
+            .insert(user_a);
         self.save_contacts_to_disk();
     }
 
@@ -530,9 +577,12 @@ impl ControlState {
                 version: "0.1.0".to_string(),
                 build_number: 1,
                 release_notes: "Базовый выпуск Liaper Desktop для Windows.".to_string(),
-                download_url: "http://127.0.0.1:4000/releases/liaper_0.1.0_x64-setup.exe".to_string(),
-                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                signature: "dW50cnVzdGVkIGNvbW1lbnQ6IGxpYXBlci1lZDI1NTE5LXNpZ25hdHVyZS12MQ==".to_string(),
+                download_url: "http://127.0.0.1:4000/releases/liaper_0.1.0_x64-setup.exe"
+                    .to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                signature: "dW50cnVzdGVkIGNvbW1lbnQ6IGxpYXBlci1lZDI1NTE5LXNpZ25hdHVyZS12MQ=="
+                    .to_string(),
                 file_size_bytes: 8_420_000,
                 mandatory: false,
                 published_at: now,
@@ -542,9 +592,12 @@ impl ControlState {
                 version: "0.1.0".to_string(),
                 build_number: 1,
                 release_notes: "Базовый выпуск Liaper Desktop для Linux.".to_string(),
-                download_url: "http://127.0.0.1:4000/releases/liaper_0.1.0_amd64.AppImage".to_string(),
-                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                signature: "dW50cnVzdGVkIGNvbW1lbnQ6IGxpYXBlci1lZDI1NTE5LXNpZ25hdHVyZS12MQ==".to_string(),
+                download_url: "http://127.0.0.1:4000/releases/liaper_0.1.0_amd64.AppImage"
+                    .to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                signature: "dW50cnVzdGVkIGNvbW1lbnQ6IGxpYXBlci1lZDI1NTE5LXNpZ25hdHVyZS12MQ=="
+                    .to_string(),
                 file_size_bytes: 11_200_000,
                 mandatory: false,
                 published_at: now,
@@ -554,9 +607,12 @@ impl ControlState {
                 version: "0.1.0".to_string(),
                 build_number: 1,
                 release_notes: "Базовый выпуск Liaper Mobile для Android.".to_string(),
-                download_url: "http://127.0.0.1:4000/releases/liaper-android-arm64-v0.1.0.apk".to_string(),
-                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                signature: "dW50cnVzdGVkIGNvbW1lbnQ6IGxpYXBlci1lZDI1NTE5LXNpZ25hdHVyZS12MQ==".to_string(),
+                download_url: "http://127.0.0.1:4000/releases/liaper-android-arm64-v0.1.0.apk"
+                    .to_string(),
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+                signature: "dW50cnVzdGVkIGNvbW1lbnQ6IGxpYXBlci1lZDI1NTE5LXNpZ25hdHVyZS12MQ=="
+                    .to_string(),
                 file_size_bytes: 19_650_000,
                 mandatory: false,
                 published_at: now,
@@ -573,11 +629,8 @@ impl ControlState {
         if let Some(parent) = self.releases_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let all: Vec<AppReleaseManifest> = self
-            .releases
-            .iter()
-            .map(|e| e.value().clone())
-            .collect();
+        let all: Vec<AppReleaseManifest> =
+            self.releases.iter().map(|e| e.value().clone()).collect();
         if let Ok(json) = serde_json::to_string_pretty(&all) {
             let _ = std::fs::write(&self.releases_path, json);
         }

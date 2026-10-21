@@ -118,7 +118,7 @@ export class SfuMediaNodeClient {
     };
 
     ws.onclose = () => {
-      if (!this.manuallyClosed) {
+      if (!this.manuallyClosed && this.ws === ws) {
         this.reconnectTimer = window.setTimeout(() => this.openSocket(), 1500);
       }
     };
@@ -188,6 +188,8 @@ export class SfuMediaNodeClient {
   }
 
   private teardownOutgoingMedia(): void {
+    if (this.videoInterval !== null) { clearInterval(this.videoInterval); this.videoInterval = null; }
+    this.captureCanvas = null;
     try {
       this.micProcessor?.disconnect();
       this.micSource?.disconnect();

@@ -13,6 +13,11 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'widgets/draggable_self_view.dart';
+import 'widgets/archive_unlock_dialog.dart';
+import 'widgets/storage_usage.dart';
+import 'services/lesson_archive.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const LiaperMobileApp());
@@ -39,6 +44,20 @@ class LiaperMobileApp extends StatelessWidget {
           surface: Colors.white,
         ),
         useMaterial3: true,
+        visualDensity: VisualDensity.standard,
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: const Color(0xFFF8FAFC),
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(minimumSize: const Size(48, 48)),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(minimumSize: const Size(48, 48)),
+        ),
       ),
       home: const LiaperHomeScreen(),
     );
@@ -80,7 +99,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       TextEditingController(text: 'http://127.0.0.1:4000');
 
   // Авторизация
-  bool _isRegister = true;
+  bool _isRegister = false;
+  bool _showPassword = false;
+  bool _identityReady = false;
+  bool _sendingChat = false;
+  bool _checkingUpdates = false;
   String _selectedRole = 'student';
   final TextEditingController _usernameCtrl = TextEditingController();
   final TextEditingController _displayNameCtrl = TextEditingController();
@@ -103,6 +126,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // Состояние WebSocket и контактов
   WebSocketChannel? _wsChannel;
   bool _wsConnected = false;
+  Timer? _reconnectTimer;
+  int _reconnectFailures = 0;
   List<dynamic> _contacts = [];
   List<dynamic> _incomingRequests = [];
   List<dynamic> _outgoingRequests = [];
@@ -122,6 +147,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   String _chatMode = 'lesson'; // 'lesson' | 'direct' | 'archive'
   Map<String, dynamic>? _selectedChatContact;
   List<Map<String, dynamic>> _archivedChats = [];
+  SecretKey? _archiveKey;
+  bool _archiveSyncing = false;
+  bool _archiveSyncAgain = false;
+  String _archiveSyncStatus =
+      'Для синхронизации разблокируйте архив паролем аккаунта';
+  Timer? _archiveSaveTimer;
 
   // Локальная камера и микрофон + подключение к SFU-ноде
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
@@ -129,7 +160,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   bool _micEnabled = true;
   bool _camEnabled = false;
   bool _usingFrontCamera = true;
-  bool _fitContain = true; // Удобно для просмотра демонстрации экрана по умолчанию
+  bool _fitContain =
+      true; // Удобно для просмотра демонстрации экрана по умолчанию
   String? _focusedPeerId;
 
   WebSocketChannel? _sfuChannel;
@@ -164,6 +196,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
   @override
   void dispose() {
+    _reconnectTimer?.cancel();
+    _archiveSaveTimer?.cancel();
+    _token = null;
+    _mediaChannel.setMethodCallHandler(null);
     _stopLocalMediaAndSfu();
     _localRenderer.dispose();
     _wsChannel?.sink.close();
@@ -192,25 +228,110 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }
 
   String? get _activeChatRoomId {
-    if (_chatMode == 'lesson' && _currentRoom != null) {
-      return _currentRoom!['id']?.toString();
-    }
-    if (_chatMode == 'direct' && _selectedChatContact != null && _currentUser != null) {
-      return _computeDmRoomId(
-        _currentUser!['id'].toString(),
-        _selectedChatContact!['id'].toString(),
-      );
-    }
-    if (_currentRoom != null) {
-      return _currentRoom!['id']?.toString();
-    }
-    if (_selectedChatContact != null && _currentUser != null) {
-      return _computeDmRoomId(
-        _currentUser!['id'].toString(),
-        _selectedChatContact!['id'].toString(),
-      );
+    if (_chatMode == 'lesson') return _currentRoom?['id']?.toString();
+    if (_chatMode == 'direct' &&
+        _selectedChatContact != null &&
+        _currentUser != null) {
+      return _computeDmRoomId(_currentUser!['id'].toString(),
+          _selectedChatContact!['id'].toString());
     }
     return null;
+  }
+
+  String get _archiveStorageKey =>
+      'liaper_chat_archives:${_currentUser?['id']}';
+
+  Future<void> _loadUserArchives() async {
+    final key = _archiveStorageKey;
+    final prefs = await SharedPreferences.getInstance();
+    List<Map<String, dynamic>> archives = [];
+    try {
+      final raw = jsonDecode(prefs.getString(key) ?? '[]') as List;
+      archives = raw.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    } catch (_) {}
+    if (mounted && key == _archiveStorageKey) {
+      setState(() => _archivedChats = archives);
+    }
+  }
+
+  Future<void> _syncArchives() async {
+    final key = _archiveKey;
+    final token = _token;
+    final ownerId = _currentUser?['id']?.toString();
+    if (key == null || token == null || ownerId == null) return;
+    if (_archiveSyncing) {
+      _archiveSyncAgain = true;
+      return;
+    }
+    setState(() {
+      _archiveSyncing = true;
+      _archiveSyncStatus = 'Синхронизация…';
+    });
+    try {
+      final remote = await syncLessonArchives(
+          baseUrl: _serverUrl,
+          token: token,
+          key: key,
+          userId: ownerId,
+          local: List.of(_archivedChats));
+      if (!mounted || _currentUser?['id'] != ownerId) return;
+      final combined = mergeArchiveLists(remote, _archivedChats);
+      setState(() {
+        _archivedChats = combined;
+        _archiveSyncStatus = 'Архив синхронизирован с сервером';
+      });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          'liaper_chat_archives:$ownerId', jsonEncode(combined));
+    } catch (error) {
+      if (mounted && _currentUser?['id'] == ownerId) {
+        setState(() => _archiveSyncStatus = error is ArchiveSyncException
+            ? error.message
+            : 'Не удалось синхронизировать архив. Проверьте подключение и пароль. Локальная копия сохранена.');
+      }
+    } finally {
+      if (mounted && _currentUser?['id'] == ownerId) {
+        setState(() => _archiveSyncing = false);
+      }
+      if (_archiveSyncAgain) {
+        _archiveSyncAgain = false;
+        if (mounted && _currentUser?['id'] == ownerId) _syncArchives();
+      }
+    }
+  }
+
+  Future<void> _unlockArchives() async {
+    final ownerId = _currentUser?['id']?.toString();
+    if (ownerId == null || _token == null) return;
+    final password = await showDialog<String>(
+        context: context, builder: (_) => const ArchiveUnlockDialog());
+    if (!mounted || password == null || _currentUser?['id'] != ownerId) return;
+    setState(() => _archiveSyncStatus = 'Разблокировка…');
+    try {
+      final response = await http
+          .post(Uri.parse('$_serverUrl/api/lesson-archives/unlock'),
+              headers: {
+                'Authorization': 'Bearer $_token',
+                'Content-Type': 'application/json'
+              },
+              body: jsonEncode({'password': password}))
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode != 204) {
+        final data = jsonDecode(response.body) as Map;
+        throw ArchiveSyncException(
+            (data['error'] ?? 'Не удалось разблокировать архив').toString());
+      }
+      final key = await ArchiveCrypto.deriveKey(password, ownerId);
+      if (!mounted || _currentUser?['id'] != ownerId) return;
+      setState(() => _archiveKey = key);
+      await _syncArchives();
+    } catch (error) {
+      if (mounted && _currentUser?['id'] == ownerId) {
+        setState(() => _archiveSyncStatus = error is ArchiveSyncException
+            ? error.message
+            : 'Нет связи с сервером. Повторите попытку.');
+      }
+    }
   }
 
   SecretKey _deriveRoomSecretKey(String roomId) {
@@ -218,7 +339,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     return SecretKey(digest.bytes);
   }
 
-  Future<Map<String, String>> _encryptChatText(String plaintext, String roomId) async {
+  Future<Map<String, String>> _encryptChatText(
+      String plaintext, String roomId) async {
     final algorithm = AesGcm.with256bits();
     final secretKey = _deriveRoomSecretKey(roomId);
     final nonce = algorithm.newNonce();
@@ -227,14 +349,17 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       secretKey: secretKey,
       nonce: nonce,
     );
-    final combined = Uint8List(secretBox.cipherText.length + secretBox.mac.bytes.length);
+    final combined =
+        Uint8List(secretBox.cipherText.length + secretBox.mac.bytes.length);
     combined.setRange(0, secretBox.cipherText.length, secretBox.cipherText);
-    combined.setRange(secretBox.cipherText.length, combined.length, secretBox.mac.bytes);
+    combined.setRange(
+        secretBox.cipherText.length, combined.length, secretBox.mac.bytes);
 
     return {
       'ciphertext_b64': base64Encode(combined),
       'iv_b64': base64Encode(nonce),
-      'room_key_id': 'rk-${roomId.length >= 8 ? roomId.substring(0, 8) : roomId}',
+      'room_key_id':
+          'rk-${roomId.length >= 8 ? roomId.substring(0, 8) : roomId}',
     };
   }
 
@@ -246,7 +371,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     try {
       final combined = base64Decode(ciphertextB64);
       final nonce = base64Decode(ivB64);
-      if (combined.length < 16) return ciphertextB64;
+      if (combined.length < 16) return 'Не удалось расшифровать сообщение';
 
       final cipherText = combined.sublist(0, combined.length - 16);
       final macBytes = combined.sublist(combined.length - 16);
@@ -259,11 +384,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       );
       return utf8.decode(clearBytes);
     } catch (_) {
-      return ciphertextB64;
+      return 'Не удалось расшифровать сообщение';
     }
   }
 
-  Future<void> _handleIncomingEncryptedChat(Map<String, dynamic> rawMsg) async {
+  Future<void> _handleIncomingEncryptedChat(Map<String, dynamic> rawMsg,
+      {bool fromHistory = false}) async {
+    final sessionToken = _token;
     final msgId = (rawMsg['id'] ?? '').toString();
     if (msgId.isNotEmpty && _seenMessageIds.contains(msgId)) return;
     if (msgId.isNotEmpty) _seenMessageIds.add(msgId);
@@ -271,13 +398,14 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     final roomId = (rawMsg['room_id'] ?? '').toString();
     final senderId = (rawMsg['sender_id'] ?? '').toString();
     final senderUsername = (rawMsg['sender_username'] ?? '').toString();
-    final senderDisplayName = (rawMsg['sender_display_name'] ?? senderUsername).toString();
+    final senderDisplayName =
+        (rawMsg['sender_display_name'] ?? senderUsername).toString();
     final ciphertextB64 = (rawMsg['ciphertext_b64'] ?? '').toString();
     final ivB64 = (rawMsg['iv_b64'] ?? '').toString();
     final sentAt = (rawMsg['created_at'] ?? rawMsg['sent_at'] ?? '').toString();
 
     final decrypted = await _decryptChatText(ciphertextB64, ivB64, roomId);
-    if (!mounted) return;
+    if (!mounted || sessionToken != _token) return;
 
     setState(() {
       _chatMessages.add(
@@ -291,13 +419,26 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           sentAt: sentAt,
         ),
       );
-      if (_selectedTabIndex != 2 && senderId != _currentUser?['id']) {
+      if (!fromHistory &&
+          senderId != _currentUser?['id'] &&
+          (_selectedTabIndex != 2 || _activeChatRoomId != roomId)) {
         _unreadChatCount++;
       }
     });
 
+    if (_currentRoom?['id'] == roomId) {
+      _archiveSaveTimer?.cancel();
+      _archiveSaveTimer = Timer(const Duration(seconds: 1), () {
+        if (mounted && _currentRoom?['id'] == roomId) {
+          _saveCurrentLessonToArchive(
+              showNotification: false, completed: false);
+        }
+      });
+    }
     Future.delayed(const Duration(milliseconds: 100), () {
-      if (_chatScrollCtrl.hasClients) {
+      if (mounted &&
+          _chatScrollCtrl.hasClients &&
+          _activeChatRoomId == roomId) {
         _chatScrollCtrl.animateTo(
           _chatScrollCtrl.position.maxScrollExtent,
           duration: const Duration(milliseconds: 220),
@@ -309,43 +450,59 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
   Future<void> _sendChatMessage() async {
     final targetRoomId = _activeChatRoomId;
-    final text = _chatInputCtrl.text.trim();
-    if (targetRoomId == null || text.isEmpty) return;
-
-    _chatInputCtrl.clear();
-    final encrypted = await _encryptChatText(text, targetRoomId);
-
-    _sendWs({
-      'type': 'send_encrypted_chat',
-      'payload': {
-        'room_id': targetRoomId,
-        'ciphertext_b64': encrypted['ciphertext_b64'],
-        'iv_b64': encrypted['iv_b64'],
-        'room_key_id': encrypted['room_key_id'],
-      },
-    });
+    final text = _chatInputCtrl.text;
+    final sessionToken = _token;
+    if (targetRoomId == null ||
+        text.trim().isEmpty ||
+        _sendingChat ||
+        !_wsConnected) {
+      return;
+    }
+    setState(() => _sendingChat = true);
+    try {
+      final encrypted = await _encryptChatText(text.trim(), targetRoomId);
+      if (!mounted || _token != sessionToken) return;
+      final sent = _sendWs({
+        'type': 'send_encrypted_chat',
+        'payload': {
+          'room_id': targetRoomId,
+          'ciphertext_b64': encrypted['ciphertext_b64'],
+          'iv_b64': encrypted['iv_b64'],
+          'room_key_id': encrypted['room_key_id'],
+        },
+      });
+      if (sent && _chatInputCtrl.text == text) _chatInputCtrl.clear();
+    } catch (_) {
+      if (mounted) {
+        setState(() => _statusMessage =
+            'Сообщение не отправлено. Текст сохранён в поле ввода.');
+      }
+    } finally {
+      if (mounted) setState(() => _sendingChat = false);
+    }
   }
 
-  Future<void> _saveCurrentLessonToArchive({bool showNotification = true}) async {
+  Future<void> _saveCurrentLessonToArchive(
+      {bool showNotification = true, bool completed = true}) async {
     if (_currentRoom == null) return;
+    final archiveKey = _archiveStorageKey;
     final roomId = _currentRoom!['id'].toString();
     final roomTitle = (_currentRoom!['title'] ?? 'Урок').toString();
     final roomMsgs = _chatMessages.where((m) => m.roomId == roomId).toList();
-    if (roomMsgs.isEmpty) {
-      if (showNotification && mounted) {
-        setState(() {
-          _statusMessage = 'В чате урока пока нет сообщений для сохранения';
-        });
-      }
-      return;
-    }
-
     final entry = {
       'id': roomId,
       'title': roomTitle,
-      'savedAt': DateTime.now().toIso8601String(),
+      'savedAt': DateTime.now().toUtc().toIso8601String(),
+      'startedAt': _currentRoom!['created_at'],
+      if (completed) 'endedAt': DateTime.now().toUtc().toIso8601String(),
       'messages': roomMsgs
           .map((m) => {
+                'id': m.id,
+                'time': DateTime.tryParse(m.sentAt)
+                        ?.toLocal()
+                        .toString()
+                        .substring(11, 16) ??
+                    '',
                 'sender': m.senderDisplayName,
                 'username': m.senderUsername,
                 'text': m.text,
@@ -355,17 +512,16 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     };
 
     setState(() {
-      _archivedChats = [
-        entry,
-        ..._archivedChats.where((a) => a['id'] != roomId),
-      ];
+      _archivedChats = mergeArchiveLists(_archivedChats, [entry]);
       if (showNotification) {
         _statusMessage = 'Чат урока «$roomTitle» сохранён в архив';
       }
     });
 
+    final archiveJson = jsonEncode(_archivedChats);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('liaper_chat_archives', jsonEncode(_archivedChats));
+    await prefs.setString(archiveKey, archiveJson);
+    if (mounted) _syncArchives();
   }
 
   // ===========================================================================
@@ -378,6 +534,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     }
 
     await _stopLocalMediaAndSfu();
+    if (!mounted || _currentRoom?['id'] != roomId) return;
     _connectedSfuRoomId = roomId;
 
     _callSeconds = 0;
@@ -391,6 +548,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     });
 
     await _startLocalMedia(withAudio: _micEnabled, withVideo: _camEnabled);
+    if (!mounted || _currentRoom?['id'] != roomId) return;
     _connectToSfuNode(room);
   }
 
@@ -400,6 +558,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }) async {
     try {
       await _mediaChannel.invokeMethod('startAudio');
+      await _mediaChannel.invokeMethod('setMicMute', {'micEnabled': withAudio});
     } catch (_) {}
 
     try {
@@ -412,10 +571,23 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             'height': {'ideal': 720},
           },
         });
-        _localStream?.dispose();
+        if (!mounted || _currentRoom == null) {
+          for (final track in stream.getTracks()) {
+            track.stop();
+          }
+          await stream.dispose();
+          return;
+        }
+        for (final track in _localStream?.getTracks() ?? <MediaStreamTrack>[]) {
+          track.stop();
+        }
+        await _localStream?.dispose();
         _localStream = stream;
         _localRenderer.srcObject = stream;
       } else {
+        for (final track in _localStream?.getTracks() ?? <MediaStreamTrack>[]) {
+          track.stop();
+        }
         await _localStream?.dispose();
         _localStream = null;
         _localRenderer.srcObject = null;
@@ -424,7 +596,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     } catch (_) {
       if (mounted) {
         setState(() {
-          _statusMessage = 'Не удалось получить доступ к камере';
+          _camEnabled = false;
+          _statusMessage =
+              'Не удалось получить доступ к камере. Проверьте разрешения приложения.';
         });
       }
     }
@@ -519,9 +693,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           } catch (_) {}
         },
         onDone: () {
-          if (mounted && _currentRoom != null && _connectedSfuRoomId == room['id']) {
+          if (mounted &&
+              _currentRoom != null &&
+              _connectedSfuRoomId == room['id']) {
             Future.delayed(const Duration(seconds: 2), () {
-              if (mounted && _currentRoom != null && _connectedSfuRoomId == room['id']) {
+              if (mounted &&
+                  _currentRoom != null &&
+                  _connectedSfuRoomId == room['id']) {
                 _connectToSfuNode(_currentRoom!);
               }
             });
@@ -548,7 +726,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
     try {
       final b64 = base64Encode(pcmBytes);
-      final iv = base64Encode(utf8.encode('aud-${DateTime.now().millisecondsSinceEpoch}'));
+      final iv = base64Encode(
+          utf8.encode('aud-${DateTime.now().millisecondsSinceEpoch}'));
       _sfuChannel?.sink.add(
         jsonEncode({
           'type': 'encrypted_media_frame',
@@ -595,7 +774,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       } catch (_) {}
 
       final b64 = base64Encode(bytesToSend);
-      final iv = base64Encode(utf8.encode('vid-${DateTime.now().millisecondsSinceEpoch}'));
+      final iv = base64Encode(
+          utf8.encode('vid-${DateTime.now().millisecondsSinceEpoch}'));
 
       _sfuChannel?.sink.add(
         jsonEncode({
@@ -687,7 +867,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         'payload': {
           'room_id': _currentRoom!['id'],
           'audio_enabled': _micEnabled,
-          'video_enabled': nextCam,
+          'video_enabled': _camEnabled,
           'screen_share_enabled': false,
           'speaking': false,
         },
@@ -725,63 +905,56 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       await prefs.setString('liaper_fp', fp);
     }
 
-    final rawArchives = prefs.getString('liaper_chat_archives');
-    List<Map<String, dynamic>> loadedArchives = [];
-    if (rawArchives != null) {
-      try {
-        final decoded = jsonDecode(rawArchives) as List<dynamic>;
-        loadedArchives =
-            decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
-      } catch (_) {}
-    }
-
+    Map<String, dynamic>? savedUser;
+    try {
+      final rawUser = prefs.getString('liaper_user');
+      if (rawUser != null) {
+        savedUser = jsonDecode(rawUser) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    if (!mounted) return;
     setState(() {
       _publicKeyB64 = pubKey!;
       _fingerprint = fp!;
-      _archivedChats = loadedArchives;
-      _token = prefs.getString('liaper_token');
-      final rawUser = prefs.getString('liaper_user');
-      if (rawUser != null) {
-        _currentUser = jsonDecode(rawUser) as Map<String, dynamic>;
-      }
+      _identityReady = true;
+      _token = savedUser == null ? null : prefs.getString('liaper_token');
+      _currentUser = savedUser;
     });
+    await _loadUserArchives();
+    if (!mounted) return;
+    if (_token != null) _connectWebSocket();
+  }
 
-    if (_token != null) {
-      _connectWebSocket();
-    }
-    _checkForUpdates();
+  void _scheduleReconnect(WebSocketChannel channel) {
+    if (!mounted || _token == null || _wsChannel != channel) return;
+    setState(() => _wsConnected = false);
+    _reconnectTimer?.cancel();
+    final seconds = (2 * (1 << _reconnectFailures.clamp(0, 3))).clamp(2, 16);
+    _reconnectFailures++;
+    _reconnectTimer = Timer(Duration(seconds: seconds), _connectWebSocket);
   }
 
   void _connectWebSocket() {
-    if (_token == null) return;
-    _wsChannel?.sink.close();
-
+    if (_token == null || !mounted) return;
+    _reconnectTimer?.cancel();
+    final previous = _wsChannel;
+    _wsChannel = null;
+    previous?.sink.close();
     final wsUri = Uri.parse(
       '${_serverUrl.replaceFirst(RegExp(r'^http'), 'ws')}/ws?token=${Uri.encodeComponent(_token!)}',
     );
-
     final channel = WebSocketChannel.connect(wsUri);
     _wsChannel = channel;
-
     channel.stream.listen(
       (message) {
-        final data = jsonDecode(message as String) as Map<String, dynamic>;
-        _handleServerMessage(data);
+        if (!mounted || _wsChannel != channel) return;
+        try {
+          final data = jsonDecode(message as String) as Map<String, dynamic>;
+          _handleServerMessage(data);
+        } catch (_) {}
       },
-      onDone: () {
-        if (mounted) {
-          setState(() {
-            _wsConnected = false;
-          });
-        }
-      },
-      onError: (_) {
-        if (mounted) {
-          setState(() {
-            _wsConnected = false;
-          });
-        }
-      },
+      onDone: () => _scheduleReconnect(channel),
+      onError: (_) => _scheduleReconnect(channel),
     );
   }
 
@@ -793,36 +966,48 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
     switch (type) {
       case 'welcome':
+        _reconnectFailures = 0;
         setState(() {
           _wsConnected = true;
           _currentUser = payload?['self_profile'] as Map<String, dynamic>?;
           _contacts = (payload?['contacts'] as List<dynamic>?) ?? [];
-          _incomingRequests = (payload?['incoming_requests'] as List<dynamic>?) ?? [];
-          _outgoingRequests = (payload?['outgoing_requests'] as List<dynamic>?) ?? [];
+          _incomingRequests =
+              (payload?['incoming_requests'] as List<dynamic>?) ?? [];
+          _outgoingRequests =
+              (payload?['outgoing_requests'] as List<dynamic>?) ?? [];
         });
+        _syncArchives();
         break;
 
       case 'contacts_updated':
         setState(() {
           _contacts = (payload?['contacts'] as List<dynamic>?) ?? [];
-          _incomingRequests = (payload?['incoming_requests'] as List<dynamic>?) ?? [];
-          _outgoingRequests = (payload?['outgoing_requests'] as List<dynamic>?) ?? [];
+          _incomingRequests =
+              (payload?['incoming_requests'] as List<dynamic>?) ?? [];
+          _outgoingRequests =
+              (payload?['outgoing_requests'] as List<dynamic>?) ?? [];
         });
         break;
 
       case 'room_updated':
         final room = payload?['room'] as Map<String, dynamic>?;
-        final wasInRoom = _currentRoom != null && _currentRoom!['id'] == room?['id'];
+        final wasInRoom =
+            _currentRoom != null && _currentRoom!['id'] == room?['id'];
         setState(() {
           _currentRoom = room;
           _incomingCall = null;
           if (!wasInRoom && room != null) {
             _chatMode = 'lesson';
-            _selectedTabIndex = 1; // Переключаем на экран звонка при старте урока
+            _selectedTabIndex =
+                1; // Переключаем на экран звонка при старте урока
           }
         });
         if (room != null) {
           _ensureRoomMediaConnected(room);
+          if (!wasInRoom) {
+            _saveCurrentLessonToArchive(
+                showNotification: false, completed: false);
+          }
         }
         break;
 
@@ -834,7 +1019,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
       case 'call_declined':
         setState(() {
-          _statusMessage = 'Пользователь @${payload?['declined_by']} отклонил звонок';
+          _statusMessage =
+              'Пользователь @${payload?['declined_by']} отклонил звонок';
         });
         break;
 
@@ -849,7 +1035,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         final list = (payload?['messages'] as List<dynamic>?) ?? [];
         for (final item in list) {
           if (item is Map<String, dynamic>) {
-            _handleIncomingEncryptedChat(item);
+            _handleIncomingEncryptedChat(item, fromHistory: true);
           }
         }
         break;
@@ -862,15 +1048,44 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     }
   }
 
-  void _sendWs(Map<String, dynamic> data) {
-    _wsChannel?.sink.add(jsonEncode(data));
+  bool _sendWs(Map<String, dynamic> data) {
+    if (!_wsConnected || _wsChannel == null) {
+      if (mounted) {
+        setState(() => _statusMessage =
+            'Нет связи с сервером. Дождитесь подключения и повторите действие.');
+      }
+      return false;
+    }
+    _wsChannel!.sink.add(jsonEncode(data));
+    return true;
   }
 
   Future<void> _submitAuth() async {
+    if (_authLoading || !_identityReady) return;
+    final username = _usernameCtrl.text.trim().replaceFirst(RegExp(r'^@'), '');
+    final server = _serverUrlCtrl.text.trim().replaceFirst(RegExp(r'/+$'), '');
+    final uri = Uri.tryParse(server);
+    String? error;
+    if (username.isEmpty || _passwordCtrl.text.isEmpty) {
+      error = 'Введите никнейм и пароль.';
+    } else if (_isRegister && _passwordCtrl.text.length < 4) {
+      error = 'Пароль должен содержать не менее 4 символов.';
+    } else if (uri == null ||
+        !['http', 'https'].contains(uri.scheme) ||
+        uri.host.isEmpty ||
+        uri.hasQuery ||
+        uri.hasFragment) {
+      error = 'Укажите адрес сервера, например https://lessons.example.ru';
+    }
+    if (error != null) {
+      setState(() => _authError = error);
+      return;
+    }
+    FocusScope.of(context).unfocus();
     setState(() {
       _authLoading = true;
       _authError = null;
-      _serverUrl = _serverUrlCtrl.text.trim();
+      _serverUrl = server;
     });
 
     final prefs = await SharedPreferences.getInstance();
@@ -880,7 +1095,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       final endpoint = _isRegister ? '/api/auth/register' : '/api/auth/login';
       final body = _isRegister
           ? {
-              'username': _usernameCtrl.text.trim(),
+              'username': username,
               'display_name': _displayNameCtrl.text.trim().isEmpty
                   ? _usernameCtrl.text.trim()
                   : _displayNameCtrl.text.trim(),
@@ -890,7 +1105,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               'key_fingerprint': _fingerprint,
             }
           : {
-              'username': _usernameCtrl.text.trim(),
+              'username': username,
               'password': _passwordCtrl.text,
               'e2ee_public_key': _publicKeyB64,
               'key_fingerprint': _fingerprint,
@@ -904,6 +1119,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           )
           .timeout(const Duration(seconds: 8));
 
+      if (!mounted) return;
       final json = jsonDecode(res.body) as Map<String, dynamic>;
       if (res.statusCode >= 400) {
         setState(() {
@@ -919,30 +1135,63 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       await prefs.setString('liaper_token', token);
       await prefs.setString('liaper_user', jsonEncode(user));
 
+      if (!mounted) return;
+      final archiveKey = await ArchiveCrypto.deriveKey(
+          _passwordCtrl.text, user['id'].toString());
+      if (!mounted) return;
+      _passwordCtrl.clear();
       setState(() {
+        _archiveKey = archiveKey;
         _token = token;
         _currentUser = user;
         _authLoading = false;
       });
 
-      _connectWebSocket();
+      await _loadUserArchives();
+      if (mounted) _connectWebSocket();
     } catch (_) {
+      if (!mounted) return;
       setState(() {
-        _authError = 'Нет связи с сервером ($_serverUrl). Проверьте подключение.';
+        _authError =
+            'Нет связи с сервером ($_serverUrl). Проверьте подключение.';
         _authLoading = false;
       });
     }
   }
 
   Future<void> _logout() async {
+    if (_currentRoom != null) {
+      await _saveCurrentLessonToArchive(showNotification: false);
+    }
+    _archiveKey = null;
+    _archiveSyncing = false;
+    _archiveSyncAgain = false;
+    _archiveSyncStatus =
+        'Для синхронизации разблокируйте архив паролем аккаунта';
+    _reconnectTimer?.cancel();
+    _archiveSaveTimer?.cancel();
+    _token = null;
+    _wsConnected = false;
     await _stopLocalMediaAndSfu();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('liaper_token');
     await prefs.remove('liaper_user');
     _wsChannel?.sink.close();
+    if (!mounted) return;
     setState(() {
       _token = null;
       _currentUser = null;
+      _selectedTabIndex = 0;
+      _selectedChatContact = null;
+      _incomingCall = null;
+      _contacts = [];
+      _incomingRequests = [];
+      _outgoingRequests = [];
+      _archivedChats = [];
+      _unreadChatCount = 0;
+      _statusMessage = null;
+      _chatInputCtrl.clear();
+      _passwordCtrl.clear();
       _currentRoom = null;
       _chatMessages.clear();
       _seenMessageIds.clear();
@@ -953,12 +1202,18 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // Действия с контактами и звонками
   // ===========================================================================
   void _sendContactRequest() {
+    if (_currentUser?['role'] != 'tutor' ||
+        _contacts.where((u) => u['role'] == 'student').length >= 10) {
+      return;
+    }
     final nick = _addContactCtrl.text.trim().replaceAll('@', '');
     if (nick.isEmpty) return;
-    _sendWs({
+    if (!_sendWs({
       'type': 'send_contact_request',
       'payload': {'target_username': nick},
-    });
+    })) {
+      return;
+    }
     _addContactCtrl.clear();
     setState(() {
       _statusMessage = 'Запрос в контакты отправлен @$nick';
@@ -975,19 +1230,40 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     });
   }
 
-  void _removeContact(String contactUserId, String username) {
-    _sendWs({
+  Future<void> _removeContact(String contactUserId, String username) async {
+    final confirmed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+              title: const Text('Удалить контакт?'),
+              content: Text(
+                  'Для новых звонков и сообщений с @$username потребуется снова обменяться заявками.'),
+              actions: [
+                TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Отмена')),
+                TextButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Удалить')),
+              ],
+            ));
+    if (confirmed != true || !mounted) return;
+    if (!_sendWs({
       'type': 'remove_contact',
       'payload': {'contact_user_id': contactUserId},
-    });
+    })) {
+      return;
+    }
     setState(() {
-      _statusMessage = 'Контакт @$username удалён';
+      _statusMessage = 'Запрос на удаление контакта отправлен';
+      if (_selectedChatContact?['id'] == contactUserId) {
+        _selectedChatContact = null;
+      }
     });
   }
 
   void _callByNick(String username, {bool withVideo = true}) {
     final clean = username.trim().replaceAll('@', '');
-    if (clean.isEmpty) return;
+    if (clean.isEmpty || !_wsConnected || _currentRoom != null) return;
     setState(() {
       _micEnabled = true;
       _camEnabled = withVideo;
@@ -1016,6 +1292,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }
 
   void _showCreateGroupDialog() {
+    if (!_wsConnected || _currentRoom != null) return;
     final titleCtrl = TextEditingController();
     final selectedNicks = <String>{};
 
@@ -1083,7 +1360,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       padding: EdgeInsets.symmetric(vertical: 16),
                       child: Text(
                         'Сначала добавьте участников во взаимные контакты.',
-                        style: TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                        style:
+                            TextStyle(color: Color(0xFF64748B), fontSize: 13),
                       ),
                     )
                   else
@@ -1164,20 +1442,32 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // Автообновление APK
   // ===========================================================================
   Future<void> _checkForUpdates() async {
+    if (_checkingUpdates) return;
+    setState(() => _checkingUpdates = true);
     try {
       final uri = Uri.parse(
-        '$_serverUrl/api/releases/check?platform=$kPlatformAndroid&version=$kCurrentAppVersion',
-      );
+          '$_serverUrl/api/releases/check?platform=$kPlatformAndroid&version=$kCurrentAppVersion');
       final res = await http.get(uri).timeout(const Duration(seconds: 6));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body) as Map<String, dynamic>;
-        if (!mounted) return;
-        setState(() {
-          _updateAvailable = data['update_available'] == true;
-          _latestRelease = data['latest'] as Map<String, dynamic>?;
-        });
+      if (res.statusCode != 200) {
+        throw const HttpException('Update check failed');
       }
-    } catch (_) {}
+      final data = jsonDecode(res.body) as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        _updateAvailable = data['update_available'] == true;
+        _latestRelease = data['latest'] as Map<String, dynamic>?;
+        _statusMessage = _updateAvailable
+            ? 'Доступна новая версия приложения'
+            : 'Установлена последняя версия';
+      });
+    } catch (_) {
+      if (mounted) {
+        setState(() => _statusMessage =
+            'Не удалось проверить обновления. Повторите попытку позже.');
+      }
+    } finally {
+      if (mounted) setState(() => _checkingUpdates = false);
+    }
   }
 
   Future<void> _downloadAndInstallApk() async {
@@ -1185,6 +1475,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     final downloadUrl = _latestRelease!['download_url'] as String;
     final expectedSha256 = (_latestRelease!['sha256'] as String).toLowerCase();
     final version = _latestRelease!['version'] as String;
+    if (!RegExp(r'^[a-f0-9]{64}$').hasMatch(expectedSha256)) {
+      setState(() => _statusMessage =
+          'Обновление недоступно: сервер не предоставил контрольную сумму файла.');
+      return;
+    }
 
     setState(() {
       _downloadingApk = true;
@@ -1212,10 +1507,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       }
 
       final actualSha256 = sha256.convert(bytes).toString().toLowerCase();
-      if (expectedSha256.isNotEmpty &&
-          expectedSha256 !=
-              'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' &&
-          actualSha256 != expectedSha256) {
+      if (actualSha256 != expectedSha256) {
         setState(() {
           _downloadingApk = false;
           _statusMessage = 'Ошибка проверки контрольной суммы SHA-256';
@@ -1258,204 +1550,235 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
     final isInCallTab = _selectedTabIndex == 1 && _currentRoom != null;
 
-    return Scaffold(
-      backgroundColor: isInCallTab ? const Color(0xFF0F172A) : const Color(0xFFF8FAFC),
-      appBar: isInCallTab
-          ? null
-          : AppBar(
-              backgroundColor: Colors.white,
-              surfaceTintColor: Colors.white,
-              elevation: 0,
-              titleSpacing: 16,
-              title: Row(
-                children: [
-                  Container(
-                    width: 32,
-                    height: 32,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF0F172A),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    alignment: Alignment.center,
-                    child: const Text(
-                      'L',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.w700,
-                        fontSize: 15,
+    return PopScope(
+      canPop: _currentRoom == null && _selectedTabIndex == 0,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        if (_selectedTabIndex != 0) {
+          setState(() => _selectedTabIndex = 0);
+        } else {
+          setState(() => _statusMessage =
+              'Урок продолжается. Чтобы выйти из него, нажмите «Выйти» на экране урока.');
+        }
+      },
+      child: Scaffold(
+        backgroundColor:
+            isInCallTab ? const Color(0xFF0F172A) : const Color(0xFFF8FAFC),
+        appBar: isInCallTab
+            ? null
+            : AppBar(
+                backgroundColor: Colors.white,
+                surfaceTintColor: Colors.white,
+                elevation: 0,
+                titleSpacing: 16,
+                title: Row(
+                  children: [
+                    Container(
+                      width: 32,
+                      height: 32,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF0F172A),
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      alignment: Alignment.center,
+                      child: const Text(
+                        'L',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.w700,
+                          fontSize: 15,
+                        ),
                       ),
                     ),
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'Liaper',
-                          style: TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.w700,
-                            color: Color(0xFF0F172A),
-                          ),
-                        ),
-                        Row(
-                          children: [
-                            Container(
-                              width: 7,
-                              height: 7,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: _wsConnected
-                                    ? const Color(0xFF10B981)
-                                    : const Color(0xFFF43F5E),
-                              ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text(
+                            'Liaper',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w700,
+                              color: Color(0xFF0F172A),
                             ),
-                            const SizedBox(width: 5),
-                            Flexible(
-                              child: Text(
-                                '@${_currentUser!['username']} · ${_currentUser!['role'] == 'tutor' ? 'Репетитор' : 'Ученик'}',
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                  fontSize: 11,
-                                  color: Color(0xFF64748B),
+                          ),
+                          Row(
+                            children: [
+                              Container(
+                                width: 7,
+                                height: 7,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: _wsConnected
+                                      ? const Color(0xFF10B981)
+                                      : const Color(0xFFF43F5E),
                                 ),
                               ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-              actions: [
-                if (_currentRoom != null)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 12),
-                    child: FilledButton.tonalIcon(
-                      onPressed: () {
-                        setState(() {
-                          _selectedTabIndex = 1;
-                        });
-                      },
-                      style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFFDCFCE7),
-                        foregroundColor: const Color(0xFF047857),
-                        visualDensity: VisualDensity.compact,
+                              const SizedBox(width: 5),
+                              Flexible(
+                                child: Text(
+                                  '@${_currentUser!['username']} · ${_currentUser!['role'] == 'tutor' ? 'Репетитор' : 'Ученик'}',
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Color(0xFF64748B),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
                       ),
-                      icon: const Icon(Icons.call, size: 16),
-                      label: Text(_formatCallDuration(_callSeconds)),
-                    ),
-                  ),
-              ],
-              bottom: PreferredSize(
-                preferredSize: const Size.fromHeight(1),
-                child: Container(height: 1, color: const Color(0xFFE2E8F0)),
-              ),
-            ),
-      body: SafeArea(
-        child: Column(
-          children: [
-            // Уведомление или статус
-            if (_statusMessage != null)
-              Container(
-                margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF1E293B),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        _statusMessage!,
-                        style: const TextStyle(color: Colors.white, fontSize: 12),
-                      ),
-                    ),
-                    GestureDetector(
-                      onTap: () => setState(() => _statusMessage = null),
-                      child: const Icon(Icons.close, size: 16, color: Colors.white70),
                     ),
                   ],
                 ),
+                actions: [
+                  if (_currentRoom != null)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 12),
+                      child: FilledButton.tonalIcon(
+                        onPressed: () {
+                          setState(() {
+                            _selectedTabIndex = 1;
+                          });
+                        },
+                        style: FilledButton.styleFrom(
+                          backgroundColor: const Color(0xFFDCFCE7),
+                          foregroundColor: const Color(0xFF047857),
+                          visualDensity: VisualDensity.compact,
+                        ),
+                        icon: const Icon(Icons.call, size: 16),
+                        label: Text(_formatCallDuration(_callSeconds)),
+                      ),
+                    ),
+                ],
+                bottom: PreferredSize(
+                  preferredSize: const Size.fromHeight(1),
+                  child: Container(height: 1, color: const Color(0xFFE2E8F0)),
+                ),
               ),
+        body: SafeArea(
+          child: Column(
+            children: [
+              if (!_wsConnected)
+                MaterialBanner(
+                  content: const Text('Нет связи. Переподключаемся…'),
+                  leading: const Icon(Icons.wifi_off, size: 20),
+                  actions: [
+                    TextButton(
+                        onPressed: _connectWebSocket,
+                        child: const Text('Повторить')),
+                    TextButton(
+                        onPressed: _logout, child: const Text('Войти заново')),
+                  ],
+                ),
+              // Уведомление или статус
+              if (_statusMessage != null)
+                Container(
+                  margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E293B),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          _statusMessage!,
+                          style: const TextStyle(
+                              color: Colors.white, fontSize: 12),
+                        ),
+                      ),
+                      IconButton(
+                        tooltip: 'Закрыть уведомление',
+                        onPressed: () => setState(() => _statusMessage = null),
+                        icon: const Icon(Icons.close,
+                            size: 20, color: Colors.white70),
+                      ),
+                    ],
+                  ),
+                ),
 
-            // Глобальное окно входящего звонка
-            if (_incomingCall != null) _buildIncomingCallBanner(),
+              // Глобальное окно входящего звонка
+              if (_incomingCall != null) _buildIncomingCallBanner(),
 
-            // Основное содержимое выбранной вкладки
-            Expanded(
-              child: IndexedStack(
-                index: _selectedTabIndex,
-                children: [
-                  _buildContactsTab(),
-                  _buildCallTab(),
-                  _buildChatTab(),
-                  _buildProfileTab(),
+              // Основное содержимое выбранной вкладки
+              Expanded(
+                child: IndexedStack(
+                  index: _selectedTabIndex,
+                  children: [
+                    _buildContactsTab(),
+                    _buildCallTab(),
+                    _buildChatTab(),
+                    _buildProfileTab(),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        bottomNavigationBar: isInCallTab
+            ? null
+            : NavigationBar(
+                selectedIndex: _selectedTabIndex,
+                onDestinationSelected: (idx) {
+                  setState(() {
+                    _selectedTabIndex = idx;
+                    if (idx == 2) {
+                      _unreadChatCount = 0;
+                    }
+                  });
+                },
+                backgroundColor: Colors.white,
+                surfaceTintColor: Colors.white,
+                indicatorColor: const Color(0xFFE2E8F0),
+                destinations: [
+                  NavigationDestination(
+                    icon: Badge(
+                      isLabelVisible: _incomingRequests.isNotEmpty,
+                      label: Text('${_incomingRequests.length}'),
+                      child: const Icon(Icons.people_outline),
+                    ),
+                    selectedIcon: Badge(
+                      isLabelVisible: _incomingRequests.isNotEmpty,
+                      label: Text('${_incomingRequests.length}'),
+                      child: const Icon(Icons.people),
+                    ),
+                    label: 'Контакты',
+                  ),
+                  NavigationDestination(
+                    icon: Badge(
+                      isLabelVisible: _currentRoom != null,
+                      backgroundColor: const Color(0xFF10B981),
+                      smallSize: 8,
+                      child: const Icon(Icons.videocam_outlined),
+                    ),
+                    selectedIcon: const Icon(Icons.videocam),
+                    label: 'Урок',
+                  ),
+                  NavigationDestination(
+                    icon: Badge(
+                      isLabelVisible: _unreadChatCount > 0,
+                      label: Text('$_unreadChatCount'),
+                      child: const Icon(Icons.chat_bubble_outline),
+                    ),
+                    selectedIcon: const Icon(Icons.chat_bubble),
+                    label: 'Сообщения',
+                  ),
+                  NavigationDestination(
+                    icon: Badge(
+                      isLabelVisible: _updateAvailable,
+                      smallSize: 8,
+                      child: const Icon(Icons.person_outline),
+                    ),
+                    selectedIcon: const Icon(Icons.person),
+                    label: 'Профиль',
+                  ),
                 ],
               ),
-            ),
-          ],
-        ),
-      ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _selectedTabIndex,
-        onDestinationSelected: (idx) {
-          setState(() {
-            _selectedTabIndex = idx;
-            if (idx == 2) {
-              _unreadChatCount = 0;
-            }
-          });
-        },
-        backgroundColor: Colors.white,
-        surfaceTintColor: Colors.white,
-        indicatorColor: const Color(0xFFE2E8F0),
-        destinations: [
-          NavigationDestination(
-            icon: Badge(
-              isLabelVisible: _incomingRequests.isNotEmpty,
-              label: Text('${_incomingRequests.length}'),
-              child: const Icon(Icons.people_outline),
-            ),
-            selectedIcon: Badge(
-              isLabelVisible: _incomingRequests.isNotEmpty,
-              label: Text('${_incomingRequests.length}'),
-              child: const Icon(Icons.people),
-            ),
-            label: 'Контакты',
-          ),
-          NavigationDestination(
-            icon: Badge(
-              isLabelVisible: _currentRoom != null,
-              backgroundColor: const Color(0xFF10B981),
-              smallSize: 8,
-              child: const Icon(Icons.videocam_outlined),
-            ),
-            selectedIcon: const Icon(Icons.videocam),
-            label: 'Звонок',
-          ),
-          NavigationDestination(
-            icon: Badge(
-              isLabelVisible: _unreadChatCount > 0,
-              label: Text('$_unreadChatCount'),
-              child: const Icon(Icons.chat_bubble_outline),
-            ),
-            selectedIcon: const Icon(Icons.chat_bubble),
-            label: 'Чат',
-          ),
-          NavigationDestination(
-            icon: Badge(
-              isLabelVisible: _updateAvailable,
-              smallSize: 8,
-              child: const Icon(Icons.person_outline),
-            ),
-            selectedIcon: const Icon(Icons.person),
-            label: 'Профиль',
-          ),
-        ],
       ),
     );
   }
@@ -1581,7 +1904,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       borderRadius: BorderRadius.circular(10),
                     ),
                   ),
-                  icon: const Icon(Icons.call_end, size: 18, color: Color(0xFFF43F5E)),
+                  icon: const Icon(Icons.call_end,
+                      size: 18, color: Color(0xFFF43F5E)),
                   label: const Text('Отклонить'),
                 ),
               ),
@@ -1596,7 +1920,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // ВКЛАДКА 1: Контакты и взаимное добавление
   // ===========================================================================
   Widget _buildContactsTab() {
-    final search = _searchContactCtrl.text.trim().toLowerCase();
+    final isTutorAccount = _currentUser?['role'] == 'tutor';
+    final studentCount = _contacts.where((u) => u['role'] == 'student').length;
+    final search = _searchContactCtrl.text
+        .trim()
+        .replaceFirst(RegExp(r'^@'), '')
+        .toLowerCase();
     final filteredContacts = _contacts.where((c) {
       final map = c as Map<String, dynamic>;
       final u = (map['username'] ?? '').toString().toLowerCase();
@@ -1620,11 +1949,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             children: [
               Row(
                 children: [
-                  const Expanded(
+                  Expanded(
                     child: Text(
-                      'Добавить контакт по @нику',
+                      isTutorAccount
+                          ? 'Ученики: $studentCount из 10'
+                          : 'Ваши преподаватели',
                       overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
+                      style: const TextStyle(
                         fontSize: 14,
                         fontWeight: FontWeight.w700,
                         color: Color(0xFF0F172A),
@@ -1633,67 +1964,82 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   ),
                   const SizedBox(width: 8),
                   OutlinedButton.icon(
-                    onPressed: _showCreateGroupDialog,
+                    onPressed: _wsConnected && _currentRoom == null
+                        ? _showCreateGroupDialog
+                        : null,
                     style: OutlinedButton.styleFrom(
                       visualDensity: VisualDensity.compact,
                       foregroundColor: const Color(0xFF0F172A),
                       side: const BorderSide(color: Color(0xFFCBD5E1)),
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 10, vertical: 6),
                     ),
                     icon: const Icon(Icons.group_add_outlined, size: 16),
                     label: const Text(
                       'Группа',
-                      style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                      style:
+                          TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                     ),
                   ),
                 ],
               ),
               const SizedBox(height: 4),
-              const Text(
-                'Звонки доступны только после взаимного подтверждения заявки',
-                style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+              Text(
+                isTutorAccount
+                    ? studentCount >= 10
+                        ? 'Достигнут лимит. Удалите ученика, чтобы пригласить нового.'
+                        : 'Пригласите ученика по его @нику. Он сможет принять или отклонить заявку.'
+                    : 'Сообщите преподавателю свой @${_currentUser?['username']} и примите его заявку ниже.',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
               ),
               const SizedBox(height: 12),
-              Row(
-                children: [
-                  Expanded(
-                    child: TextField(
-                      controller: _addContactCtrl,
-                      decoration: InputDecoration(
-                        hintText: '@username',
-                        isDense: true,
-                        filled: true,
-                        fillColor: const Color(0xFFF8FAFC),
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12,
-                          vertical: 12,
+              if (isTutorAccount)
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _addContactCtrl,
+                        enabled: _wsConnected && studentCount < 10,
+                        decoration: InputDecoration(
+                          hintText: '@username',
+                          isDense: true,
+                          filled: true,
+                          fillColor: const Color(0xFFF8FAFC),
+                          contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 12,
+                          ),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide:
+                                const BorderSide(color: Color(0xFFCBD5E1)),
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            borderSide:
+                                const BorderSide(color: Color(0xFFE2E8F0)),
+                          ),
                         ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(10),
-                          borderSide: const BorderSide(color: Color(0xFFCBD5E1)),
-                        ),
-                        enabledBorder: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(10),
-                          borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
-                        ),
-                      ),
-                      onSubmitted: (_) => _sendContactRequest(),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  FilledButton(
-                    onPressed: _sendContactRequest,
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF0F172A),
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10),
+                        onSubmitted: (_) => _sendContactRequest(),
                       ),
                     ),
-                    child: const Text('Добавить'),
-                  ),
-                ],
-              ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: _wsConnected && studentCount < 10
+                          ? _sendContactRequest
+                          : null,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: const Color(0xFF0F172A),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 14, vertical: 12),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                      ),
+                      child: const Text('Добавить'),
+                    ),
+                  ],
+                ),
             ],
           ),
         ),
@@ -1757,8 +2103,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                           children: [
                             Expanded(
                               child: FilledButton(
-                                onPressed: () =>
-                                    _respondContactRequest(r['id'] as String, true),
+                                onPressed: () => _respondContactRequest(
+                                    r['id'] as String, true),
                                 style: FilledButton.styleFrom(
                                   backgroundColor: const Color(0xFF0F172A),
                                   visualDensity: VisualDensity.compact,
@@ -1772,8 +2118,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                             const SizedBox(width: 8),
                             Expanded(
                               child: OutlinedButton(
-                                onPressed: () =>
-                                    _respondContactRequest(r['id'] as String, false),
+                                onPressed: () => _respondContactRequest(
+                                    r['id'] as String, false),
                                 style: OutlinedButton.styleFrom(
                                   visualDensity: VisualDensity.compact,
                                 ),
@@ -1888,23 +2234,33 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               borderRadius: BorderRadius.circular(16),
               border: Border.all(color: const Color(0xFFE2E8F0)),
             ),
-            child: const Column(
+            child: Column(
               children: [
-                Icon(Icons.people_outline, size: 40, color: Color(0xFF94A3B8)),
-                SizedBox(height: 10),
+                const Icon(Icons.people_outline,
+                    size: 40, color: Color(0xFF94A3B8)),
+                const SizedBox(height: 10),
                 Text(
-                  'Список контактов пуст',
-                  style: TextStyle(
+                  search.isEmpty
+                      ? isTutorAccount
+                          ? 'Пригласите первого ученика'
+                          : 'Пока нет преподавателей'
+                      : 'Ничего не найдено',
+                  style: const TextStyle(
                     fontWeight: FontWeight.w600,
                     fontSize: 14,
                     color: Color(0xFF334155),
                   ),
                 ),
-                SizedBox(height: 4),
+                const SizedBox(height: 4),
                 Text(
-                  'Отправьте заявку по @нику выше и дождитесь подтверждения, чтобы начать звонки и уроки.',
+                  search.isEmpty
+                      ? isTutorAccount
+                          ? 'Отправьте заявку по @нику выше. После подтверждения можно начать урок.'
+                          : 'Преподаватель появится здесь после того, как вы примете его заявку.'
+                      : 'Попробуйте другое имя или никнейм.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                  style:
+                      const TextStyle(fontSize: 12, color: Color(0xFF64748B)),
                 ),
               ],
             ),
@@ -1933,7 +2289,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                         radius: 20,
                         backgroundColor: const Color(0xFFF1F5F9),
                         child: Text(
-                          displayName.substring(0, displayName.length >= 2 ? 2 : 1).toUpperCase(),
+                          (displayName.isEmpty
+                                  ? '?'
+                                  : displayName.substring(
+                                      0, displayName.length >= 2 ? 2 : 1))
+                              .toUpperCase(),
                           style: const TextStyle(
                             fontWeight: FontWeight.w700,
                             color: Color(0xFF0F172A),
@@ -1986,64 +2346,50 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 4),
-                  IconButton.filledTonal(
-                    onPressed: () {
-                      setState(() {
-                        _selectedChatContact = u;
-                        _chatMode = 'direct';
-                        _selectedTabIndex = 2;
-                        _unreadChatCount = 0;
-                      });
+                  PopupMenuButton<String>(
+                    tooltip: 'Действия с контактом',
+                    onSelected: (action) {
+                      if (action == 'chat') {
+                        setState(() {
+                          _selectedChatContact = u;
+                          _chatMode = 'direct';
+                          _selectedTabIndex = 2;
+                          _unreadChatCount = 0;
+                        });
+                      } else if (action == 'audio') {
+                        _callByNick(username, withVideo: false);
+                      } else if (action == 'video') {
+                        _callByNick(username);
+                      } else if (action == 'remove') {
+                        _removeContact(u['id'] as String, username);
+                      }
                     },
-                    visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
-                    padding: EdgeInsets.zero,
-                    style: IconButton.styleFrom(
-                      backgroundColor: const Color(0xFFF1F5F9),
-                      foregroundColor: const Color(0xFF0F172A),
-                    ),
-                    tooltip: 'Написать в личный чат',
-                    icon: const Icon(Icons.chat_bubble_outline, size: 17),
-                  ),
-                  const SizedBox(width: 4),
-                  IconButton.filledTonal(
-                    onPressed: () => _callByNick(username, withVideo: false),
-                    visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
-                    padding: EdgeInsets.zero,
-                    style: IconButton.styleFrom(
-                      backgroundColor: const Color(0xFFF1F5F9),
-                      foregroundColor: const Color(0xFF0F172A),
-                    ),
-                    tooltip: 'Аудиозвонок',
-                    icon: const Icon(Icons.call, size: 17),
-                  ),
-                  const SizedBox(width: 4),
-                  IconButton.filled(
-                    onPressed: () => _callByNick(username, withVideo: true),
-                    visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
-                    padding: EdgeInsets.zero,
-                    style: IconButton.styleFrom(
-                      backgroundColor: const Color(0xFF0F172A),
-                      foregroundColor: Colors.white,
-                    ),
-                    tooltip: 'Видеозвонок',
-                    icon: const Icon(Icons.videocam, size: 17),
-                  ),
-                  const SizedBox(width: 2),
-                  IconButton(
-                    onPressed: () => _removeContact(u['id'] as String, username),
-                    visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 30, minHeight: 34),
-                    padding: EdgeInsets.zero,
-                    tooltip: 'Удалить из контактов',
-                    icon: const Icon(
-                      Icons.delete_outline,
-                      size: 17,
-                      color: Color(0xFF94A3B8),
-                    ),
+                    itemBuilder: (_) => [
+                      const PopupMenuItem(
+                          value: 'chat',
+                          child: ListTile(
+                              leading: Icon(Icons.chat_bubble_outline),
+                              title: Text('Написать сообщение'))),
+                      PopupMenuItem(
+                          value: 'audio',
+                          enabled: _wsConnected && _currentRoom == null,
+                          child: const ListTile(
+                              leading: Icon(Icons.call_outlined),
+                              title: Text('Аудиозвонок'))),
+                      PopupMenuItem(
+                          value: 'video',
+                          enabled: _wsConnected && _currentRoom == null,
+                          child: const ListTile(
+                              leading: Icon(Icons.videocam_outlined),
+                              title: Text('Видеозвонок'))),
+                      const PopupMenuDivider(),
+                      PopupMenuItem(
+                          value: 'remove',
+                          enabled: _wsConnected,
+                          child: const ListTile(
+                              leading: Icon(Icons.person_remove_outlined),
+                              title: Text('Удалить контакт'))),
+                    ],
                   ),
                 ],
               ),
@@ -2098,7 +2444,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 onPressed: () => setState(() => _selectedTabIndex = 0),
                 style: FilledButton.styleFrom(
                   backgroundColor: const Color(0xFF0F172A),
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -2112,7 +2459,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       );
     }
 
-    final participants = (_currentRoom!['participants'] as List<dynamic>?) ?? [];
+    final participants =
+        (_currentRoom!['participants'] as List<dynamic>?) ?? [];
     final myId = _currentUser?['id']?.toString();
     final remoteParticipants = participants
         .map((p) => p as Map<String, dynamic>)
@@ -2128,273 +2476,310 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     }
 
     final primaryPeerId = primaryPeer?['user_id']?.toString();
-    final primaryRemoteFrame =
-        primaryPeerId != null ? _remoteVideoFrames[primaryPeerId] : null;
+    final primaryRemoteFrame = primaryPeerId != null &&
+            (primaryPeer?['video_enabled'] == true ||
+                primaryPeer?['screen_share_enabled'] == true)
+        ? _remoteVideoFrames[primaryPeerId]
+        : null;
     final isPrimaryScreenShare = primaryPeer?['screen_share_enabled'] == true;
 
-    return Container(
-      color: const Color(0xFF0F172A),
-      child: Stack(
-        children: [
-          // 1. Главная сцена (Видео собеседника или демонстрация экрана с Pinch-to-Zoom)
-          Positioned.fill(
-            child: primaryPeer == null
-                ? _buildWaitingForPeerStage()
-                : primaryRemoteFrame != null
-                    ? InteractiveViewer(
-                        minScale: 1.0,
-                        maxScale: 4.5,
-                        child: Center(
-                          child: Image.memory(
-                            primaryRemoteFrame,
-                            gaplessPlayback: true,
-                            fit: (_fitContain || isPrimaryScreenShare)
-                                ? BoxFit.contain
-                                : BoxFit.cover,
-                            width: double.infinity,
-                            height: double.infinity,
+    return LayoutBuilder(builder: (context, callConstraints) {
+      final showParticipantStrip =
+          remoteParticipants.length > 1 && callConstraints.maxHeight >= 480;
+      return Container(
+        color: const Color(0xFF0F172A),
+        child: Stack(
+          children: [
+            // 1. Главная сцена (Видео собеседника или демонстрация экрана с Pinch-to-Zoom)
+            Positioned.fill(
+              child: primaryPeer == null
+                  ? _buildWaitingForPeerStage()
+                  : primaryRemoteFrame != null
+                      ? InteractiveViewer(
+                          minScale: 1.0,
+                          maxScale: 4.5,
+                          child: Center(
+                            child: Image.memory(
+                              primaryRemoteFrame,
+                              gaplessPlayback: true,
+                              fit: (_fitContain || isPrimaryScreenShare)
+                                  ? BoxFit.contain
+                                  : BoxFit.cover,
+                              width: double.infinity,
+                              height: double.infinity,
+                            ),
                           ),
-                        ),
-                      )
-                    : _buildAudioOnlyPeerStage(primaryPeer),
-          ),
-
-          // 2. Верхняя панель управления звонком
-          Positioned(
-            top: 12,
-            left: 12,
-            right: 12,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E293B).withValues(alpha: 0.85),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(color: Colors.white12),
-              ),
-              child: Row(
-                children: [
-                  Container(
-                    width: 8,
-                    height: 8,
-                    decoration: const BoxDecoration(
-                      color: Color(0xFF10B981),
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          (_currentRoom!['title'] ?? 'Урок').toString(),
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.w700,
-                            fontSize: 14,
-                          ),
-                        ),
-                        Text(
-                          '${_formatCallDuration(_callSeconds)} · Участников: ${participants.length}',
-                          style: const TextStyle(
-                            color: Color(0xFF94A3B8),
-                            fontSize: 11,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  if (primaryRemoteFrame != null)
-                    IconButton(
-                      onPressed: () {
-                        setState(() {
-                          _fitContain = !_fitContain;
-                        });
-                      },
-                      tooltip: _fitContain ? 'Заполнить экран' : 'Вписать целиком',
-                      icon: Icon(
-                        _fitContain ? Icons.fullscreen : Icons.fit_screen,
-                        color: Colors.white,
-                        size: 20,
-                      ),
-                    ),
-                  IconButton(
-                    onPressed: _showInviteParticipantSheet,
-                    tooltip: 'Пригласить контакт в звонок',
-                    icon: const Icon(
-                      Icons.person_add_alt,
-                      color: Colors.white,
-                      size: 20,
-                    ),
-                  ),
-                ],
-              ),
+                        )
+                      : _buildAudioOnlyPeerStage(primaryPeer),
             ),
-          ),
 
-          // 3. Миниатюры других участников (если групповой звонок)
-          if (remoteParticipants.length > 1)
+            // 2. Верхняя панель управления звонком
             Positioned(
-              top: 80,
+              top: 12,
               left: 12,
-              right: 120,
-              height: 68,
-              child: ListView.separated(
-                scrollDirection: Axis.horizontal,
-                itemCount: remoteParticipants.length,
-                separatorBuilder: (_, __) => const SizedBox(width: 8),
-                itemBuilder: (_, idx) {
-                  final peer = remoteParticipants[idx];
-                  final peerId = peer['user_id'].toString();
-                  final isSelected = peerId == primaryPeerId;
-                  return GestureDetector(
-                    onTap: () => setState(() => _focusedPeerId = peerId),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                      decoration: BoxDecoration(
-                        color: isSelected
-                            ? const Color(0xFF334155)
-                            : const Color(0xFF1E293B).withValues(alpha: 0.8),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(
-                          color: isSelected ? const Color(0xFF38BDF8) : Colors.white12,
-                        ),
+              right: 12,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E293B).withValues(alpha: 0.85),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Row(
+                  children: [
+                    IconButton(
+                      tooltip: 'Свернуть урок',
+                      onPressed: () => setState(() => _selectedTabIndex = 0),
+                      icon: const Icon(Icons.keyboard_arrow_down,
+                          color: Colors.white),
+                    ),
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF10B981),
+                        shape: BoxShape.circle,
                       ),
-                      child: Row(
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Icon(
-                            peer['audio_enabled'] == true ? Icons.mic : Icons.mic_off,
-                            size: 14,
-                            color: peer['audio_enabled'] == true
-                                ? const Color(0xFF34D399)
-                                : const Color(0xFFF43F5E),
-                          ),
-                          const SizedBox(width: 6),
                           Text(
-                            peer['display_name'].toString(),
+                            (_currentRoom!['title'] ?? 'Урок').toString(),
+                            overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
                               color: Colors.white,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14,
+                            ),
+                          ),
+                          Text(
+                            '${_formatCallDuration(_callSeconds)} · Участников: ${participants.length}',
+                            style: const TextStyle(
+                              color: Color(0xFF94A3B8),
+                              fontSize: 11,
                             ),
                           ),
                         ],
                       ),
                     ),
-                  );
-                },
+                    if (remoteParticipants.length > 1 && !showParticipantStrip)
+                      PopupMenuButton<String>(
+                        tooltip: 'Выбрать участника',
+                        icon: const Icon(Icons.people_outline,
+                            color: Colors.white),
+                        onSelected: (id) => setState(() => _focusedPeerId = id),
+                        itemBuilder: (_) => remoteParticipants
+                            .map((peer) => PopupMenuItem(
+                                  value: peer['user_id'].toString(),
+                                  child: Text(peer['display_name'].toString()),
+                                ))
+                            .toList(),
+                      ),
+                    if (primaryRemoteFrame != null)
+                      IconButton(
+                        onPressed: () {
+                          setState(() {
+                            _fitContain = !_fitContain;
+                          });
+                        },
+                        tooltip:
+                            _fitContain ? 'Заполнить экран' : 'Вписать целиком',
+                        icon: Icon(
+                          _fitContain ? Icons.fullscreen : Icons.fit_screen,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    IconButton(
+                      onPressed: _showInviteParticipantSheet,
+                      tooltip: 'Пригласить контакт в звонок',
+                      icon: const Icon(
+                        Icons.person_add_alt,
+                        color: Colors.white,
+                        size: 20,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
 
-          // 4. Локальное превью камеры (Picture-in-Picture в углу)
-          if (_camEnabled && _localStream != null)
-            Positioned(
-              right: 14,
-              bottom: 100,
-              width: 108,
-              height: 152,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(16),
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.black,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: Colors.white24, width: 1.5),
-                  ),
-                  child: Stack(
-                    fit: StackFit.expand,
-                    children: [
-                      RTCVideoView(
-                        _localRenderer,
-                        mirror: _usingFrontCamera,
-                        objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
-                      ),
-                      Positioned(
-                        top: 6,
-                        right: 6,
-                        child: GestureDetector(
-                          onTap: _switchCameraDirection,
-                          child: Container(
-                            padding: const EdgeInsets.all(5),
-                            decoration: const BoxDecoration(
-                              color: Colors.black54,
-                              shape: BoxShape.circle,
-                            ),
-                            child: const Icon(
-                              Icons.cameraswitch,
-                              size: 16,
-                              color: Colors.white,
-                            ),
+            // 3. Миниатюры других участников (если групповой звонок)
+            if (showParticipantStrip)
+              Positioned(
+                top: 80,
+                left: 12,
+                right: 120,
+                height: 68,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: remoteParticipants.length,
+                  separatorBuilder: (_, __) => const SizedBox(width: 8),
+                  itemBuilder: (_, idx) {
+                    final peer = remoteParticipants[idx];
+                    final peerId = peer['user_id'].toString();
+                    final isSelected = peerId == primaryPeerId;
+                    return GestureDetector(
+                      onTap: () => setState(() => _focusedPeerId = peerId),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 8),
+                        decoration: BoxDecoration(
+                          color: isSelected
+                              ? const Color(0xFF334155)
+                              : const Color(0xFF1E293B).withValues(alpha: 0.8),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(
+                            color: isSelected
+                                ? const Color(0xFF38BDF8)
+                                : Colors.white12,
                           ),
                         ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              peer['audio_enabled'] == true
+                                  ? Icons.mic
+                                  : Icons.mic_off,
+                              size: 14,
+                              color: peer['audio_enabled'] == true
+                                  ? const Color(0xFF34D399)
+                                  : const Color(0xFFF43F5E),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              peer['display_name'].toString(),
+                              style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ],
+                    );
+                  },
+                ),
+              ),
+
+            // Preview position survives camera toggles and follows the usable area.
+            Positioned.fill(
+              child: DraggableSelfView(
+                visible: _camEnabled && _localStream != null,
+                reservedInsets: EdgeInsets.fromLTRB(
+                    12, showParticipantStrip ? 160 : 88, 12, 116),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      color: Colors.black,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: Colors.white24, width: 1.5),
+                    ),
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        RTCVideoView(
+                          _localRenderer,
+                          mirror: _usingFrontCamera,
+                          objectFit:
+                              RTCVideoViewObjectFit.RTCVideoViewObjectFitCover,
+                        ),
+                        Positioned(
+                          top: 0,
+                          right: 0,
+                          child: IconButton(
+                            tooltip: 'Переключить камеру',
+                            onPressed: _switchCameraDirection,
+                            style: IconButton.styleFrom(
+                                backgroundColor: Colors.black54),
+                            icon: const Icon(Icons.cameraswitch,
+                                size: 20, color: Colors.white),
+                          ),
+                        ),
+                        const Positioned(
+                          left: 8,
+                          bottom: 8,
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                                color: Colors.black54,
+                                borderRadius:
+                                    BorderRadius.all(Radius.circular(6))),
+                            child: Padding(
+                                padding: EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 3),
+                                child: Text('Вы · ↔',
+                                    style: TextStyle(
+                                        fontSize: 11, color: Colors.white))),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
             ),
 
-          // 5. Нижняя панель кнопок звонка (Микрофон, Камера, Чат, Завершить)
-          Positioned(
-            left: 16,
-            right: 16,
-            bottom: 18,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1E293B).withValues(alpha: 0.92),
-                borderRadius: BorderRadius.circular(24),
-                border: Border.all(color: Colors.white12),
-              ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                children: [
-                  _buildCallControlButton(
-                    icon: _micEnabled ? Icons.mic : Icons.mic_off,
-                    label: _micEnabled ? 'Микрофон' : 'Выкл.',
-                    active: _micEnabled,
-                    onTap: _toggleMic,
-                  ),
-                  _buildCallControlButton(
-                    icon: _camEnabled ? Icons.videocam : Icons.videocam_off,
-                    label: _camEnabled ? 'Камера' : 'Выкл.',
-                    active: _camEnabled,
-                    onTap: _toggleCamera,
-                  ),
-                  if (_camEnabled)
+            // 5. Нижняя панель кнопок звонка (Микрофон, Камера, Чат, Завершить)
+            Positioned(
+              left: 16,
+              right: 16,
+              bottom: 18,
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1E293B).withValues(alpha: 0.92),
+                  borderRadius: BorderRadius.circular(24),
+                  border: Border.all(color: Colors.white12),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: [
                     _buildCallControlButton(
-                      icon: Icons.cameraswitch_outlined,
-                      label: 'Поворот',
-                      active: false,
-                      onTap: _switchCameraDirection,
+                      icon: _micEnabled ? Icons.mic : Icons.mic_off,
+                      label: _micEnabled ? 'Микрофон' : 'Выкл.',
+                      active: _micEnabled,
+                      onTap: _toggleMic,
                     ),
-                  _buildCallControlButton(
-                    icon: Icons.chat_bubble_outline,
-                    label: 'Чат урока',
-                    active: false,
-                    badgeCount: _unreadChatCount,
-                    onTap: () {
-                      setState(() {
-                        _selectedTabIndex = 2;
-                        _unreadChatCount = 0;
-                      });
-                    },
-                  ),
-                  _buildCallControlButton(
-                    icon: Icons.call_end,
-                    label: 'Выйти',
-                    active: true,
-                    isDanger: true,
-                    onTap: _leaveCurrentRoom,
-                  ),
-                ],
+                    _buildCallControlButton(
+                      icon: _camEnabled ? Icons.videocam : Icons.videocam_off,
+                      label: _camEnabled ? 'Камера' : 'Выкл.',
+                      active: _camEnabled,
+                      onTap: _toggleCamera,
+                    ),
+                    _buildCallControlButton(
+                      icon: Icons.chat_bubble_outline,
+                      label: 'Чат урока',
+                      active: false,
+                      badgeCount: _unreadChatCount,
+                      onTap: () {
+                        setState(() {
+                          _selectedTabIndex = 2;
+                          _unreadChatCount = 0;
+                        });
+                      },
+                    ),
+                    _buildCallControlButton(
+                      icon: Icons.call_end,
+                      label: 'Выйти',
+                      active: true,
+                      isDanger: true,
+                      onTap: _leaveCurrentRoom,
+                    ),
+                  ],
+                ),
               ),
             ),
-          ),
-        ],
-      ),
-    );
+          ],
+        ),
+      );
+    });
   }
 
   Widget _buildWaitingForPeerStage() {
@@ -2437,7 +2822,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }
 
   Widget _buildAudioOnlyPeerStage(Map<String, dynamic> peer) {
-    final name = (peer['display_name'] ?? peer['username'] ?? 'Участник').toString();
+    final name =
+        (peer['display_name'] ?? peer['username'] ?? 'Участник').toString();
     final username = (peer['username'] ?? '').toString();
     final role = peer['role'] == 'tutor' ? 'Репетитор' : 'Ученик';
     final audioOn = peer['audio_enabled'] == true;
@@ -2494,7 +2880,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 Icon(
                   audioOn ? Icons.mic : Icons.mic_off,
                   size: 15,
-                  color: audioOn ? const Color(0xFF34D399) : const Color(0xFFF43F5E),
+                  color: audioOn
+                      ? const Color(0xFF34D399)
+                      : const Color(0xFFF43F5E),
                 ),
                 const SizedBox(width: 6),
                 Text(
@@ -2528,36 +2916,47 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             ? const Color(0xFF0F172A)
             : Colors.white;
 
-    return GestureDetector(
-      onTap: onTap,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Badge(
-            isLabelVisible: badgeCount > 0,
-            label: Text('$badgeCount'),
-            child: Container(
-              width: 48,
-              height: 48,
-              decoration: BoxDecoration(
-                color: bgColor,
-                shape: BoxShape.circle,
+    return Expanded(
+        child: Semantics(
+      button: true,
+      label: label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Badge(
+                isLabelVisible: badgeCount > 0,
+                label: Text('$badgeCount'),
+                child: Container(
+                  width: 48,
+                  height: 48,
+                  decoration: BoxDecoration(
+                    color: bgColor,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: iconColor, size: 22),
+                ),
               ),
-              child: Icon(icon, color: iconColor, size: 22),
-            ),
+              const SizedBox(height: 5),
+              Text(
+                label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
           ),
-          const SizedBox(height: 5),
-          Text(
-            label,
-            style: const TextStyle(
-              color: Colors.white70,
-              fontSize: 11,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
-        ],
+        ),
       ),
-    );
+    ));
   }
 
   void _showInviteParticipantSheet() {
@@ -2657,6 +3056,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               SegmentedButton<String>(
+                showSelectedIcon: false,
                 segments: [
                   const ButtonSegment(value: 'lesson', label: Text('Урок')),
                   const ButtonSegment(value: 'direct', label: Text('Личный')),
@@ -2670,6 +3070,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   setState(() {
                     _chatMode = s.first;
                   });
+                  if (s.first == 'archive') _syncArchives();
                 },
               ),
               if (_chatMode == 'lesson' && _currentRoom != null) ...[
@@ -2688,12 +3089,14 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       ),
                     ),
                     TextButton.icon(
-                      onPressed: () => _saveCurrentLessonToArchive(showNotification: true),
+                      onPressed: () => _saveCurrentLessonToArchive(
+                          showNotification: true, completed: false),
                       style: TextButton.styleFrom(
                         visualDensity: VisualDensity.compact,
                       ),
                       icon: const Icon(Icons.bookmark_add_outlined, size: 16),
-                      label: const Text('В архив', style: TextStyle(fontSize: 12)),
+                      label:
+                          const Text('В архив', style: TextStyle(fontSize: 12)),
                     ),
                     TextButton.icon(
                       onPressed: () => setState(() => _selectedTabIndex = 1),
@@ -2701,7 +3104,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                         visualDensity: VisualDensity.compact,
                       ),
                       icon: const Icon(Icons.videocam, size: 16),
-                      label: const Text('К видео', style: TextStyle(fontSize: 12)),
+                      label:
+                          const Text('К видео', style: TextStyle(fontSize: 12)),
                     ),
                   ],
                 ),
@@ -2710,7 +3114,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 const SizedBox(height: 8),
                 if (_contacts.isEmpty)
                   const Text(
-                    'Добавьте собеседника во взаимные контакты, чтобы писать напрямую',
+                    'Выберите контакт после подтверждения приглашения преподавателя',
                     style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
                   )
                 else
@@ -2722,7 +3126,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       separatorBuilder: (_, __) => const SizedBox(width: 6),
                       itemBuilder: (_, idx) {
                         final c = _contacts[idx] as Map<String, dynamic>;
-                        final isSelected = _selectedChatContact?['id'] == c['id'];
+                        final isSelected =
+                            _selectedChatContact?['id'] == c['id'];
                         return ChoiceChip(
                           selected: isSelected,
                           visualDensity: VisualDensity.compact,
@@ -2744,6 +3149,31 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           ),
         ),
 
+        if (_chatMode == 'archive')
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            color: Colors.white,
+            child:
+                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(_archiveSyncStatus,
+                  style:
+                      const TextStyle(fontSize: 12, color: Color(0xFF64748B))),
+              TextButton.icon(
+                onPressed: _archiveSyncing
+                    ? null
+                    : _archiveKey == null
+                        ? _unlockArchives
+                        : _syncArchives,
+                icon: Icon(
+                    _archiveKey == null ? Icons.lock_open_outlined : Icons.sync,
+                    size: 18),
+                label: Text(_archiveKey == null
+                    ? 'Разблокировать архив'
+                    : 'Синхронизировать'),
+              ),
+            ]),
+          ),
         // Режим Архива уроков
         if (_chatMode == 'archive')
           Expanded(
@@ -2754,7 +3184,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       child: Text(
                         'Сохранённых чатов уроков пока нет. По завершении урока переписка сохраняется в архив автоматически или по кнопке «В архив».',
                         textAlign: TextAlign.center,
-                        style: TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                        style:
+                            TextStyle(color: Color(0xFF64748B), fontSize: 13),
                       ),
                     ),
                   )
@@ -2800,7 +3231,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                       ClipboardData(text: buf.toString()),
                                     );
                                     setState(() {
-                                      _statusMessage = 'Текст архива скопирован в буфер обмена';
+                                      _statusMessage =
+                                          'Текст архива скопирован в буфер обмена';
                                     });
                                   },
                                   tooltip: 'Скопировать конспект чата',
@@ -2840,7 +3272,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                             ? 'Выберите контакт выше или нажмите на иконку сообщения рядом с контактом, чтобы написать напрямую.'
                             : 'Нет активного урока. Вы можете переключиться на вкладку «Личный», чтобы написать любому контакту напрямую.',
                         textAlign: TextAlign.center,
-                        style: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                        style: const TextStyle(
+                            color: Color(0xFF64748B), fontSize: 13),
                       ),
                     ),
                   )
@@ -2848,7 +3281,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                     ? const Center(
                         child: Text(
                           'Сообщений пока нет. Напишите первым!',
-                          style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                          style:
+                              TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
                         ),
                       )
                     : ListView.builder(
@@ -2866,22 +3300,28 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                           } catch (_) {}
 
                           return Align(
-                            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                            alignment: isMe
+                                ? Alignment.centerRight
+                                : Alignment.centerLeft,
                             child: Container(
                               margin: const EdgeInsets.only(bottom: 10),
                               constraints: BoxConstraints(
-                                maxWidth: MediaQuery.of(context).size.width * 0.78,
+                                maxWidth:
+                                    MediaQuery.of(context).size.width * 0.78,
                               ),
                               padding: const EdgeInsets.symmetric(
                                 horizontal: 14,
                                 vertical: 10,
                               ),
                               decoration: BoxDecoration(
-                                color: isMe ? const Color(0xFF0F172A) : Colors.white,
+                                color: isMe
+                                    ? const Color(0xFF0F172A)
+                                    : Colors.white,
                                 borderRadius: BorderRadius.circular(16),
                                 border: isMe
                                     ? null
-                                    : Border.all(color: const Color(0xFFE2E8F0)),
+                                    : Border.all(
+                                        color: const Color(0xFFE2E8F0)),
                               ),
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -2923,7 +3363,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                     m.text,
                                     style: TextStyle(
                                       fontSize: 14,
-                                      color: isMe ? Colors.white : const Color(0xFF0F172A),
+                                      color: isMe
+                                          ? Colors.white
+                                          : const Color(0xFF0F172A),
                                     ),
                                   ),
                                 ],
@@ -2946,13 +3388,15 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 Expanded(
                   child: TextField(
                     controller: _chatInputCtrl,
-                    enabled: targetRoomId != null,
+                    enabled: targetRoomId != null && _wsConnected,
+                    onChanged: (_) => setState(() {}),
                     textInputAction: TextInputAction.send,
                     onSubmitted: (_) => _sendChatMessage(),
                     decoration: InputDecoration(
                       hintText: targetRoomId == null
                           ? 'Выберите контакт или начните урок'
-                          : _chatMode == 'direct' && _selectedChatContact != null
+                          : _chatMode == 'direct' &&
+                                  _selectedChatContact != null
                               ? 'Сообщение для @${_selectedChatContact!['username']}...'
                               : 'Написать сообщение в чат урока...',
                       isDense: true,
@@ -2975,7 +3419,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 ),
                 const SizedBox(width: 8),
                 IconButton.filled(
-                  onPressed: targetRoomId == null ? null : _sendChatMessage,
+                  tooltip: 'Отправить сообщение',
+                  onPressed: targetRoomId == null ||
+                          !_wsConnected ||
+                          _sendingChat ||
+                          _chatInputCtrl.text.trim().isEmpty
+                      ? null
+                      : _sendChatMessage,
                   style: IconButton.styleFrom(
                     backgroundColor: const Color(0xFF0F172A),
                     foregroundColor: Colors.white,
@@ -3002,6 +3452,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        StorageUsageCard(
+            key: ValueKey(_currentUser!['id']),
+            baseUrl: _serverUrl,
+            token: _token!,
+            active: _selectedTabIndex == 3),
+        const SizedBox(height: 16),
         Container(
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
@@ -3015,8 +3471,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 radius: 28,
                 backgroundColor: const Color(0xFF0F172A),
                 child: Text(
-                  displayName
-                      .substring(0, displayName.length >= 2 ? 2 : 1)
+                  (displayName.isEmpty
+                          ? '?'
+                          : displayName.substring(
+                              0, displayName.length >= 2 ? 2 : 1))
                       .toUpperCase(),
                   style: const TextStyle(
                     color: Colors.white,
@@ -3065,20 +3523,21 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Row(
+              const Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  const Text(
+                  Expanded(
+                      child: Text(
                     'Версия приложения',
                     style: TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 14,
-                      color: Color(0xFF0F172A),
-                    ),
-                  ),
+                        fontWeight: FontWeight.w700,
+                        fontSize: 14,
+                        color: Color(0xFF0F172A)),
+                  )),
+                  SizedBox(width: 12),
                   Text(
                     'v$kCurrentAppVersion',
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
                       color: Color(0xFF64748B),
@@ -3090,7 +3549,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               if (_updateAvailable && _latestRelease != null) ...[
                 Text(
                   'Доступно обновление v${_latestRelease!['version']}: ${_latestRelease!['release_notes']}',
-                  style: const TextStyle(fontSize: 13, color: Color(0xFF334155)),
+                  style:
+                      const TextStyle(fontSize: 13, color: Color(0xFF334155)),
                 ),
                 const SizedBox(height: 12),
                 if (_downloadingApk)
@@ -3106,9 +3566,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   ),
               ] else
                 OutlinedButton.icon(
-                  onPressed: _checkForUpdates,
+                  onPressed: _checkingUpdates ? null : _checkForUpdates,
                   icon: const Icon(Icons.refresh, size: 18),
-                  label: const Text('Проверить наличие обновлений'),
+                  label: Text(
+                      _checkingUpdates ? 'Проверяем…' : 'Проверить обновления'),
                 ),
             ],
           ),
@@ -3200,6 +3661,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                     ),
                     const SizedBox(height: 20),
                     SegmentedButton<bool>(
+                      showSelectedIcon: false,
+                      style: SegmentedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 8)),
                       segments: const [
                         ButtonSegment(value: true, label: Text('Регистрация')),
                         ButtonSegment(value: false, label: Text('Вход')),
@@ -3208,12 +3672,17 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       onSelectionChanged: (s) {
                         setState(() {
                           _isRegister = s.first;
+                          _authError = null;
                         });
                       },
                     ),
                     const SizedBox(height: 16),
                     TextField(
                       controller: _usernameCtrl,
+                      textInputAction: TextInputAction.next,
+                      autofillHints: const [AutofillHints.username],
+                      autocorrect: false,
+                      enableSuggestions: false,
                       decoration: InputDecoration(
                         labelText: 'Никнейм (@username)',
                         prefixText: '@',
@@ -3226,6 +3695,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                     if (_isRegister) ...[
                       TextField(
                         controller: _displayNameCtrl,
+                        textCapitalization: TextCapitalization.words,
+                        textInputAction: TextInputAction.next,
+                        autofillHints: const [AutofillHints.name],
                         decoration: InputDecoration(
                           labelText: 'Ваше имя',
                           border: OutlineInputBorder(
@@ -3235,6 +3707,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       ),
                       const SizedBox(height: 12),
                       DropdownButtonFormField<String>(
+                        isExpanded: true,
                         initialValue: _selectedRole,
                         decoration: InputDecoration(
                           labelText: 'Ваша роль',
@@ -3260,9 +3733,27 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                     ],
                     TextField(
                       controller: _passwordCtrl,
-                      obscureText: true,
+                      obscureText: !_showPassword,
+                      textInputAction: TextInputAction.done,
+                      autofillHints: [
+                        _isRegister
+                            ? AutofillHints.newPassword
+                            : AutofillHints.password
+                      ],
+                      onSubmitted: (_) => _submitAuth(),
                       decoration: InputDecoration(
                         labelText: 'Пароль',
+                        helperText: _isRegister ? 'Не менее 4 символов' : null,
+                        suffixIcon: IconButton(
+                          tooltip: _showPassword
+                              ? 'Скрыть пароль'
+                              : 'Показать пароль',
+                          onPressed: () =>
+                              setState(() => _showPassword = !_showPassword),
+                          icon: Icon(_showPassword
+                              ? Icons.visibility_off_outlined
+                              : Icons.visibility_outlined),
+                        ),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(12),
                         ),
@@ -3289,11 +3780,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                     if (_showServerConfig) ...[
                       TextField(
                         controller: _serverUrlCtrl,
-                        decoration: InputDecoration(
-                          labelText: 'Адрес сервера управления',
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(12),
-                          ),
+                        keyboardType: TextInputType.url,
+                        autocorrect: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Адрес сервера',
+                          helperText:
+                              'На телефоне укажите адрес компьютера в сети.\n127.0.0.1 указывает на сам телефон.',
+                          helperMaxLines: 3,
                         ),
                       ),
                       const SizedBox(height: 12),
@@ -3317,7 +3810,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       const SizedBox(height: 12),
                     ],
                     FilledButton(
-                      onPressed: _authLoading ? null : _submitAuth,
+                      onPressed:
+                          _authLoading || !_identityReady ? null : _submitAuth,
                       style: FilledButton.styleFrom(
                         backgroundColor: const Color(0xFF0F172A),
                         foregroundColor: Colors.white,

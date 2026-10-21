@@ -30,6 +30,10 @@ services:
         condition: service_healthy
     environment:
       CONTROL_PORT: "4000"
+      LIAPER_ADMIN_SECRET: "${LIAPER_ADMIN_SECRET:-}"
+      LIAPER_STORAGE_SECRET: "${LIAPER_STORAGE_SECRET:?Set LIAPER_STORAGE_SECRET in .env}"
+      FILE_NODE_INTERNAL_URL: "http://liaper-files:4201"
+      FILE_NODE_PUBLIC_URL: "${FILE_NODE_PUBLIC_URL:-http://127.0.0.1:4201}"
       DATABASE_URL: "postgres://${POSTGRES_USER:-liaper}:${POSTGRES_PASSWORD:-liaper_secret_2026}@postgres:5432/${POSTGRES_DB:-liaper}"
       RUST_LOG: "liaper_control=info,tower_http=info"
     ports:
@@ -37,6 +41,25 @@ services:
     volumes:
       - ./data:/app/data
       - ./releases:/app/releases
+
+  liaper-files:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    command: ["liaper-files"]
+    depends_on:
+      - liaper-control
+    environment:
+      FILE_NODE_PORT: "4201"
+      FILE_NODE_ID: "storage-local-1"
+      FILE_STORAGE_PATH: "/app/data/files"
+      LIAPER_STORAGE_SECRET: "${LIAPER_STORAGE_SECRET:?Set LIAPER_STORAGE_SECRET in .env}"
+      CONTROL_URL: "http://liaper-control:4000"
+    ports:
+      - "4201:4201"
+    volumes:
+      - ./data/files:/app/data/files
 
   liaper-node-1:
     build:
@@ -83,7 +106,7 @@ services:
       context: ./clients/web-desktop
       dockerfile: ../../Dockerfile.web
       args:
-        VITE_CONTROL_URL: "${VITE_CONTROL_URL:-http://127.0.0.1:4000}"
+        VITE_CONTROL_URL: "${VITE_CONTROL_URL:-}"
     container_name: liaper-web
     restart: unless-stopped
     depends_on:

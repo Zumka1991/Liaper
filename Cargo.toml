@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
+exclude = ["clients/web-desktop/src-tauri"]
 members = [
     "crates/common",
     "crates/control-server",
     "crates/media-node",
+    "crates/file-node",
 ]
 
 [workspace.package]

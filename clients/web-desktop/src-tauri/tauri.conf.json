@@ -12,11 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "Liaper — Защищённая платформа для репетиторства (E2EE)",
+        "title": "Liaper — Учебное пространство",
         "width": 1360,
         "height": 840,
-        "minWidth": 1024,
-        "minHeight": 680,
+        "minWidth": 640,
+        "minHeight": 480,
         "resizable": true
       }
     ],

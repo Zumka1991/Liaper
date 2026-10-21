@@ -33,7 +33,12 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
         self_profile.username, self_profile.id
     );
 
-    let active_rooms: Vec<RoomInfo> = state.rooms.iter().map(|r| r.value().clone()).collect();
+    let active_rooms: Vec<RoomInfo> = state
+        .rooms
+        .iter()
+        .filter(|r| r.participants.iter().any(|p| p.user_id == user_id))
+        .map(|r| r.value().clone())
+        .collect();
     let (contacts, incoming_requests, outgoing_requests) = state.user_contacts_bundle(&user_id);
 
     let welcome = ControlToClientMsg::Welcome {
@@ -75,7 +80,7 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
     while let Some(Ok(frame)) = ws_receiver.next().await {
         if let Message::Text(text) = frame {
             match serde_json::from_str::<ClientToControlMsg>(&text) {
-                Ok(cmd) => process_client_command(&state, user_id, cmd),
+                Ok(cmd) => process_client_command(&state, user_id, cmd).await,
                 Err(err) => {
                     warn!("Invalid WS message from {}: {}", user_id, err);
                     state.send_to_user(
@@ -102,10 +107,20 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
     info!("Client disconnected: @{}", self_profile.username);
 }
 
-fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientToControlMsg) {
+async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientToControlMsg) {
     let caller = match state.users_by_id.get(&user_id) {
         Some(u) => u.clone(),
         None => return,
+    };
+    let _contact_guard = if matches!(
+        &cmd,
+        ClientToControlMsg::SendContactRequest { .. }
+            | ClientToControlMsg::RespondContactRequest { .. }
+            | ClientToControlMsg::RemoveContact { .. }
+    ) {
+        Some(state.contact_mutations.lock().await)
+    } else {
+        None
     };
 
     match cmd {
@@ -113,6 +128,10 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
         // Взаимные Контакты и Заявки
         // ====================================================================
         ClientToControlMsg::SendContactRequest { target_username } => {
+            if caller.role != liaper_common::UserRole::Tutor {
+                state.send_to_user(&caller.id,&ControlToClientMsg::Error{message:"Приглашение в контакты отправляет преподаватель. Сообщите ему свой @ник".into()});
+                return;
+            }
             let norm = ControlState::normalize_username(&target_username);
             let target_id = match state.user_id_by_username.get(&norm) {
                 Some(id) => *id,
@@ -146,19 +165,13 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 );
                 return;
             }
-
-            // Если от этого пользователя уже есть встречная заявка к нам — автоматически подтверждаем взаимный контакт!
-            let reverse_req_id = state
-                .contact_requests
-                .iter()
-                .find(|e| e.from_user_id == target_id && e.to_user_id == caller.id)
-                .map(|e| *e.key());
-
-            if let Some(req_id) = reverse_req_id {
-                state.contact_requests.remove(&req_id);
-                state.add_mutual_contact(caller.id, target_id);
-                state.push_contacts_update(&caller.id);
-                state.push_contacts_update(&target_id);
+            if let Err(e) = state.validate_student_addition(caller.id, target_id) {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: e.to_string(),
+                    },
+                );
                 return;
             }
 
@@ -172,7 +185,10 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 state.send_to_user(
                     &caller.id,
                     &ControlToClientMsg::Error {
-                        message: format!("Заявка для @{} уже отправлена и ожидает подтверждения", norm),
+                        message: format!(
+                            "Заявка для @{} уже отправлена и ожидает подтверждения",
+                            norm
+                        ),
                     },
                 );
                 return;
@@ -184,6 +200,15 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 to_user_id: target_id,
                 created_at: Utc::now(),
             };
+            if state.persist_contact_request(&req).await.is_err() {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Не удалось сохранить заявку в базе данных".into(),
+                    },
+                );
+                return;
+            }
             state.contact_requests.insert(req.id, req);
             state.save_contacts_to_disk();
 
@@ -201,6 +226,22 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 return;
             }
 
+            if let Err(e) = state
+                .persist_contact_decision(req.from_user_id, req.to_user_id, request_id, accept)
+                .await
+            {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: if e.downcast_ref::<tokio_postgres::Error>().is_some() {
+                            "Не удалось сохранить контакт в базе данных".into()
+                        } else {
+                            e.to_string()
+                        },
+                    },
+                );
+                return;
+            }
             state.contact_requests.remove(&request_id);
             if accept {
                 state.add_mutual_contact(req.from_user_id, req.to_user_id);
@@ -213,6 +254,19 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
         }
 
         ClientToControlMsg::RemoveContact { contact_user_id } => {
+            if state
+                .persist_contact_removal(caller.id, contact_user_id)
+                .await
+                .is_err()
+            {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Не удалось удалить контакт из базы данных".into(),
+                    },
+                );
+                return;
+            }
             state.remove_mutual_contact(caller.id, contact_user_id);
             state.push_contacts_update(&caller.id);
             state.push_contacts_update(&contact_user_id);
@@ -265,6 +319,11 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 let norm = ControlState::normalize_username(&raw_nick);
                 if let Some(target_id) = state.user_id_by_username.get(&norm) {
                     if *target_id != caller.id && state.are_contacts(&caller.id, &target_id) {
+                        state
+                            .room_invitations
+                            .entry(room_id)
+                            .or_default()
+                            .insert(*target_id);
                         state.send_to_user(
                             &target_id,
                             &ControlToClientMsg::IncomingCall {
@@ -352,6 +411,11 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
             };
 
             state.rooms.insert(room_id, room.clone());
+            state
+                .room_invitations
+                .entry(room_id)
+                .or_default()
+                .insert(target_id);
             state.send_to_user(
                 &caller.id,
                 &ControlToClientMsg::RoomUpdated { room: room.clone() },
@@ -389,16 +453,27 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 state.send_to_user(
                     &caller.id,
                     &ControlToClientMsg::Error {
-                        message: format!(
-                            "Пользователь @{} не состоит в ваших контактах",
-                            norm
-                        ),
+                        message: format!("Пользователь @{} не состоит в ваших контактах", norm),
                     },
                 );
                 return;
             }
 
             if let Some(room) = state.rooms.get(&room_id) {
+                if !room.participants.iter().any(|p| p.user_id == caller.id) {
+                    state.send_to_user(
+                        &caller.id,
+                        &ControlToClientMsg::Error {
+                            message: "Приглашать может только участник урока".into(),
+                        },
+                    );
+                    return;
+                }
+                state
+                    .room_invitations
+                    .entry(room_id)
+                    .or_default()
+                    .insert(target_id);
                 state.send_to_user(
                     &target_id,
                     &ControlToClientMsg::IncomingCall {
@@ -415,6 +490,23 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
             audio_enabled,
             video_enabled,
         } => {
+            let allowed = state
+                .rooms
+                .get(&room_id)
+                .is_some_and(|r| r.participants.iter().any(|p| p.user_id == caller.id))
+                || state
+                    .room_invitations
+                    .get(&room_id)
+                    .is_some_and(|ids| ids.contains(&caller.id));
+            if !allowed {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Войти в урок можно только по приглашению".into(),
+                    },
+                );
+                return;
+            }
             let mut updated_room = None;
             if let Some(mut room) = state.rooms.get_mut(&room_id) {
                 if let Some(existing) = room
@@ -475,6 +567,13 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
         }
 
         ClientToControlMsg::DeclineCall { room_id, reason } => {
+            if let Some(mut ids) = state.room_invitations.get_mut(&room_id) {
+                if !ids.remove(&caller.id) {
+                    return;
+                }
+            } else {
+                return;
+            }
             if let Some(room) = state.rooms.get(&room_id) {
                 for p in &room.participants {
                     state.send_to_user(
@@ -541,6 +640,27 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
             iv_b64,
             room_key_id,
         } => {
+            let room_allowed = state
+                .rooms
+                .get(&room_id)
+                .is_some_and(|room| room.participants.iter().any(|p| p.user_id == caller.id));
+            let dm_allowed = state
+                .contacts_by_user
+                .get(&caller.id)
+                .is_some_and(|contacts| {
+                    contacts
+                        .iter()
+                        .any(|id| ControlState::dm_room_id(&caller.id, id) == room_id)
+                });
+            if !room_allowed && !dm_allowed {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Нет доступа к этому чату".into(),
+                    },
+                );
+                return;
+            }
             let msg = EncryptedChatMessage {
                 id: Uuid::new_v4(),
                 room_id,
@@ -553,12 +673,22 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 created_at: Utc::now(),
             };
 
+            if let Err(e) = state.persist_chat(&msg).await {
+                tracing::error!("Chat persistence failed: {}", e);
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Сообщение не сохранено: база данных недоступна".into(),
+                    },
+                );
+                return;
+            }
             state
                 .room_chats
                 .entry(room_id)
                 .or_default()
                 .push(msg.clone());
-            state.save_chats_to_disk(Some(msg.clone()));
+            state.save_chats_to_disk();
 
             if state.rooms.contains_key(&room_id) {
                 state.broadcast_to_room(
@@ -603,6 +733,7 @@ fn remove_user_from_room(state: &Arc<ControlState>, room_id: Uuid, user_id: Uuid
 
     if should_remove_room {
         state.rooms.remove(&room_id);
+        state.room_invitations.remove(&room_id);
     } else if let Some(room) = updated_room {
         state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room });
     }
@@ -618,5 +749,155 @@ fn remove_user_from_all_rooms(state: &Arc<ControlState>, user_id: Uuid) {
 
     for room_id in room_ids {
         remove_user_from_room(state, room_id, user_id);
+    }
+}
+
+#[cfg(test)]
+mod contact_tests {
+    use super::*;
+    use crate::state::StoredUser;
+    use liaper_common::UserRole;
+    #[tokio::test]
+    async fn only_tutors_invite_students_and_tenth_slot_is_atomic() {
+        let root = std::env::temp_dir().join(format!("liaper-contact-test-{}", Uuid::new_v4()));
+        let state = ControlState::new(root.join("users.json"));
+        let add = |role| {
+            let id = Uuid::new_v4();
+            let username = id.simple().to_string();
+            state.users_by_id.insert(
+                id,
+                StoredUser {
+                    id,
+                    username: username.clone(),
+                    display_name: "Test".into(),
+                    password_hash: "hash".into(),
+                    salt_b64: "salt".into(),
+                    role,
+                    e2ee_public_key: "key".into(),
+                    key_fingerprint: "fingerprint".into(),
+                },
+            );
+            state.user_id_by_username.insert(username, id);
+            id
+        };
+        let tutor = add(UserRole::Tutor);
+        let tutor2 = add(UserRole::Tutor);
+        let students: Vec<_> = (0..11).map(|_| add(UserRole::Student)).collect();
+        let invite = |target: Uuid| ClientToControlMsg::SendContactRequest {
+            target_username: target.simple().to_string(),
+        };
+        process_client_command(&state, students[0], invite(students[1])).await;
+        process_client_command(&state, students[0], invite(tutor)).await;
+        process_client_command(&state, tutor, invite(tutor2)).await;
+        assert!(state.contact_requests.is_empty());
+        for student in &students {
+            process_client_command(&state, tutor, invite(*student)).await;
+        }
+        let requests: Vec<_> = students
+            .iter()
+            .map(|id| {
+                state
+                    .contact_requests
+                    .iter()
+                    .find(|r| r.to_user_id == *id)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        for i in 0..9 {
+            process_client_command(
+                &state,
+                students[i],
+                ClientToControlMsg::RespondContactRequest {
+                    request_id: requests[i],
+                    accept: true,
+                },
+            )
+            .await;
+        }
+        tokio::join!(
+            process_client_command(
+                &state,
+                students[9],
+                ClientToControlMsg::RespondContactRequest {
+                    request_id: requests[9],
+                    accept: true
+                }
+            ),
+            process_client_command(
+                &state,
+                students[10],
+                ClientToControlMsg::RespondContactRequest {
+                    request_id: requests[10],
+                    accept: true
+                }
+            )
+        );
+        assert_eq!(state.student_count(tutor), 10);
+        let pending = state.contact_requests.iter().next().unwrap().clone();
+        process_client_command(
+            &state,
+            tutor,
+            ClientToControlMsg::RemoveContact {
+                contact_user_id: students[0],
+            },
+        )
+        .await;
+        process_client_command(
+            &state,
+            pending.to_user_id,
+            ClientToControlMsg::RespondContactRequest {
+                request_id: pending.id,
+                accept: true,
+            },
+        )
+        .await;
+        assert_eq!(state.student_count(tutor), 10);
+        assert!(state.are_contacts(&tutor, &pending.to_user_id));
+        process_client_command(
+            &state,
+            tutor,
+            ClientToControlMsg::CreateRoom {
+                title: "Test lesson".into(),
+                invited_usernames: vec![students[1].simple().to_string()],
+                preferred_region: None,
+            },
+        )
+        .await;
+        let room = state.rooms.iter().next().unwrap().id;
+        process_client_command(
+            &state,
+            tutor2,
+            ClientToControlMsg::JoinRoom {
+                room_id: room,
+                audio_enabled: false,
+                video_enabled: false,
+            },
+        )
+        .await;
+        assert_eq!(state.rooms.get(&room).unwrap().participants.len(), 1);
+        process_client_command(
+            &state,
+            students[2],
+            ClientToControlMsg::InviteByNick {
+                room_id: room,
+                target_username: tutor.simple().to_string(),
+            },
+        )
+        .await;
+        assert!(!state.room_invitations.get(&room).unwrap().contains(&tutor));
+        process_client_command(
+            &state,
+            students[1],
+            ClientToControlMsg::JoinRoom {
+                room_id: room,
+                audio_enabled: false,
+                video_enabled: false,
+            },
+        )
+        .await;
+        assert_eq!(state.rooms.get(&room).unwrap().participants.len(), 2);
+        assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
