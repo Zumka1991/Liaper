@@ -114,11 +114,14 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   final TextEditingController _searchContactCtrl = TextEditingController();
   final TextEditingController _inviteInCallCtrl = TextEditingController();
 
-  // Чат урока
+  // Чат урока, личные диалоги и архив уроков
   final TextEditingController _chatInputCtrl = TextEditingController();
   final ScrollController _chatScrollCtrl = ScrollController();
   final List<ChatMessageItem> _chatMessages = [];
   final Set<String> _seenMessageIds = {};
+  String _chatMode = 'lesson'; // 'lesson' | 'direct' | 'archive'
+  Map<String, dynamic>? _selectedChatContact;
+  List<Map<String, dynamic>> _archivedChats = [];
 
   // Локальная камера и микрофон + подключение к SFU-ноде
   final RTCVideoRenderer _localRenderer = RTCVideoRenderer();
@@ -179,6 +182,37 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // ===========================================================================
   // Прозрачное E2EE для чата (совместимое с Web/Desktop AES-256-GCM)
   // ===========================================================================
+  String _computeDmRoomId(String u1, String u2) {
+    final s1 = u1.toLowerCase();
+    final s2 = u2.toLowerCase();
+    final first = s1.compareTo(s2) <= 0 ? s1 : s2;
+    final second = s1.compareTo(s2) <= 0 ? s2 : s1;
+    if (first.length < 18 || second.length < 36) return u1;
+    return '${first.substring(0, 18)}${second.substring(18, 36)}';
+  }
+
+  String? get _activeChatRoomId {
+    if (_chatMode == 'lesson' && _currentRoom != null) {
+      return _currentRoom!['id']?.toString();
+    }
+    if (_chatMode == 'direct' && _selectedChatContact != null && _currentUser != null) {
+      return _computeDmRoomId(
+        _currentUser!['id'].toString(),
+        _selectedChatContact!['id'].toString(),
+      );
+    }
+    if (_currentRoom != null) {
+      return _currentRoom!['id']?.toString();
+    }
+    if (_selectedChatContact != null && _currentUser != null) {
+      return _computeDmRoomId(
+        _currentUser!['id'].toString(),
+        _selectedChatContact!['id'].toString(),
+      );
+    }
+    return null;
+  }
+
   SecretKey _deriveRoomSecretKey(String roomId) {
     final digest = sha256.convert(utf8.encode('liaper-room-e2ee-v1:$roomId'));
     return SecretKey(digest.bytes);
@@ -240,7 +274,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     final senderDisplayName = (rawMsg['sender_display_name'] ?? senderUsername).toString();
     final ciphertextB64 = (rawMsg['ciphertext_b64'] ?? '').toString();
     final ivB64 = (rawMsg['iv_b64'] ?? '').toString();
-    final sentAt = (rawMsg['sent_at'] ?? '').toString();
+    final sentAt = (rawMsg['created_at'] ?? rawMsg['sent_at'] ?? '').toString();
 
     final decrypted = await _decryptChatText(ciphertextB64, ivB64, roomId);
     if (!mounted) return;
@@ -274,23 +308,64 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }
 
   Future<void> _sendChatMessage() async {
-    final room = _currentRoom;
+    final targetRoomId = _activeChatRoomId;
     final text = _chatInputCtrl.text.trim();
-    if (room == null || text.isEmpty) return;
+    if (targetRoomId == null || text.isEmpty) return;
 
     _chatInputCtrl.clear();
-    final roomId = room['id'].toString();
-    final encrypted = await _encryptChatText(text, roomId);
+    final encrypted = await _encryptChatText(text, targetRoomId);
 
     _sendWs({
       'type': 'send_encrypted_chat',
       'payload': {
-        'room_id': roomId,
+        'room_id': targetRoomId,
         'ciphertext_b64': encrypted['ciphertext_b64'],
         'iv_b64': encrypted['iv_b64'],
         'room_key_id': encrypted['room_key_id'],
       },
     });
+  }
+
+  Future<void> _saveCurrentLessonToArchive({bool showNotification = true}) async {
+    if (_currentRoom == null) return;
+    final roomId = _currentRoom!['id'].toString();
+    final roomTitle = (_currentRoom!['title'] ?? 'Урок').toString();
+    final roomMsgs = _chatMessages.where((m) => m.roomId == roomId).toList();
+    if (roomMsgs.isEmpty) {
+      if (showNotification && mounted) {
+        setState(() {
+          _statusMessage = 'В чате урока пока нет сообщений для сохранения';
+        });
+      }
+      return;
+    }
+
+    final entry = {
+      'id': roomId,
+      'title': roomTitle,
+      'savedAt': DateTime.now().toIso8601String(),
+      'messages': roomMsgs
+          .map((m) => {
+                'sender': m.senderDisplayName,
+                'username': m.senderUsername,
+                'text': m.text,
+                'sentAt': m.sentAt,
+              })
+          .toList(),
+    };
+
+    setState(() {
+      _archivedChats = [
+        entry,
+        ..._archivedChats.where((a) => a['id'] != roomId),
+      ];
+      if (showNotification) {
+        _statusMessage = 'Чат урока «$roomTitle» сохранён в архив';
+      }
+    });
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('liaper_chat_archives', jsonEncode(_archivedChats));
   }
 
   // ===========================================================================
@@ -650,9 +725,20 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       await prefs.setString('liaper_fp', fp);
     }
 
+    final rawArchives = prefs.getString('liaper_chat_archives');
+    List<Map<String, dynamic>> loadedArchives = [];
+    if (rawArchives != null) {
+      try {
+        final decoded = jsonDecode(rawArchives) as List<dynamic>;
+        loadedArchives =
+            decoded.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+      } catch (_) {}
+    }
+
     setState(() {
       _publicKeyB64 = pubKey!;
       _fingerprint = fp!;
+      _archivedChats = loadedArchives;
       _token = prefs.getString('liaper_token');
       final rawUser = prefs.getString('liaper_user');
       if (rawUser != null) {
@@ -731,6 +817,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           _currentRoom = room;
           _incomingCall = null;
           if (!wasInRoom && room != null) {
+            _chatMode = 'lesson';
             _selectedTabIndex = 1; // Переключаем на экран звонка при старте урока
           }
         });
@@ -760,8 +847,6 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
       case 'room_chat_history':
         final list = (payload?['messages'] as List<dynamic>?) ?? [];
-        _chatMessages.clear();
-        _seenMessageIds.clear();
         for (final item in list) {
           if (item is Map<String, dynamic>) {
             _handleIncomingEncryptedChat(item);
@@ -918,6 +1003,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
   void _leaveCurrentRoom() {
     if (_currentRoom == null) return;
+    _saveCurrentLessonToArchive(showNotification: true);
     _sendWs({
       'type': 'leave_room',
       'payload': {'room_id': _currentRoom!['id']},
@@ -925,8 +1011,6 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     _stopLocalMediaAndSfu();
     setState(() {
       _currentRoom = null;
-      _chatMessages.clear();
-      _seenMessageIds.clear();
       _selectedTabIndex = 0;
     });
   }
@@ -1902,42 +1986,62 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       ],
                     ),
                   ),
-                  const SizedBox(width: 6),
+                  const SizedBox(width: 4),
+                  IconButton.filledTonal(
+                    onPressed: () {
+                      setState(() {
+                        _selectedChatContact = u;
+                        _chatMode = 'direct';
+                        _selectedTabIndex = 2;
+                        _unreadChatCount = 0;
+                      });
+                    },
+                    visualDensity: VisualDensity.compact,
+                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
+                    padding: EdgeInsets.zero,
+                    style: IconButton.styleFrom(
+                      backgroundColor: const Color(0xFFF1F5F9),
+                      foregroundColor: const Color(0xFF0F172A),
+                    ),
+                    tooltip: 'Написать в личный чат',
+                    icon: const Icon(Icons.chat_bubble_outline, size: 17),
+                  ),
+                  const SizedBox(width: 4),
                   IconButton.filledTonal(
                     onPressed: () => _callByNick(username, withVideo: false),
                     visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
                     padding: EdgeInsets.zero,
                     style: IconButton.styleFrom(
                       backgroundColor: const Color(0xFFF1F5F9),
                       foregroundColor: const Color(0xFF0F172A),
                     ),
                     tooltip: 'Аудиозвонок',
-                    icon: const Icon(Icons.call, size: 18),
+                    icon: const Icon(Icons.call, size: 17),
                   ),
                   const SizedBox(width: 4),
                   IconButton.filled(
                     onPressed: () => _callByNick(username, withVideo: true),
                     visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                    constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
                     padding: EdgeInsets.zero,
                     style: IconButton.styleFrom(
                       backgroundColor: const Color(0xFF0F172A),
                       foregroundColor: Colors.white,
                     ),
                     tooltip: 'Видеозвонок',
-                    icon: const Icon(Icons.videocam, size: 18),
+                    icon: const Icon(Icons.videocam, size: 17),
                   ),
                   const SizedBox(width: 2),
                   IconButton(
                     onPressed: () => _removeContact(u['id'] as String, username),
                     visualDensity: VisualDensity.compact,
-                    constraints: const BoxConstraints(minWidth: 32, minHeight: 36),
+                    constraints: const BoxConstraints(minWidth: 30, minHeight: 34),
                     padding: EdgeInsets.zero,
                     tooltip: 'Удалить из контактов',
                     icon: const Icon(
                       Icons.delete_outline,
-                      size: 18,
+                      size: 17,
                       color: Color(0xFF94A3B8),
                     ),
                   ),
@@ -2531,229 +2635,357 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }
 
   // ===========================================================================
-  // ВКЛАДКА 3: Чат урока (совместимый с веб-приложением)
+  // ВКЛАДКА 3: Чат урока, Личные сообщения контактам и Архив уроков
   // ===========================================================================
   Widget _buildChatTab() {
-    if (_currentRoom == null) {
-      return Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Container(
-                width: 64,
-                height: 64,
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  shape: BoxShape.circle,
-                  border: Border.all(color: const Color(0xFFE2E8F0)),
-                ),
-                child: const Icon(
-                  Icons.chat_bubble_outline,
-                  size: 28,
-                  color: Color(0xFF64748B),
-                ),
-              ),
-              const SizedBox(height: 14),
-              const Text(
-                'Чат доступен во время урока',
-                style: TextStyle(
-                  fontSize: 17,
-                  fontWeight: FontWeight.w700,
-                  color: Color(0xFF0F172A),
-                ),
-              ),
-              const SizedBox(height: 6),
-              const Text(
-                'Позвоните контакту или присоединитесь к групповому уроку, чтобы обмениваться сообщениями и материалами.',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 13, color: Color(0xFF64748B)),
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
     final myId = _currentUser?['id']?.toString();
+    final targetRoomId = _activeChatRoomId;
+    final visibleMessages = targetRoomId == null
+        ? <ChatMessageItem>[]
+        : _chatMessages.where((m) => m.roomId == targetRoomId).toList();
 
     return Column(
       children: [
-        // Шапка чата комнаты
+        // Панель выбора режима чата (Урок / Личный диалог / Архив)
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
           decoration: const BoxDecoration(
             color: Colors.white,
             border: Border(bottom: BorderSide(color: Color(0xFFE2E8F0))),
           ),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Icon(Icons.forum_outlined, size: 20, color: Color(0xFF0F172A)),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+              SegmentedButton<String>(
+                segments: [
+                  const ButtonSegment(value: 'lesson', label: Text('Урок')),
+                  const ButtonSegment(value: 'direct', label: Text('Личный')),
+                  ButtonSegment(
+                    value: 'archive',
+                    label: Text('Архив (${_archivedChats.length})'),
+                  ),
+                ],
+                selected: {_chatMode},
+                onSelectionChanged: (s) {
+                  setState(() {
+                    _chatMode = s.first;
+                  });
+                },
+              ),
+              if (_chatMode == 'lesson' && _currentRoom != null) ...[
+                const SizedBox(height: 8),
+                Row(
                   children: [
-                    Text(
-                      'Чат: ${_currentRoom!['title']}',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w700,
-                        fontSize: 14,
-                        color: Color(0xFF0F172A),
+                    Expanded(
+                      child: Text(
+                        'Урок: ${_currentRoom!['title']}',
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 13,
+                          color: Color(0xFF0F172A),
+                        ),
                       ),
                     ),
-                    const Text(
-                      'Сообщения синхронизируются со всеми участниками урока',
-                      style: TextStyle(fontSize: 11, color: Color(0xFF64748B)),
+                    TextButton.icon(
+                      onPressed: () => _saveCurrentLessonToArchive(showNotification: true),
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      icon: const Icon(Icons.bookmark_add_outlined, size: 16),
+                      label: const Text('В архив', style: TextStyle(fontSize: 12)),
+                    ),
+                    TextButton.icon(
+                      onPressed: () => setState(() => _selectedTabIndex = 1),
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      icon: const Icon(Icons.videocam, size: 16),
+                      label: const Text('К видео', style: TextStyle(fontSize: 12)),
                     ),
                   ],
                 ),
-              ),
-              TextButton.icon(
-                onPressed: () => setState(() => _selectedTabIndex = 1),
-                icon: const Icon(Icons.videocam, size: 16),
-                label: const Text('К видео'),
-              ),
+              ],
+              if (_chatMode == 'direct') ...[
+                const SizedBox(height: 8),
+                if (_contacts.isEmpty)
+                  const Text(
+                    'Добавьте собеседника во взаимные контакты, чтобы писать напрямую',
+                    style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                  )
+                else
+                  SizedBox(
+                    height: 36,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: _contacts.length,
+                      separatorBuilder: (_, __) => const SizedBox(width: 6),
+                      itemBuilder: (_, idx) {
+                        final c = _contacts[idx] as Map<String, dynamic>;
+                        final isSelected = _selectedChatContact?['id'] == c['id'];
+                        return ChoiceChip(
+                          selected: isSelected,
+                          visualDensity: VisualDensity.compact,
+                          label: Text(
+                            '${c['display_name']} (@${c['username']})',
+                            style: const TextStyle(fontSize: 12),
+                          ),
+                          onSelected: (_) {
+                            setState(() {
+                              _selectedChatContact = c;
+                            });
+                          },
+                        );
+                      },
+                    ),
+                  ),
+              ],
             ],
           ),
         ),
 
-        // Список сообщений
-        Expanded(
-          child: _chatMessages.isEmpty
-              ? const Center(
-                  child: Text(
-                    'Сообщений пока нет. Напишите первым!',
-                    style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
-                  ),
-                )
-              : ListView.builder(
-                  controller: _chatScrollCtrl,
-                  padding: const EdgeInsets.all(16),
-                  itemCount: _chatMessages.length,
-                  itemBuilder: (_, idx) {
-                    final m = _chatMessages[idx];
-                    final isMe = m.senderId == myId;
-                    String timeLabel = '';
-                    try {
-                      final dt = DateTime.parse(m.sentAt).toLocal();
-                      timeLabel =
-                          '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
-                    } catch (_) {}
-
-                    return Align(
-                      alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
-                      child: Container(
-                        margin: const EdgeInsets.only(bottom: 10),
-                        constraints: BoxConstraints(
-                          maxWidth: MediaQuery.of(context).size.width * 0.78,
-                        ),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 10,
-                        ),
+        // Режим Архива уроков
+        if (_chatMode == 'archive')
+          Expanded(
+            child: _archivedChats.isEmpty
+                ? const Center(
+                    child: Padding(
+                      padding: EdgeInsets.all(24),
+                      child: Text(
+                        'Сохранённых чатов уроков пока нет. По завершении урока переписка сохраняется в архив автоматически или по кнопке «В архив».',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                      ),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.all(14),
+                    itemCount: _archivedChats.length,
+                    itemBuilder: (_, idx) {
+                      final arch = _archivedChats[idx];
+                      final msgs = (arch['messages'] as List<dynamic>?) ?? [];
+                      return Container(
+                        margin: const EdgeInsets.only(bottom: 12),
+                        padding: const EdgeInsets.all(14),
                         decoration: BoxDecoration(
-                          color: isMe ? const Color(0xFF0F172A) : Colors.white,
-                          borderRadius: BorderRadius.circular(16),
-                          border: isMe
-                              ? null
-                              : Border.all(color: const Color(0xFFE2E8F0)),
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: const Color(0xFFE2E8F0)),
                         ),
                         child: Column(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Row(
-                              mainAxisSize: MainAxisSize.min,
                               children: [
-                                Text(
-                                  isMe
-                                      ? 'Вы'
-                                      : '${m.senderDisplayName} (@${m.senderUsername})',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    fontWeight: FontWeight.w600,
-                                    color: isMe
-                                        ? const Color(0xFF94A3B8)
-                                        : const Color(0xFF64748B),
+                                Expanded(
+                                  child: Text(
+                                    (arch['title'] ?? 'Урок').toString(),
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 14,
+                                      color: Color(0xFF0F172A),
+                                    ),
                                   ),
                                 ),
-                                if (timeLabel.isNotEmpty) ...[
-                                  const SizedBox(width: 8),
+                                IconButton(
+                                  onPressed: () {
+                                    final buf = StringBuffer();
+                                    buf.writeln('=== ${arch['title']} ===');
+                                    for (final m in msgs) {
+                                      final map = m as Map<String, dynamic>;
+                                      buf.writeln(
+                                          '${map['sender']} (@${map['username']}): ${map['text']}');
+                                    }
+                                    Clipboard.setData(
+                                      ClipboardData(text: buf.toString()),
+                                    );
+                                    setState(() {
+                                      _statusMessage = 'Текст архива скопирован в буфер обмена';
+                                    });
+                                  },
+                                  tooltip: 'Скопировать конспект чата',
+                                  icon: const Icon(Icons.copy, size: 17),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            ...msgs.map((m) {
+                              final map = m as Map<String, dynamic>;
+                              return Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: Text(
+                                  '${map['sender']}: ${map['text']}',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: Color(0xFF334155),
+                                  ),
+                                ),
+                              );
+                            }),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+          )
+        else ...[
+          // Список сообщений (Урок или Личный чат)
+          Expanded(
+            child: targetRoomId == null
+                ? Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(24),
+                      child: Text(
+                        _chatMode == 'direct'
+                            ? 'Выберите контакт выше или нажмите на иконку сообщения рядом с контактом, чтобы написать напрямую.'
+                            : 'Нет активного урока. Вы можете переключиться на вкладку «Личный», чтобы написать любому контакту напрямую.',
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(color: Color(0xFF64748B), fontSize: 13),
+                      ),
+                    ),
+                  )
+                : visibleMessages.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'Сообщений пока нет. Напишите первым!',
+                          style: TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                        ),
+                      )
+                    : ListView.builder(
+                        controller: _chatScrollCtrl,
+                        padding: const EdgeInsets.all(16),
+                        itemCount: visibleMessages.length,
+                        itemBuilder: (_, idx) {
+                          final m = visibleMessages[idx];
+                          final isMe = m.senderId == myId;
+                          String timeLabel = '';
+                          try {
+                            final dt = DateTime.parse(m.sentAt).toLocal();
+                            timeLabel =
+                                '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+                          } catch (_) {}
+
+                          return Align(
+                            alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
+                            child: Container(
+                              margin: const EdgeInsets.only(bottom: 10),
+                              constraints: BoxConstraints(
+                                maxWidth: MediaQuery.of(context).size.width * 0.78,
+                              ),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 14,
+                                vertical: 10,
+                              ),
+                              decoration: BoxDecoration(
+                                color: isMe ? const Color(0xFF0F172A) : Colors.white,
+                                borderRadius: BorderRadius.circular(16),
+                                border: isMe
+                                    ? null
+                                    : Border.all(color: const Color(0xFFE2E8F0)),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Flexible(
+                                        child: Text(
+                                          isMe
+                                              ? 'Вы'
+                                              : '${m.senderDisplayName} (@${m.senderUsername})',
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: isMe
+                                                ? const Color(0xFF94A3B8)
+                                                : const Color(0xFF64748B),
+                                          ),
+                                        ),
+                                      ),
+                                      if (timeLabel.isNotEmpty) ...[
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          timeLabel,
+                                          style: TextStyle(
+                                            fontSize: 10,
+                                            color: isMe
+                                                ? const Color(0xFF64748B)
+                                                : const Color(0xFF94A3B8),
+                                          ),
+                                        ),
+                                      ],
+                                    ],
+                                  ),
+                                  const SizedBox(height: 4),
                                   Text(
-                                    timeLabel,
+                                    m.text,
                                     style: TextStyle(
-                                      fontSize: 10,
-                                      color: isMe
-                                          ? const Color(0xFF64748B)
-                                          : const Color(0xFF94A3B8),
+                                      fontSize: 14,
+                                      color: isMe ? Colors.white : const Color(0xFF0F172A),
                                     ),
                                   ),
                                 ],
-                              ],
-                            ),
-                            const SizedBox(height: 4),
-                            Text(
-                              m.text,
-                              style: TextStyle(
-                                fontSize: 14,
-                                color: isMe ? Colors.white : const Color(0xFF0F172A),
                               ),
                             ),
-                          ],
-                        ),
+                          );
+                        },
                       ),
-                    );
-                  },
-                ),
-        ),
-
-        // Поле ввода сообщения
-        Container(
-          padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-          decoration: const BoxDecoration(
-            color: Colors.white,
-            border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
           ),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _chatInputCtrl,
-                  textInputAction: TextInputAction.send,
-                  onSubmitted: (_) => _sendChatMessage(),
-                  decoration: InputDecoration(
-                    hintText: 'Написать сообщение в чат урока...',
-                    isDense: true,
-                    filled: true,
-                    fillColor: const Color(0xFFF8FAFC),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 14,
-                      vertical: 12,
-                    ),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+
+          // Поле ввода сообщения
+          Container(
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              border: Border(top: BorderSide(color: Color(0xFFE2E8F0))),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _chatInputCtrl,
+                    enabled: targetRoomId != null,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _sendChatMessage(),
+                    decoration: InputDecoration(
+                      hintText: targetRoomId == null
+                          ? 'Выберите контакт или начните урок'
+                          : _chatMode == 'direct' && _selectedChatContact != null
+                              ? 'Сообщение для @${_selectedChatContact!['username']}...'
+                              : 'Написать сообщение в чат урока...',
+                      isDense: true,
+                      filled: true,
+                      fillColor: const Color(0xFFF8FAFC),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+                      ),
                     ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                onPressed: _sendChatMessage,
-                style: IconButton.styleFrom(
-                  backgroundColor: const Color(0xFF0F172A),
-                  foregroundColor: Colors.white,
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: targetRoomId == null ? null : _sendChatMessage,
+                  style: IconButton.styleFrom(
+                    backgroundColor: const Color(0xFF0F172A),
+                    foregroundColor: Colors.white,
+                  ),
+                  icon: const Icon(Icons.send_rounded, size: 20),
                 ),
-                icon: const Icon(Icons.send_rounded, size: 20),
-              ),
-            ],
+              ],
+            ),
           ),
-        ),
+        ],
       ],
     );
   }

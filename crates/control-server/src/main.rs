@@ -39,6 +39,9 @@ async fn main() -> anyhow::Result<()> {
     let storage_path = PathBuf::from("data/users.json");
     let _ = std::fs::create_dir_all("releases");
     let state = ControlState::new(storage_path);
+    if let Ok(db_url) = std::env::var("DATABASE_URL") {
+        state.init_postgres(&db_url).await;
+    }
 
     let app = Router::new()
         .route("/api/health", get(health_handler))

@@ -59,6 +59,25 @@ const DEFAULT_CONTROL_HTTP =
   (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_CONTROL_URL ||
   'http://127.0.0.1:4000';
 
+export interface ArchivedLessonChat {
+  id: string;
+  title: string;
+  savedAt: string;
+  messages: {
+    sender: string;
+    username: string;
+    text: string;
+    time: string;
+  }[];
+}
+
+function computeDmRoomId(u1: string, u2: string): string {
+  const s1 = u1.toLowerCase();
+  const s2 = u2.toLowerCase();
+  const [first, second] = s1 <= s2 ? [s1, s2] : [s2, s1];
+  return `${first.slice(0, 18)}${second.slice(18, 36)}`;
+}
+
 const VideoTile: React.FC<{
   stream: MediaStream | null;
   remoteFrameUrl?: string | null;
@@ -274,6 +293,16 @@ export function App() {
   const [rawMessages, setRawMessages] = useState<EncryptedChatMessage[]>([]);
   const [decryptedMessages, setDecryptedMessages] = useState<DecryptedChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
+  const [selectedChatContact, setSelectedChatContact] = useState<UserPublicProfile | null>(null);
+  const [chatMode, setChatMode] = useState<'lesson' | 'direct' | 'archive'>('lesson');
+  const [archivedChats, setArchivedChats] = useState<ArchivedLessonChat[]>(() => {
+    try {
+      const raw = localStorage.getItem('liaper_chat_archives');
+      return raw ? (JSON.parse(raw) as ArchivedLessonChat[]) : [];
+    } catch {
+      return [];
+    }
+  });
 
   // Правая панель
   const [rightTab, setRightTab] = useState<'chat' | 'nodes' | 'releases'>('chat');
@@ -400,13 +429,24 @@ export function App() {
     };
   }, [token, identityKeys]);
 
-  // Автоматическая расшифровка сообщений чата комнаты
+  const activeChatRoomId =
+    chatMode === 'lesson' && currentRoom
+      ? currentRoom.id
+      : chatMode === 'direct' && selectedChatContact && currentUser
+        ? computeDmRoomId(currentUser.id, selectedChatContact.id)
+        : currentRoom
+          ? currentRoom.id
+          : selectedChatContact && currentUser
+            ? computeDmRoomId(currentUser.id, selectedChatContact.id)
+            : null;
+
+  // Автоматическая расшифровка сообщений выбранного чата (урока или личного диалога с контактом)
   useEffect(() => {
-    if (!currentRoom) {
+    if (!activeChatRoomId) {
       setDecryptedMessages([]);
       return;
     }
-    const roomId = currentRoom.id;
+    const roomId = activeChatRoomId;
     let cancelled = false;
 
     async function decryptAll() {
@@ -443,7 +483,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [rawMessages, currentRoom]);
+  }, [rawMessages, activeChatRoomId]);
 
   const sendControl = (msg: ClientToControlMsg) => {
     if (controlWsRef.current && controlWsRef.current.readyState === WebSocket.OPEN) {
@@ -545,6 +585,7 @@ export function App() {
         setCurrentRoom(room);
 
         if (!wasInRoom) {
+          setChatMode('lesson');
           await connectToAssignedMediaNode(room, audioEnabled, videoEnabled);
         }
         break;
@@ -565,12 +606,19 @@ export function App() {
       }
 
       case 'encrypted_chat_received': {
-        setRawMessages((prev) => [...prev, msg.payload.message]);
+        setRawMessages((prev) =>
+          prev.some((m) => m.id === msg.payload.message.id)
+            ? prev
+            : [...prev, msg.payload.message]
+        );
         break;
       }
 
       case 'room_chat_history': {
-        setRawMessages(msg.payload.messages);
+        setRawMessages((prev) => [
+          ...prev.filter((m) => m.room_id !== msg.payload.room_id),
+          ...msg.payload.messages,
+        ]);
         break;
       }
 
@@ -674,7 +722,7 @@ export function App() {
     if (!clean) return;
     setAudioEnabled(true);
     setVideoEnabled(withVideo);
-    setRawMessages([]);
+    setChatMode('lesson');
     sendControl({
       type: 'call_by_nick',
       payload: {
@@ -688,7 +736,7 @@ export function App() {
     e.preventDefault();
     setAudioEnabled(true);
     setVideoEnabled(false);
-    setRawMessages([]);
+    setChatMode('lesson');
     sendControl({
       type: 'create_room',
       payload: {
@@ -707,7 +755,7 @@ export function App() {
     const { room, withVideo } = incomingCall;
     setAudioEnabled(true);
     setVideoEnabled(withVideo);
-    setRawMessages([]);
+    setChatMode('lesson');
     setIncomingCall(null);
     sendControl({
       type: 'join_room',
@@ -731,8 +779,81 @@ export function App() {
     setIncomingCall(null);
   };
 
+  const downloadArchiveAsTxt = (archive: ArchivedLessonChat) => {
+    const lines = [
+      `=== Архив чата урока: ${archive.title} ===`,
+      `Дата сохранения: ${new Date(archive.savedAt).toLocaleString('ru-RU')}`,
+      '',
+      ...archive.messages.map(
+        (m) => `[${m.time}] ${m.sender} (@${m.username}): ${m.text}`
+      ),
+    ];
+    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `liaper-lesson-${archive.id.slice(0, 8)}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const saveCurrentLessonToArchive = async (downloadTxt = false) => {
+    if (!currentRoom) return;
+    const roomMsgs = rawMessages.filter((m) => m.room_id === currentRoom.id);
+    if (roomMsgs.length === 0) {
+      if (downloadTxt) {
+        setSystemBanner('В чате текущего урока пока нет сообщений для сохранения');
+      }
+      return;
+    }
+
+    let keyBundle = roomKeysRef.current.get(currentRoom.id);
+    if (!keyBundle) {
+      keyBundle = await deriveRoomKeyFromId(currentRoom.id);
+      roomKeysRef.current.set(currentRoom.id, keyBundle);
+    }
+
+    const formatted: ArchivedLessonChat['messages'] = [];
+    for (const msg of roomMsgs) {
+      let text = msg.ciphertext_b64;
+      try {
+        text = await decryptChatText(msg.ciphertext_b64, msg.iv_b64, keyBundle);
+      } catch {}
+      formatted.push({
+        sender: msg.sender_display_name,
+        username: msg.sender_username,
+        text,
+        time: new Date(msg.created_at).toLocaleTimeString('ru-RU', {
+          hour: '2-digit',
+          minute: '2-digit',
+        }),
+      });
+    }
+
+    const archiveEntry: ArchivedLessonChat = {
+      id: currentRoom.id,
+      title: currentRoom.title,
+      savedAt: new Date().toISOString(),
+      messages: formatted,
+    };
+
+    setArchivedChats((prev) => {
+      const next = [archiveEntry, ...prev.filter((a) => a.id !== archiveEntry.id)];
+      localStorage.setItem('liaper_chat_archives', JSON.stringify(next));
+      return next;
+    });
+
+    if (downloadTxt) {
+      downloadArchiveAsTxt(archiveEntry);
+      setSystemBanner(`Чат урока «${currentRoom.title}» сохранён в архив и скачан`);
+    } else {
+      setSystemBanner(`Чат урока «${currentRoom.title}» автоматически сохранён в архив`);
+    }
+  };
+
   const leaveCurrentRoom = () => {
     if (!currentRoom) return;
+    void saveCurrentLessonToArchive(false);
     sendControl({
       type: 'leave_room',
       payload: { room_id: currentRoom.id },
@@ -858,19 +979,19 @@ export function App() {
 
   const handleSendChatMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!currentRoom || !chatInput.trim()) return;
+    if (!activeChatRoomId || !chatInput.trim()) return;
 
-    let roomKey = roomKeysRef.current.get(currentRoom.id);
+    let roomKey = roomKeysRef.current.get(activeChatRoomId);
     if (!roomKey) {
-      roomKey = await deriveRoomKeyFromId(currentRoom.id);
-      roomKeysRef.current.set(currentRoom.id, roomKey);
+      roomKey = await deriveRoomKeyFromId(activeChatRoomId);
+      roomKeysRef.current.set(activeChatRoomId, roomKey);
     }
 
     const encrypted = await encryptChatText(chatInput.trim(), roomKey);
     sendControl({
       type: 'send_encrypted_chat',
       payload: {
-        room_id: currentRoom.id,
+        room_id: activeChatRoomId,
         ciphertext_b64: encrypted.ciphertextB64,
         iv_b64: encrypted.ivB64,
         room_key_id: encrypted.roomKeyId,
@@ -1372,6 +1493,22 @@ export function App() {
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
+                      onClick={() => {
+                        setSelectedChatContact(u);
+                        setChatMode('direct');
+                        setRightTab('chat');
+                      }}
+                      title={`Написать сообщение @${u.username}`}
+                      className={`rounded-lg border p-2 transition ${
+                        selectedChatContact?.id === u.id && chatMode === 'direct'
+                          ? 'border-slate-900 bg-slate-900 text-white'
+                          : 'border-slate-200 text-slate-700 hover:bg-slate-900 hover:text-white'
+                      }`}
+                    >
+                      <MessageSquare className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => startCallByNick(u.username, false)}
                       title={`Позвонить @${u.username}`}
                       className="rounded-lg border border-slate-200 p-2 text-slate-700 hover:bg-slate-900 hover:text-white"
@@ -1676,74 +1813,201 @@ export function App() {
           </button>
         </div>
 
-        {/* ВКЛАДКА 1: Чат Урока */}
+        {/* ВКЛАДКА 1: Чат (Урок, Личный диалог с контактом и Архив уроков) */}
         {rightTab === 'chat' && (
           <div className="flex flex-1 flex-col overflow-hidden">
-            <div className="flex-1 space-y-3 overflow-y-auto p-5">
-              {!currentRoom ? (
-                <div className="flex h-full flex-col items-center justify-center text-center text-xs text-slate-400">
-                  <MessageSquare className="mb-2 h-6 w-6 stroke-1" />
-                  Начните звонок или урок, чтобы обмениваться сообщениями
+            {/* Переключатель режима чата */}
+            <div className="border-b border-slate-200 bg-white px-4 py-3 space-y-2.5">
+              <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
+                <button
+                  type="button"
+                  onClick={() => setChatMode('lesson')}
+                  className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
+                    chatMode === 'lesson'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Чат урока
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setChatMode('direct')}
+                  className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
+                    chatMode === 'direct'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Личный чат
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setChatMode('archive')}
+                  className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
+                    chatMode === 'archive'
+                      ? 'bg-white text-slate-900 shadow-2xs'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  Архив ({archivedChats.length})
+                </button>
+              </div>
+
+              {chatMode === 'lesson' && currentRoom && (
+                <div className="flex items-center justify-between gap-2 pt-0.5">
+                  <span className="truncate text-xs font-medium text-slate-600">
+                    Урок: <strong className="text-slate-900">{currentRoom.title}</strong>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void saveCurrentLessonToArchive(true)}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white"
+                  >
+                    <Download className="h-3 w-3" />
+                    В архив (.txt)
+                  </button>
                 </div>
-              ) : decryptedMessages.length === 0 ? (
-                <div className="rounded-xl border border-dashed border-slate-200 p-5 text-center text-xs text-slate-400">
-                  Сообщений пока нет. Отправьте ссылку, задание или заметку к уроку!
+              )}
+
+              {chatMode === 'direct' && (
+                <div className="flex items-center justify-between gap-2 pt-0.5">
+                  <select
+                    value={selectedChatContact?.id ?? ''}
+                    onChange={(e) => {
+                      const found = contacts.find((c) => c.id === e.target.value) ?? null;
+                      setSelectedChatContact(found);
+                    }}
+                    className="w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-900 focus:outline-none"
+                  >
+                    <option value="">— Выберите контакт для переписки —</option>
+                    {contacts.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.display_name} (@{c.username})
+                      </option>
+                    ))}
+                  </select>
                 </div>
-              ) : (
-                decryptedMessages.map((m) => {
-                  const isMine = m.sender_id === currentUser.id;
-                  return (
-                    <div
-                      key={m.id}
-                      className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
-                    >
-                      <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
-                        <span className="font-medium text-slate-700">
-                          {m.sender_display_name}
-                        </span>
-                        <span>@{m.sender_username}</span>
-                      </div>
-                      <div
-                        className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                          isMine
-                            ? 'bg-slate-900 text-white'
-                            : 'border border-slate-200 bg-slate-50 text-slate-900'
-                        }`}
-                      >
-                        {m.plaintext}
-                      </div>
-                    </div>
-                  );
-                })
               )}
             </div>
 
-            <form
-              onSubmit={handleSendChatMessage}
-              className="border-t border-slate-200 p-4"
-            >
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  disabled={!currentRoom}
-                  placeholder={
-                    currentRoom
-                      ? 'Написать сообщение...'
-                      : 'Чат доступен во время звонка'
-                  }
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  className="flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-slate-900 focus:outline-none disabled:bg-slate-100"
-                />
-                <button
-                  type="submit"
-                  disabled={!currentRoom || !chatInput.trim()}
-                  className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40"
-                >
-                  <Send className="h-4 w-4" />
-                </button>
+            {chatMode === 'archive' ? (
+              <div className="flex-1 space-y-3 overflow-y-auto p-4">
+                {archivedChats.length === 0 ? (
+                  <div className="flex h-full flex-col items-center justify-center text-center text-xs text-slate-400">
+                    <Download className="mb-2 h-6 w-6 stroke-1" />
+                    Сохранённых архивов уроков пока нет. В конце урока чат сохраняется автоматически или по кнопке «В архив (.txt)».
+                  </div>
+                ) : (
+                  archivedChats.map((arch) => (
+                    <div
+                      key={`${arch.id}-${arch.savedAt}`}
+                      className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 space-y-2"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-semibold text-slate-900">
+                            {arch.title}
+                          </div>
+                          <div className="text-[11px] text-slate-500">
+                            {new Date(arch.savedAt).toLocaleString('ru-RU')} • Сообщений:{' '}
+                            {arch.messages.length}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => downloadArchiveAsTxt(arch)}
+                          className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-slate-800"
+                        >
+                          <Download className="h-3 w-3" />
+                          .txt
+                        </button>
+                      </div>
+                      <div className="max-h-36 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-white p-2.5 text-[11px]">
+                        {arch.messages.map((m, idx) => (
+                          <div key={idx} className="text-slate-700">
+                            <span className="text-slate-400">[{m.time}]</span>{' '}
+                            <strong className="text-slate-900">{m.sender}:</strong> {m.text}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
-            </form>
+            ) : (
+              <>
+                <div className="flex-1 space-y-3 overflow-y-auto p-5">
+                  {!activeChatRoomId ? (
+                    <div className="flex h-full flex-col items-center justify-center text-center text-xs text-slate-400">
+                      <MessageSquare className="mb-2 h-6 w-6 stroke-1" />
+                      {chatMode === 'direct'
+                        ? 'Выберите контакт из списка слева (иконка чата) или в меню выше, чтобы начать личную переписку'
+                        : 'Начните звонок или переключитесь на «Личный чат», чтобы написать контакту напрямую'}
+                    </div>
+                  ) : decryptedMessages.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-slate-200 p-5 text-center text-xs text-slate-400">
+                      Сообщений пока нет. Напишите первое сообщение!
+                    </div>
+                  ) : (
+                    decryptedMessages.map((m) => {
+                      const isMine = m.sender_id === currentUser.id;
+                      return (
+                        <div
+                          key={m.id}
+                          className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
+                        >
+                          <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
+                            <span className="font-medium text-slate-700">
+                              {m.sender_display_name}
+                            </span>
+                            <span>@{m.sender_username}</span>
+                          </div>
+                          <div
+                            className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                              isMine
+                                ? 'bg-slate-900 text-white'
+                                : 'border border-slate-200 bg-slate-50 text-slate-900'
+                            }`}
+                          >
+                            {m.plaintext}
+                          </div>
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+
+                <form
+                  onSubmit={handleSendChatMessage}
+                  className="border-t border-slate-200 p-4"
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      disabled={!activeChatRoomId}
+                      placeholder={
+                        activeChatRoomId
+                          ? chatMode === 'direct' && selectedChatContact
+                            ? `Сообщение для @${selectedChatContact.username}...`
+                            : 'Написать сообщение...'
+                          : 'Выберите контакт или начните урок'
+                      }
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      className="flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-slate-900 focus:outline-none disabled:bg-slate-100"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!activeChatRoomId || !chatInput.trim()}
+                      className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40"
+                    >
+                      <Send className="h-4 w-4" />
+                    </button>
+                  </div>
+                </form>
+              </>
+            )}
           </div>
         )}
 

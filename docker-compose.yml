@@ -1,0 +1,95 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: liaper-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-liaper}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-liaper_secret_2026}
+      POSTGRES_DB: ${POSTGRES_DB:-liaper}
+    ports:
+      - "5432:5432"
+    volumes:
+      - liaper_pgdata:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-liaper} -d ${POSTGRES_DB:-liaper}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  liaper-control:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: liaper-control
+    restart: unless-stopped
+    command: ["liaper-control"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CONTROL_PORT: "4000"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-liaper}:${POSTGRES_PASSWORD:-liaper_secret_2026}@postgres:5432/${POSTGRES_DB:-liaper}"
+      RUST_LOG: "liaper_control=info,tower_http=info"
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./data:/app/data
+      - ./releases:/app/releases
+
+  liaper-node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: liaper-node-1
+    restart: unless-stopped
+    command: ["liaper-node"]
+    depends_on:
+      - liaper-control
+    environment:
+      NODE_PORT: "4101"
+      NODE_ID: "node-ru-1"
+      NODE_NAME: "SFU-Node-1-Moscow"
+      NODE_REGION: "RU-Central"
+      NODE_PUBLIC_HOST: "${PUBLIC_HOST:-127.0.0.1}"
+      CONTROL_URL: "http://liaper-control:4000"
+      RUST_LOG: "liaper_node=info"
+    ports:
+      - "4101:4101"
+
+  liaper-node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: liaper-node-2
+    restart: unless-stopped
+    command: ["liaper-node"]
+    depends_on:
+      - liaper-control
+    environment:
+      NODE_PORT: "4102"
+      NODE_ID: "node-ru-2"
+      NODE_NAME: "SFU-Node-2-Siberia"
+      NODE_REGION: "RU-East"
+      NODE_PUBLIC_HOST: "${PUBLIC_HOST:-127.0.0.1}"
+      CONTROL_URL: "http://liaper-control:4000"
+      RUST_LOG: "liaper_node=info"
+    ports:
+      - "4102:4102"
+
+  liaper-web:
+    build:
+      context: ./clients/web-desktop
+      dockerfile: ../../Dockerfile.web
+      args:
+        VITE_CONTROL_URL: "${VITE_CONTROL_URL:-http://127.0.0.1:4000}"
+    container_name: liaper-web
+    restart: unless-stopped
+    depends_on:
+      - liaper-control
+    ports:
+      - "5173:80"
+
+volumes:
+  liaper_pgdata:

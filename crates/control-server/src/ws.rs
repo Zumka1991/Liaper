@@ -38,13 +38,26 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
 
     let welcome = ControlToClientMsg::Welcome {
         self_profile: self_profile.clone(),
-        contacts,
+        contacts: contacts.clone(),
         incoming_requests,
         outgoing_requests,
         active_rooms,
         media_nodes: state.list_nodes_sorted(),
     };
     let _ = tx.send(welcome);
+
+    // Отправляем историю личных диалогов со взаимными контактами
+    for contact in &contacts {
+        let dm_id = ControlState::dm_room_id(&user_id, &contact.id);
+        if let Some(messages) = state.room_chats.get(&dm_id) {
+            if !messages.is_empty() {
+                let _ = tx.send(ControlToClientMsg::RoomChatHistory {
+                    room_id: dm_id,
+                    messages: messages.clone(),
+                });
+            }
+        }
+    }
 
     // Оповещаем взаимные контакты об изменении онлайн-статуса
     state.notify_user_contacts_presence(&user_id);
@@ -545,11 +558,32 @@ fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientT
                 .entry(room_id)
                 .or_default()
                 .push(msg.clone());
+            state.save_chats_to_disk(Some(msg.clone()));
 
-            state.broadcast_to_room(
-                &room_id,
-                &ControlToClientMsg::EncryptedChatReceived { message: msg },
-            );
+            if state.rooms.contains_key(&room_id) {
+                state.broadcast_to_room(
+                    &room_id,
+                    &ControlToClientMsg::EncryptedChatReceived { message: msg },
+                );
+            } else {
+                // Личный диалог с подтверждённым контактом
+                let mut target_contact_id = None;
+                if let Some(contact_ids) = state.contacts_by_user.get(&caller.id) {
+                    for cid in contact_ids.iter() {
+                        if ControlState::dm_room_id(&caller.id, cid) == room_id {
+                            target_contact_id = Some(*cid);
+                            break;
+                        }
+                    }
+                }
+                if let Some(peer_id) = target_contact_id {
+                    let event = ControlToClientMsg::EncryptedChatReceived { message: msg };
+                    state.send_to_user(&caller.id, &event);
+                    if peer_id != caller.id {
+                        state.send_to_user(&peer_id, &event);
+                    }
+                }
+            }
         }
     }
 }

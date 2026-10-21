@@ -69,8 +69,10 @@ pub struct ControlState {
     pub releases: DashMap<AppPlatform, AppReleaseManifest>,
     pub storage_path: PathBuf,
     pub contacts_path: PathBuf,
+    pub chats_path: PathBuf,
     pub releases_path: PathBuf,
     pub admin_secret: String,
+    pub pg_client: tokio::sync::RwLock<Option<Arc<tokio_postgres::Client>>>,
 }
 
 impl ControlState {
@@ -79,6 +81,7 @@ impl ControlState {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("data"));
         let contacts_path = base_dir.join("contacts.json");
+        let chats_path = base_dir.join("chats.json");
         let releases_path = base_dir.join("releases.json");
         let admin_secret = std::env::var("LIAPER_ADMIN_SECRET")
             .unwrap_or_else(|_| "liaper-release-secret-2026".to_string());
@@ -97,13 +100,117 @@ impl ControlState {
             releases: DashMap::new(),
             storage_path,
             contacts_path,
+            chats_path,
             releases_path,
             admin_secret,
+            pg_client: tokio::sync::RwLock::new(None),
         });
         state.load_users_from_disk();
         state.load_contacts_from_disk();
+        state.load_chats_from_disk();
         state.load_or_seed_releases();
         state
+    }
+
+    /// Подключение к PostgreSQL (если задан DATABASE_URL в Docker или окружении)
+    pub async fn init_postgres(&self, database_url: &str) {
+        match tokio_postgres::connect(database_url, tokio_postgres::NoTls).await {
+            Ok((client, connection)) => {
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        tracing::error!("PostgreSQL connection error: {}", e);
+                    }
+                });
+
+                let schema_sql = include_str!("../../../docker/init.sql");
+                if let Err(e) = client.batch_execute(schema_sql).await {
+                    tracing::warn!("PostgreSQL schema init warning: {}", e);
+                }
+
+                // Загружаем пользователей из PostgreSQL
+                if let Ok(rows) = client
+                    .query(
+                        "SELECT id, username, display_name, role, password_hash, password_salt, e2ee_public_key, key_fingerprint FROM users",
+                        &[],
+                    )
+                    .await
+                {
+                    for row in rows {
+                        let id: Uuid = row.get(0);
+                        let username: String = row.get(1);
+                        let display_name: String = row.get(2);
+                        let role_str: String = row.get(3);
+                        let password_hash: String = row.get(4);
+                        let salt_b64: String = row.get(5);
+                        let e2ee_public_key: String = row.get(6);
+                        let key_fingerprint: String = row.get(7);
+                        let role = if role_str == "tutor" {
+                            UserRole::Tutor
+                        } else {
+                            UserRole::Student
+                        };
+                        self.user_id_by_username.insert(username.clone(), id);
+                        self.users_by_id.insert(
+                            id,
+                            StoredUser {
+                                id,
+                                username,
+                                display_name,
+                                password_hash,
+                                salt_b64,
+                                role,
+                                e2ee_public_key,
+                                key_fingerprint,
+                            },
+                        );
+                    }
+                }
+
+                // Загружаем взаимные контакты из PostgreSQL
+                if let Ok(rows) = client.query("SELECT user_a, user_b FROM contacts", &[]).await {
+                    for row in rows {
+                        let a: Uuid = row.get(0);
+                        let b: Uuid = row.get(1);
+                        self.contacts_by_user.entry(a).or_default().insert(b);
+                        self.contacts_by_user.entry(b).or_default().insert(a);
+                    }
+                }
+
+                // Загружаем историю сообщений из PostgreSQL
+                if let Ok(rows) = client
+                    .query(
+                        "SELECT id, room_id, sender_id, sender_username, sender_display_name, ciphertext_b64, iv_b64, room_key_id, created_at FROM chat_messages ORDER BY created_at ASC",
+                        &[],
+                    )
+                    .await
+                {
+                    for row in rows {
+                        let msg = EncryptedChatMessage {
+                            id: row.get(0),
+                            room_id: row.get(1),
+                            sender_id: row.get(2),
+                            sender_username: row.get(3),
+                            sender_display_name: row.get(4),
+                            ciphertext_b64: row.get(5),
+                            iv_b64: row.get(6),
+                            room_key_id: row.get(7),
+                            created_at: row.get(8),
+                        };
+                        self.room_chats.entry(msg.room_id).or_default().push(msg);
+                    }
+                }
+
+                let mut guard = self.pg_client.write().await;
+                *guard = Some(Arc::new(client));
+                tracing::info!("Connected to PostgreSQL database successfully");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "PostgreSQL not reachable ({}), using local JSON storage in data/",
+                    err
+                );
+            }
+        }
     }
 
     pub fn normalize_username(raw: &str) -> String {
@@ -159,6 +266,39 @@ impl ControlState {
         if let Ok(json) = serde_json::to_string_pretty(&all_users) {
             let _ = std::fs::write(&self.storage_path, json);
         }
+
+        if let Ok(guard) = self.pg_client.try_read() {
+            if let Some(client) = guard.clone() {
+                tokio::spawn(async move {
+                    for u in all_users {
+                        let role_str = match u.role {
+                            UserRole::Tutor => "tutor",
+                            UserRole::Student => "student",
+                        };
+                        let _ = client
+                            .execute(
+                                "INSERT INTO users (id, username, display_name, role, password_hash, password_salt, e2ee_public_key, key_fingerprint)
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                                 ON CONFLICT (id) DO UPDATE SET
+                                    display_name = EXCLUDED.display_name,
+                                    e2ee_public_key = EXCLUDED.e2ee_public_key,
+                                    key_fingerprint = EXCLUDED.key_fingerprint",
+                                &[
+                                    &u.id,
+                                    &u.username,
+                                    &u.display_name,
+                                    &role_str,
+                                    &u.password_hash,
+                                    &u.salt_b64,
+                                    &u.e2ee_public_key,
+                                    &u.key_fingerprint,
+                                ],
+                            )
+                            .await;
+                    }
+                });
+            }
+        }
     }
 
     pub fn load_contacts_from_disk(&self) {
@@ -194,11 +334,76 @@ impl ControlState {
             .map(|e| e.value().clone())
             .collect();
         let snap = ContactsDiskSnapshot {
-            confirmed_pairs: pairs,
+            confirmed_pairs: pairs.clone(),
             pending_requests,
         };
         if let Ok(json) = serde_json::to_string_pretty(&snap) {
             let _ = std::fs::write(&self.contacts_path, json);
+        }
+
+        if let Ok(guard) = self.pg_client.try_read() {
+            if let Some(client) = guard.clone() {
+                tokio::spawn(async move {
+                    for (a, b) in pairs {
+                        let _ = client
+                            .execute(
+                                "INSERT INTO contacts (user_a, user_b) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                                &[&a, &b],
+                            )
+                            .await;
+                    }
+                });
+            }
+        }
+    }
+
+    pub fn load_chats_from_disk(&self) {
+        if let Ok(content) = std::fs::read_to_string(&self.chats_path) {
+            if let Ok(messages) = serde_json::from_str::<Vec<EncryptedChatMessage>>(&content) {
+                for msg in messages {
+                    self.room_chats.entry(msg.room_id).or_default().push(msg);
+                }
+            }
+        }
+    }
+
+    pub fn save_chats_to_disk(&self, new_msg: Option<EncryptedChatMessage>) {
+        if let Some(parent) = self.chats_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut all_msgs = Vec::new();
+        for entry in self.room_chats.iter() {
+            all_msgs.extend(entry.value().iter().cloned());
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&all_msgs) {
+            let _ = std::fs::write(&self.chats_path, json);
+        }
+
+        if let Some(msg) = new_msg {
+            if let Ok(guard) = self.pg_client.try_read() {
+                if let Some(client) = guard.clone() {
+                    tokio::spawn(async move {
+                        let _ = client
+                            .execute(
+                                "INSERT INTO chat_messages (id, room_id, sender_id, sender_username, sender_display_name, ciphertext_b64, iv_b64, room_key_id, created_at)
+                                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                 ON CONFLICT (id) DO NOTHING",
+                                &[
+                                    &msg.id,
+                                    &msg.room_id,
+                                    &msg.sender_id,
+                                    &msg.sender_username,
+                                    &msg.sender_display_name,
+                                    &msg.ciphertext_b64,
+                                    &msg.iv_b64,
+                                    &msg.room_key_id,
+                                    &msg.created_at,
+                                ],
+                            )
+                            .await;
+                    });
+                }
+            }
         }
     }
 
@@ -207,6 +412,15 @@ impl ControlState {
             .get(user_a)
             .map(|set| set.contains(user_b))
             .unwrap_or(false)
+    }
+
+    /// Вычисляет детерминированный UUID личного диалога между двумя контактами
+    pub fn dm_room_id(u1: &Uuid, u2: &Uuid) -> Uuid {
+        let s1 = u1.to_string().to_lowercase();
+        let s2 = u2.to_string().to_lowercase();
+        let (first, second) = if s1 <= s2 { (s1, s2) } else { (s2, s1) };
+        let combined = format!("{}{}", &first[0..18], &second[18..36]);
+        Uuid::parse_str(&combined).unwrap_or(*u1)
     }
 
     pub fn add_mutual_contact(&self, user_a: Uuid, user_b: Uuid) {
