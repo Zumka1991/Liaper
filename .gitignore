@@ -1,0 +1,32 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node / Web / Tauri
+node_modules/
+clients/web-desktop/dist/
+clients/web-desktop/src-tauri/target/
+
+# Flutter / Android
+clients/android/build/
+clients/android/.dart_tool/
+clients/android/.flutter-plugins
+clients/android/.flutter-plugins-dependencies
+clients/android/android/.gradle/
+clients/android/android/app/build/
+clients/android/android/local.properties
+clients/android/android/.kotlin/
+
+# Runtime data & large binary release artifacts
+/data/*.json
+/releases/*.apk
+/releases/*.exe
+/releases/*.AppImage
+/releases/*.msi
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
