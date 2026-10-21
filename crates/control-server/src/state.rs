@@ -37,6 +37,41 @@ impl StoredUser {
             online,
         }
     }
+
+    pub fn merge_public_key(&mut self, pub_key: &str, fp: &str) {
+        let is_x25519 = |k: &str| -> bool {
+            BASE64.decode(k.trim()).map(|b| b.len() == 32).unwrap_or(false)
+        };
+        let incoming_x25519: Vec<String> = pub_key
+            .split(',')
+            .map(str::trim)
+            .filter(|k| !k.is_empty() && is_x25519(k))
+            .map(ToOwned::to_owned)
+            .collect();
+
+        if !incoming_x25519.is_empty() {
+            let mut merged = Vec::new();
+            for k in incoming_x25519 {
+                if !merged.contains(&k) {
+                    merged.push(k);
+                }
+            }
+            for existing in self.e2ee_public_key.split(',').map(str::trim) {
+                if is_x25519(existing) && !merged.iter().any(|k| k == existing) && merged.len() < 8 {
+                    merged.push(existing.to_string());
+                }
+            }
+            self.e2ee_public_key = merged.join(",");
+        } else if !pub_key.trim().is_empty() {
+            let has_existing_x25519 = self.e2ee_public_key.split(',').any(is_x25519);
+            if !has_existing_x25519 {
+                self.e2ee_public_key = pub_key.trim().to_string();
+            }
+        }
+        if !fp.trim().is_empty() {
+            self.key_fingerprint = fp.trim().to_string();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +88,34 @@ struct ContactsDiskSnapshot {
     pub pending_requests: Vec<StoredContactRequest>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisclosedRoomKey {
+    pub room_key_id: String,
+    pub secret_key_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatAbuseReport {
+    pub id: Uuid,
+    pub room_id: Uuid,
+    pub room_title: String,
+    pub reporter_id: Uuid,
+    pub reporter_username: String,
+    pub reporter_display_name: String,
+    pub reason: String,
+    pub disclosed_keys: Vec<DisclosedRoomKey>,
+    pub messages_snapshot: Vec<EncryptedChatMessage>,
+    pub status: String, // "open" | "resolved"
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminMasterCredentials {
+    pub password_hash: String,
+    pub salt_b64: String,
+    pub updated_at: DateTime<Utc>,
+}
+
 pub type ClientSender = mpsc::UnboundedSender<ControlToClientMsg>;
 
 pub struct ControlState {
@@ -67,12 +130,20 @@ pub struct ControlState {
     pub room_invitations: DashMap<Uuid, HashSet<Uuid>>,
     pub room_key_envelopes: DashMap<(Uuid, Uuid), Vec<E2eeKeyEnvelope>>,
     pub room_chats: DashMap<Uuid, Vec<EncryptedChatMessage>>,
+    pub reports: DashMap<Uuid, ChatAbuseReport>,
     pub releases: DashMap<AppPlatform, AppReleaseManifest>,
     pub storage_path: PathBuf,
     pub contacts_path: PathBuf,
     pub chats_path: PathBuf,
+    pub envelopes_path: PathBuf,
+    pub sessions_path: PathBuf,
+    pub reports_path: PathBuf,
     pub releases_path: PathBuf,
+    pub admin_auth_path: PathBuf,
+    pub admin_master_creds: std::sync::RwLock<Option<AdminMasterCredentials>>,
+    pub admin_usernames: HashSet<String>,
     pub admin_secret: Option<String>,
+    pub antifraud: crate::antifraud::AntiFraudEngine,
     pub pg_client: tokio::sync::RwLock<Option<Arc<tokio_postgres::Client>>>,
     pub contact_mutations: tokio::sync::Mutex<()>,
 }
@@ -84,10 +155,21 @@ impl ControlState {
             .unwrap_or_else(|| std::path::Path::new("data"));
         let contacts_path = base_dir.join("contacts.json");
         let chats_path = base_dir.join("chats.json");
+        let envelopes_path = base_dir.join("envelopes.json");
+        let sessions_path = base_dir.join("sessions.json");
+        let reports_path = base_dir.join("reports.json");
         let releases_path = base_dir.join("releases.json");
+        let admin_auth_path = base_dir.join("admin_auth.json");
         let admin_secret = std::env::var("LIAPER_ADMIN_SECRET")
             .ok()
             .filter(|secret| !secret.trim().is_empty());
+        let raw_admins = std::env::var("LIAPER_ADMIN_USERNAMES")
+            .unwrap_or_else(|_| "napsy,admin".to_string());
+        let admin_usernames: HashSet<String> = raw_admins
+            .split(',')
+            .map(Self::normalize_username)
+            .filter(|s| !s.is_empty())
+            .collect();
 
         let state = Arc::new(Self {
             users_by_id: DashMap::new(),
@@ -101,18 +183,30 @@ impl ControlState {
             room_invitations: DashMap::new(),
             room_key_envelopes: DashMap::new(),
             room_chats: DashMap::new(),
+            reports: DashMap::new(),
             releases: DashMap::new(),
             storage_path,
             contacts_path,
             chats_path,
+            envelopes_path,
+            sessions_path,
+            reports_path,
             releases_path,
+            admin_auth_path,
+            admin_master_creds: std::sync::RwLock::new(None),
+            admin_usernames,
             admin_secret,
+            antifraud: crate::antifraud::AntiFraudEngine::new(),
             pg_client: tokio::sync::RwLock::new(None),
             contact_mutations: tokio::sync::Mutex::new(()),
         });
         state.load_users_from_disk();
         state.load_contacts_from_disk();
         state.load_chats_from_disk();
+        state.load_envelopes_from_disk();
+        state.load_sessions_from_disk();
+        state.load_reports_from_disk();
+        state.load_admin_auth_from_disk();
         state.load_or_seed_releases();
         state
     }
@@ -198,9 +292,59 @@ impl ControlState {
             self.contact_requests.insert(req.id, req);
         }
         self.room_chats.clear();
-        for row in client.query("SELECT id,room_id,sender_id,sender_username,sender_display_name,ciphertext_b64,iv_b64,room_key_id,created_at FROM chat_messages ORDER BY created_at ASC", &[]).await? {
-            let msg=EncryptedChatMessage{id:row.get(0),room_id:row.get(1),sender_id:row.get(2),sender_username:row.get(3),sender_display_name:row.get(4),ciphertext_b64:row.get(5),iv_b64:row.get(6),room_key_id:row.get(7),created_at:row.get(8)};
+        let _ = client
+            .execute(
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ",
+                &[],
+            )
+            .await;
+        for row in client.query("SELECT id,room_id,sender_id,sender_username,sender_display_name,ciphertext_b64,iv_b64,room_key_id,created_at,edited_at FROM chat_messages ORDER BY created_at ASC", &[]).await? {
+            let msg=EncryptedChatMessage{id:row.get(0),room_id:row.get(1),sender_id:row.get(2),sender_username:row.get(3),sender_display_name:row.get(4),ciphertext_b64:row.get(5),iv_b64:row.get(6),room_key_id:row.get(7),created_at:row.get(8),edited_at:row.get(9)};
             self.room_chats.entry(msg.room_id).or_default().push(msg);
+        }
+        for entry in self.room_key_envelopes.iter() {
+            for env in entry.value().iter() {
+                if self.users_by_id.contains_key(&env.sender_id)
+                    && self.users_by_id.contains_key(&env.recipient_id)
+                {
+                    let _ = Self::write_key_envelope(&client, env).await;
+                }
+            }
+        }
+        self.room_key_envelopes.clear();
+        for row in client.query("SELECT room_id,sender_id,sender_username,sender_public_key,recipient_id,recipient_username,encrypted_room_key_b64,iv_b64,room_key_id FROM e2ee_key_envelopes ORDER BY created_at ASC", &[]).await? {
+            let env = E2eeKeyEnvelope {
+                room_id: row.get(0),
+                sender_id: row.get(1),
+                sender_username: row.get(2),
+                sender_public_key: row.get(3),
+                recipient_id: row.get(4),
+                recipient_username: row.get(5),
+                encrypted_room_key_b64: row.get(6),
+                iv_b64: row.get(7),
+                room_key_id: row.get(8),
+            };
+            self.upsert_key_envelope_in_memory(env);
+        }
+        for entry in self.tokens.iter() {
+            let token = entry.key().clone();
+            let uid = *entry.value();
+            if self.users_by_id.contains_key(&uid) {
+                let _ = client
+                    .execute(
+                        "INSERT INTO user_sessions (token,user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+                        &[&token, &uid],
+                    )
+                    .await;
+            }
+        }
+        for row in client
+            .query("SELECT token,user_id FROM user_sessions", &[])
+            .await?
+        {
+            let token: String = row.get(0);
+            let uid: Uuid = row.get(1);
+            self.tokens.insert(token, uid);
         }
         if let Some(parent) = migration_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -209,6 +353,124 @@ impl ControlState {
         *self.pg_client.write().await = Some(client);
         tracing::info!("PostgreSQL ready: users, contacts, encrypted messages and lesson archives");
         Ok(())
+    }
+
+    async fn write_key_envelope(
+        client: &tokio_postgres::Client,
+        e: &E2eeKeyEnvelope,
+    ) -> Result<(), tokio_postgres::Error> {
+        client
+            .execute(
+                "INSERT INTO e2ee_key_envelopes (room_id,sender_id,sender_username,sender_public_key,recipient_id,recipient_username,encrypted_room_key_b64,iv_b64,room_key_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+                &[
+                    &e.room_id,
+                    &e.sender_id,
+                    &e.sender_username,
+                    &e.sender_public_key,
+                    &e.recipient_id,
+                    &e.recipient_username,
+                    &e.encrypted_room_key_b64,
+                    &e.iv_b64,
+                    &e.room_key_id,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub fn upsert_key_envelope_in_memory(&self, env: E2eeKeyEnvelope) -> bool {
+        let mut list = self
+            .room_key_envelopes
+            .entry((env.room_id, env.recipient_id))
+            .or_default();
+        let exists = list.iter().any(|existing| {
+            existing.room_key_id == env.room_key_id
+                && existing.sender_public_key == env.sender_public_key
+                && existing.encrypted_room_key_b64 == env.encrypted_room_key_b64
+        });
+        if !exists {
+            list.push(env);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn persist_key_envelope(&self, env: &E2eeKeyEnvelope) -> anyhow::Result<()> {
+        if let Some(client) = self.pg_client.read().await.clone() {
+            Self::write_key_envelope(&client, env).await?;
+        }
+        Ok(())
+    }
+
+    pub fn envelopes_for_recipient(&self, recipient_id: &Uuid) -> Vec<E2eeKeyEnvelope> {
+        let mut out = Vec::new();
+        for entry in self.room_key_envelopes.iter() {
+            if entry.key().1 == *recipient_id {
+                out.extend(entry.value().iter().cloned());
+            }
+        }
+        out
+    }
+
+    pub fn load_envelopes_from_disk(&self) {
+        if let Ok(content) = std::fs::read_to_string(&self.envelopes_path) {
+            if let Ok(envelopes) = serde_json::from_str::<Vec<E2eeKeyEnvelope>>(&content) {
+                for env in envelopes {
+                    self.upsert_key_envelope_in_memory(env);
+                }
+            }
+        }
+    }
+
+    pub fn save_envelopes_to_disk(&self) {
+        if let Some(parent) = self.envelopes_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut all = Vec::new();
+        for entry in self.room_key_envelopes.iter() {
+            all.extend(entry.value().iter().cloned());
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&all) {
+            let _ = std::fs::write(&self.envelopes_path, json);
+        }
+    }
+
+    pub fn load_sessions_from_disk(&self) {
+        if let Ok(content) = std::fs::read_to_string(&self.sessions_path) {
+            if let Ok(pairs) = serde_json::from_str::<Vec<(String, Uuid)>>(&content) {
+                for (token, uid) in pairs {
+                    self.tokens.insert(token, uid);
+                }
+            }
+        }
+    }
+
+    pub fn save_sessions_to_disk(&self) {
+        if let Some(parent) = self.sessions_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let pairs: Vec<(String, Uuid)> = self
+            .tokens
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        if let Ok(json) = serde_json::to_string_pretty(&pairs) {
+            let _ = std::fs::write(&self.sessions_path, json);
+        }
+    }
+
+    pub async fn persist_session(&self, token: &str, user_id: Uuid) {
+        self.tokens.insert(token.to_string(), user_id);
+        self.save_sessions_to_disk();
+        if let Some(client) = self.pg_client.read().await.clone() {
+            let _ = client
+                .execute(
+                    "INSERT INTO user_sessions (token,user_id) VALUES ($1,$2) ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id",
+                    &[&token, &user_id],
+                )
+                .await;
+        }
     }
 
     async fn write_user(
@@ -236,13 +498,46 @@ impl ControlState {
         client: &tokio_postgres::Client,
         m: &EncryptedChatMessage,
     ) -> Result<(), tokio_postgres::Error> {
-        client.execute("INSERT INTO chat_messages (id,room_id,sender_id,sender_username,sender_display_name,ciphertext_b64,iv_b64,room_key_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING", &[&m.id,&m.room_id,&m.sender_id,&m.sender_username,&m.sender_display_name,&m.ciphertext_b64,&m.iv_b64,&m.room_key_id,&m.created_at]).await?;
+        client
+            .execute(
+                "INSERT INTO chat_messages (id,room_id,sender_id,sender_username,sender_display_name,ciphertext_b64,iv_b64,room_key_id,created_at,edited_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO UPDATE SET ciphertext_b64=EXCLUDED.ciphertext_b64, iv_b64=EXCLUDED.iv_b64, room_key_id=EXCLUDED.room_key_id, edited_at=EXCLUDED.edited_at",
+                &[
+                    &m.id,
+                    &m.room_id,
+                    &m.sender_id,
+                    &m.sender_username,
+                    &m.sender_display_name,
+                    &m.ciphertext_b64,
+                    &m.iv_b64,
+                    &m.room_key_id,
+                    &m.created_at,
+                    &m.edited_at,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
     pub async fn persist_chat(&self, msg: &EncryptedChatMessage) -> anyhow::Result<()> {
         if let Some(client) = self.pg_client.read().await.clone() {
             Self::write_chat(&client, msg).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_chat_from_pg(
+        &self,
+        message_id: &Uuid,
+        room_id: &Uuid,
+        sender_id: &Uuid,
+    ) -> anyhow::Result<()> {
+        if let Some(client) = self.pg_client.read().await.clone() {
+            client
+                .execute(
+                    "DELETE FROM chat_messages WHERE id=$1 AND room_id=$2 AND sender_id=$3",
+                    &[message_id, room_id, sender_id],
+                )
+                .await?;
         }
         Ok(())
     }
@@ -274,6 +569,69 @@ impl ControlState {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
         format!("lpr_{}", BASE64.encode(bytes))
+    }
+
+    pub fn is_admin_username(&self, username: &str) -> bool {
+        self.admin_usernames
+            .contains(&Self::normalize_username(username))
+    }
+
+    pub fn is_admin_password_configured(&self) -> bool {
+        if self
+            .admin_master_creds
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .is_some()
+        {
+            return true;
+        }
+        std::env::var("LIAPER_ADMIN_PASSWORD")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+    }
+
+    pub fn verify_admin_password(&self, password: &str) -> bool {
+        if let Some(creds) = self.admin_master_creds.read().ok().and_then(|g| g.clone()) {
+            return Self::hash_password(password, &creds.salt_b64) == creds.password_hash;
+        }
+        if let Ok(env_pass) = std::env::var("LIAPER_ADMIN_PASSWORD") {
+            let trimmed = env_pass.trim();
+            if !trimmed.is_empty() {
+                return password == trimmed;
+            }
+        }
+        false
+    }
+
+    pub fn set_admin_password(&self, new_password: &str) {
+        let salt_b64 = Self::generate_salt();
+        let password_hash = Self::hash_password(new_password, &salt_b64);
+        let creds = AdminMasterCredentials {
+            password_hash,
+            salt_b64,
+            updated_at: Utc::now(),
+        };
+        if let Ok(mut guard) = self.admin_master_creds.write() {
+            *guard = Some(creds.clone());
+        }
+        if let Some(parent) = self.admin_auth_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&creds) {
+            let _ = std::fs::write(&self.admin_auth_path, json);
+        }
+    }
+
+    pub fn load_admin_auth_from_disk(&self) {
+        if let Ok(content) = std::fs::read_to_string(&self.admin_auth_path) {
+            if let Ok(creds) = serde_json::from_str::<AdminMasterCredentials>(&content) {
+                if let Ok(mut guard) = self.admin_master_creds.write() {
+                    *guard = Some(creds);
+                }
+            }
+        }
     }
 
     pub fn load_users_from_disk(&self) {
@@ -779,6 +1137,28 @@ impl ControlState {
             for p in &room.participants {
                 self.send_to_user(&p.user_id, msg);
             }
+        }
+    }
+
+    pub fn load_reports_from_disk(&self) {
+        if let Ok(raw) = std::fs::read_to_string(&self.reports_path) {
+            if let Ok(list) = serde_json::from_str::<Vec<ChatAbuseReport>>(&raw) {
+                for rep in list {
+                    self.reports.insert(rep.id, rep);
+                }
+            }
+        }
+    }
+
+    pub fn save_reports_to_disk(&self) {
+        let mut list: Vec<ChatAbuseReport> =
+            self.reports.iter().map(|e| e.value().clone()).collect();
+        list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        if let Some(parent) = self.reports_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(&self.reports_path, json);
         }
     }
 }

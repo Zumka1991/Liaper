@@ -7,7 +7,15 @@ function size(bytes: number): string {
   const unit = bytes >= 1024 ** 3 ? 3 : bytes >= 1024 ** 2 ? 2 : bytes >= 1024 ? 1 : 0;
   return `${(bytes / 1024 ** unit).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ${['Б', 'КиБ', 'МиБ', 'ГиБ'][unit]}`;
 }
-export function StorageUsage({ baseUrl, token }: { baseUrl: string; token: string }) {
+export function StorageUsage({
+  baseUrl,
+  token,
+  refreshTrigger = 0,
+}: {
+  baseUrl: string;
+  token: string;
+  refreshTrigger?: number;
+}) {
   const [usage, setUsage] = useState<Usage | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
@@ -24,7 +32,7 @@ export function StorageUsage({ baseUrl, token }: { baseUrl: string; token: strin
       }).catch(() => { if (!controller.signal.aborted) setError('Не удалось обновить занятое место. Проверьте соединение.'); })
       .finally(() => { window.clearTimeout(timeout); if (!controller.signal.aborted) setLoading(false); });
     return () => { controller.abort(); window.clearTimeout(timeout); };
-  }, [baseUrl, token, attempt]);
+  }, [baseUrl, token, attempt, refreshTrigger]);
   return <section aria-label="Хранилище" className="rounded-xl border border-slate-200 bg-white p-4">
     <div className="flex items-center justify-between gap-3">
       <h3 className="text-sm font-semibold text-slate-900">Хранилище</h3>

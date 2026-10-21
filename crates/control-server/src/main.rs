@@ -1,3 +1,4 @@
+mod antifraud;
 mod archives;
 mod attachments;
 #[cfg(test)]
@@ -24,7 +25,7 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::state::{ControlState, StoredUser};
+use crate::state::{ChatAbuseReport, ControlState, DisclosedRoomKey, StoredUser};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -50,6 +51,22 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/api/health", get(health_handler))
+        .route("/api/admin/auth-status", get(admin_auth_status_handler))
+        .route(
+            "/api/admin/setup-password",
+            post(admin_setup_password_handler),
+        )
+        .route("/api/admin/overview", get(admin_overview_handler))
+        .route(
+            "/api/admin/antifraud/unblock",
+            post(admin_unblock_subject_handler),
+        )
+        .route(
+            "/api/admin/antifraud/quarantine",
+            post(admin_manual_quarantine_handler),
+        )
+        .route("/api/reports", post(submit_report_handler))
+        .route("/api/admin/reports/:id/resolve", post(resolve_report_handler))
         .route("/api/storage/usage", get(attachments::usage))
         .route("/api/storage/committed", post(attachments::node_commit))
         .route("/api/attachments", post(attachments::reserve))
@@ -108,6 +125,539 @@ async fn health_handler(State(state): State<Arc<ControlState>>) -> Json<serde_js
     }))
 }
 
+fn verify_admin_user(
+    state: &ControlState,
+    headers: &axum::http::HeaderMap,
+) -> Result<StoredUser, archives::ApiError> {
+    let user_id = archives::owner(state, headers)?;
+    let user = state
+        .users_by_id
+        .get(&user_id)
+        .map(|u| u.value().clone())
+        .ok_or_else(|| archives::error(StatusCode::UNAUTHORIZED, "Пользователь не найден"))?;
+    if !state.is_admin_username(&user.username) {
+        return Err(archives::error(
+            StatusCode::FORBIDDEN,
+            "Доступ к админке разрешён только владельцу системы (@napsy)",
+        ));
+    }
+    Ok(user)
+}
+
+fn extract_admin_password(headers: &axum::http::HeaderMap) -> Option<String> {
+    if let Some(b64_val) = headers
+        .get("x-admin-password-b64")
+        .and_then(|v| v.to_str().ok())
+    {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        if let Ok(bytes) = BASE64.decode(b64_val.trim()) {
+            if let Ok(decoded) = String::from_utf8(bytes) {
+                return Some(decoded);
+            }
+        }
+    }
+    headers
+        .get("x-admin-password")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+async fn require_admin_access(
+    state: &ControlState,
+    headers: &axum::http::HeaderMap,
+) -> Result<StoredUser, archives::ApiError> {
+    let user = verify_admin_user(state, headers)?;
+    let subj_key = format!("user:{}", user.id);
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        return Err(archives::error(StatusCode::TOO_MANY_REQUESTS, &msg));
+    }
+    if !state.is_admin_password_configured() {
+        return Err(archives::error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "Сначала задайте мастер-пароль администратора",
+        ));
+    }
+    let provided = extract_admin_password(headers).ok_or_else(|| {
+        archives::error(
+            StatusCode::UNAUTHORIZED,
+            "Введите мастер-пароль администратора",
+        )
+    })?;
+    if !state.verify_admin_password(&provided) {
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(user.id),
+                Some(user.username.clone()),
+                None,
+                "auth_bruteforce",
+                antifraud::IncidentSeverity::Medium,
+                30,
+                "Неверный мастер-пароль при входе в Админку".into(),
+                300,
+            )
+            .await;
+        return Err(archives::error(
+            StatusCode::UNAUTHORIZED,
+            "Неверный мастер-пароль администратора",
+        ));
+    }
+    Ok(user)
+}
+
+async fn admin_auth_status_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let user = verify_admin_user(&state, &headers)?;
+    Ok(Json(serde_json::json!({
+        "is_admin": true,
+        "username": user.username,
+        "password_configured": state.is_admin_password_configured(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct AdminSetupPasswordRequest {
+    current_password: Option<String>,
+    new_password: String,
+}
+
+async fn admin_setup_password_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AdminSetupPasswordRequest>,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let user = verify_admin_user(&state, &headers)?;
+    let subj_key = format!("user:{}", user.id);
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        return Err(archives::error(StatusCode::TOO_MANY_REQUESTS, &msg));
+    }
+    let clean_new = req.new_password.trim();
+    if clean_new.len() < 4 || clean_new.len() > 128 {
+        return Err(archives::error(
+            StatusCode::BAD_REQUEST,
+            "Мастер-пароль должен содержать от 4 до 128 символов",
+        ));
+    }
+    if state.is_admin_password_configured() {
+        let cur = req.current_password.as_deref().unwrap_or("");
+        if !state.verify_admin_password(cur) {
+            state
+                .antifraud
+                .record_violation(
+                    &subj_key,
+                    Some(user.id),
+                    Some(user.username.clone()),
+                    None,
+                    "auth_bruteforce",
+                    antifraud::IncidentSeverity::Medium,
+                    30,
+                    "Неверный текущий мастер-пароль при попытке смены пароля Админки".into(),
+                    300,
+                )
+                .await;
+            return Err(archives::error(
+                StatusCode::UNAUTHORIZED,
+                "Неверный текущий мастер-пароль",
+            ));
+        }
+    }
+    state.set_admin_password(clean_new);
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "password_configured": true,
+    })))
+}
+
+async fn admin_overview_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let _admin = require_admin_access(&state, &headers).await?;
+    let pg = state.pg_client.read().await.clone().filter(|c| !c.is_closed());
+    let database_connected = pg.is_some();
+
+    let mut per_user_storage: std::collections::HashMap<Uuid, (i64, i64)> =
+        std::collections::HashMap::new();
+    let mut per_user_archives: std::collections::HashMap<Uuid, i64> =
+        std::collections::HashMap::new();
+    let mut total_attachments_ready: i64 = 0;
+    let mut total_attachments_pending: i64 = 0;
+    let mut total_attachments_bytes: i64 = 0;
+    let mut total_lesson_archives: i64 = 0;
+
+    if let Some(ref db) = pg {
+        if let Ok(row) = db
+            .query_one(
+                "SELECT \
+                    COALESCE(COUNT(*) FILTER (WHERE state='ready' AND expires_at > NOW()), 0)::BIGINT, \
+                    COALESCE(COUNT(*) FILTER (WHERE state='pending' AND reservation_until > NOW()), 0)::BIGINT, \
+                    COALESCE(SUM(size_bytes) FILTER (WHERE state='ready' AND expires_at > NOW()), 0)::BIGINT \
+                 FROM file_attachments",
+                &[],
+            )
+            .await
+        {
+            total_attachments_ready = row.get(0);
+            total_attachments_pending = row.get(1);
+            total_attachments_bytes = row.get(2);
+        }
+
+        if let Ok(rows) = db
+            .query(
+                "SELECT owner_id, \
+                    COALESCE(SUM(size_bytes) FILTER (WHERE state='ready' AND expires_at > NOW()), 0)::BIGINT, \
+                    COALESCE(COUNT(*) FILTER (WHERE state='ready' AND expires_at > NOW()), 0)::BIGINT \
+                 FROM file_attachments GROUP BY owner_id",
+                &[],
+            )
+            .await
+        {
+            for r in rows {
+                let uid: Uuid = r.get(0);
+                let bytes: i64 = r.get(1);
+                let cnt: i64 = r.get(2);
+                per_user_storage.insert(uid, (bytes, cnt));
+            }
+        }
+
+        if let Ok(rows) = db
+            .query(
+                "SELECT user_id, COUNT(*)::BIGINT FROM lesson_archives GROUP BY user_id",
+                &[],
+            )
+            .await
+        {
+            for r in rows {
+                let uid: Uuid = r.get(0);
+                let cnt: i64 = r.get(1);
+                total_lesson_archives += cnt;
+                per_user_archives.insert(uid, cnt);
+            }
+        }
+    }
+
+    let file_node_url = std::env::var("FILE_NODE_PUBLIC_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:4201".to_string());
+    let file_node_online = tokio::net::TcpStream::connect("127.0.0.1:4201")
+        .await
+        .is_ok();
+
+    let mut users_list = Vec::new();
+    let mut online_users = 0usize;
+    let mut tutors_count = 0usize;
+    let mut students_count = 0usize;
+    let mut active_ws_connections = 0usize;
+
+    for entry in state.users_by_id.iter() {
+        let u = entry.value();
+        let ws_sessions = state
+            .sessions
+            .get(&u.id)
+            .map(|s| s.value().len())
+            .unwrap_or(0);
+        let is_online = ws_sessions > 0;
+        if is_online {
+            online_users += 1;
+        }
+        active_ws_connections += ws_sessions;
+        match u.role {
+            liaper_common::UserRole::Tutor => tutors_count += 1,
+            liaper_common::UserRole::Student => students_count += 1,
+        }
+        let contacts_count = state
+            .contacts_by_user
+            .get(&u.id)
+            .map(|c| c.value().len())
+            .unwrap_or(0);
+        let (used_bytes, files_count) = per_user_storage.get(&u.id).copied().unwrap_or((0, 0));
+        let archives_count = per_user_archives.get(&u.id).copied().unwrap_or(0);
+
+        users_list.push(serde_json::json!({
+            "id": u.id,
+            "username": u.username,
+            "display_name": u.display_name,
+            "role": u.role,
+            "online": is_online,
+            "ws_sessions": ws_sessions,
+            "contacts_count": contacts_count,
+            "key_fingerprint": u.key_fingerprint,
+            "storage_used_bytes": used_bytes,
+            "storage_quota_bytes": attachments::USER_QUOTA_BYTES,
+            "attachments_count": files_count,
+            "archives_count": archives_count,
+        }));
+    }
+
+    users_list.sort_by(|a, b| {
+        let ao = a["online"].as_bool().unwrap_or(false);
+        let bo = b["online"].as_bool().unwrap_or(false);
+        bo.cmp(&ao).then_with(|| {
+            a["username"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["username"].as_str().unwrap_or(""))
+        })
+    });
+
+    let mut total_contact_links = 0usize;
+    for entry in state.contacts_by_user.iter() {
+        total_contact_links += entry.value().len();
+    }
+    let confirmed_contact_pairs = total_contact_links / 2;
+    let pending_contact_requests = state.contact_requests.len();
+
+    let mut active_rooms: Vec<liaper_common::RoomInfo> =
+        state.rooms.iter().map(|r| r.value().clone()).collect();
+    active_rooms.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let total_chat_rooms = state.room_chats.len();
+    let total_encrypted_messages: usize = state
+        .room_chats
+        .iter()
+        .map(|entry| entry.value().len())
+        .sum();
+    let total_key_envelopes: usize = state
+        .room_key_envelopes
+        .iter()
+        .map(|entry| entry.value().len())
+        .sum();
+
+    let media_nodes = state.list_nodes_sorted();
+    let mut releases_list: Vec<AppReleaseManifest> =
+        state.releases.iter().map(|e| e.value().clone()).collect();
+    releases_list.sort_by(|a, b| a.platform.as_str().cmp(b.platform.as_str()));
+
+    let mut reports_list: Vec<ChatAbuseReport> =
+        state.reports.iter().map(|e| e.value().clone()).collect();
+    reports_list.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let open_reports_count = reports_list.iter().filter(|r| r.status == "open").count();
+    let antifraud_snapshot = state.antifraud.snapshot_for_admin().await;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "storage_engine": if database_connected { "postgresql" } else { "json" },
+        "database_connected": database_connected,
+        "summary": {
+            "total_users": users_list.len(),
+            "online_users": online_users,
+            "tutors_count": tutors_count,
+            "students_count": students_count,
+            "active_ws_connections": active_ws_connections,
+            "confirmed_contact_pairs": confirmed_contact_pairs,
+            "pending_contact_requests": pending_contact_requests,
+            "active_rooms_count": active_rooms.len(),
+            "media_nodes_count": media_nodes.len(),
+            "file_nodes_online": if file_node_online { 1 } else { 0 },
+            "total_chat_rooms": total_chat_rooms,
+            "total_encrypted_messages": total_encrypted_messages,
+            "total_key_envelopes": total_key_envelopes,
+            "total_attachments_ready": total_attachments_ready,
+            "total_attachments_pending": total_attachments_pending,
+            "total_attachments_bytes": total_attachments_bytes,
+            "total_lesson_archives": total_lesson_archives,
+            "user_quota_bytes": attachments::USER_QUOTA_BYTES,
+            "open_reports_count": open_reports_count,
+            "total_reports_count": reports_list.len(),
+        },
+        "file_nodes": [
+            {
+                "node_id": "storage-local-1",
+                "public_url": file_node_url,
+                "online": file_node_online,
+                "stored_files": total_attachments_ready,
+                "pending_uploads": total_attachments_pending,
+                "stored_bytes": total_attachments_bytes,
+            }
+        ],
+        "media_nodes": media_nodes,
+        "active_rooms": active_rooms,
+        "users": users_list,
+        "reports": reports_list,
+        "antifraud": antifraud_snapshot,
+        "releases": releases_list,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AdminUnblockRequest {
+    subject_key: String,
+}
+
+async fn admin_unblock_subject_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AdminUnblockRequest>,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let _admin = require_admin_access(&state, &headers).await?;
+    let ok = state.antifraud.unblock_subject(req.subject_key.trim());
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "unblocked": ok,
+        "subject_key": req.subject_key,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AdminQuarantineRequest {
+    subject_key: String,
+    user_id: Option<Uuid>,
+    username: Option<String>,
+    duration_secs: Option<i64>,
+    reason: Option<String>,
+}
+
+async fn admin_manual_quarantine_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<AdminQuarantineRequest>,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let _admin = require_admin_access(&state, &headers).await?;
+    let duration = req.duration_secs.unwrap_or(900);
+    let reason = req
+        .reason
+        .unwrap_or_else(|| "Ручная блокировка администратором".to_string());
+    state
+        .antifraud
+        .manual_quarantine(
+            req.subject_key.trim(),
+            req.user_id,
+            req.username,
+            duration,
+            reason,
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "subject_key": req.subject_key,
+        "duration_secs": duration,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SubmitReportRequest {
+    room_id: Uuid,
+    room_title: Option<String>,
+    reason: String,
+    disclosed_keys: Vec<DisclosedRoomKey>,
+}
+
+async fn submit_report_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<SubmitReportRequest>,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let reporter_id = archives::owner(&state, &headers)?;
+    let reporter = state
+        .users_by_id
+        .get(&reporter_id)
+        .map(|u| u.value().clone())
+        .ok_or_else(|| archives::error(StatusCode::UNAUTHORIZED, "Пользователь не найден"))?;
+
+    let subj_key = format!("user:{reporter_id}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        return Err(archives::error(StatusCode::TOO_MANY_REQUESTS, &msg));
+    }
+    if !state
+        .antifraud
+        .allow_rate(&format!("report:{reporter_id}"), 600, 5)
+    {
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(reporter_id),
+                Some(reporter.username.clone()),
+                None,
+                "report_spam",
+                antifraud::IncidentSeverity::Medium,
+                35,
+                "Флуд жалобами (> 5 за 10 минут)".into(),
+                300,
+            )
+            .await;
+        return Err(archives::error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Слишком много жалоб за короткое время. Подождите несколько минут",
+        ));
+    }
+
+    let reason = req.reason.trim();
+    let clean_reason = if reason.is_empty() {
+        "Жалоба на нарушение правил общения".to_string()
+    } else {
+        reason.chars().take(500).collect()
+    };
+
+    let room_title = req
+        .room_title
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("Чат {}", req.room_id));
+
+    let messages_snapshot = state
+        .room_chats
+        .get(&req.room_id)
+        .map(|entry| entry.value().clone())
+        .unwrap_or_default();
+
+    let safe_keys: Vec<DisclosedRoomKey> = req.disclosed_keys.into_iter().take(32).collect();
+
+    let report = ChatAbuseReport {
+        id: Uuid::new_v4(),
+        room_id: req.room_id,
+        room_title,
+        reporter_id,
+        reporter_username: reporter.username,
+        reporter_display_name: reporter.display_name,
+        reason: clean_reason,
+        disclosed_keys: safe_keys,
+        messages_snapshot: messages_snapshot.clone(),
+        status: "open".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let report_id = report.id;
+    state.reports.insert(report_id, report);
+    state.save_reports_to_disk();
+
+    Ok(Json(serde_json::json!({
+        "report_id": report_id,
+        "messages_count": messages_snapshot.len(),
+        "status": "open",
+    })))
+}
+
+async fn resolve_report_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _admin = require_admin_access(&state, &headers).await?;
+    if let Some(mut rep) = state.reports.get_mut(&id) {
+        rep.status = if rep.status == "open" {
+            "resolved".to_string()
+        } else {
+            "open".to_string()
+        };
+        let new_status = rep.status.clone();
+        drop(rep);
+        state.save_reports_to_disk();
+        return Ok(Json(serde_json::json!({
+            "id": id,
+            "status": new_status,
+        })));
+    }
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({ "error": "Жалоба не найдена" })),
+    ))
+}
+
 // ============================================================================
 // Авторизация и Пользователи
 // ============================================================================
@@ -117,18 +667,38 @@ async fn register_handler(
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<serde_json::Value>)> {
     let username = ControlState::normalize_username(&req.username);
-    if username.len() < 3 {
+    if username.len() < 3 || username.len() > 32 {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(
-                serde_json::json!({ "error": "Ник должен содержать минимум 3 символа (латиница, цифры, _)" }),
+                serde_json::json!({ "error": "Ник должен содержать от 3 до 32 символов (латиница, цифры, _)" }),
             ),
         ));
     }
-    if req.password.len() < 4 {
+    if req.password.len() < 4 || req.password.len() > 256 || req.display_name.len() > 64 || req.e2ee_public_key.len() > 2048 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Пароль должен содержать минимум 4 символа" })),
+            Json(serde_json::json!({ "error": "Некорректная длина пароля или параметров профиля" })),
+        ));
+    }
+    if !state.antifraud.allow_rate("register:global", 600, 12) {
+        state
+            .antifraud
+            .record_violation(
+                &format!("username:{username}"),
+                None,
+                Some(username.clone()),
+                None,
+                "register_flood",
+                antifraud::IncidentSeverity::High,
+                50,
+                format!("Попытка массовой регистрации аккаунтов (@{username})"),
+                600,
+            )
+            .await;
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "Сработала антифрод-защита от массовой регистрации. Повторите позже." })),
         ));
     }
 
@@ -170,7 +740,7 @@ async fn register_handler(
     state.save_users_to_disk();
 
     let token = ControlState::generate_token();
-    state.tokens.insert(token.clone(), user_id);
+    state.persist_session(&token, user_id).await;
 
     info!("Registered user @{} ({})", stored.username, stored.id);
 
@@ -190,15 +760,68 @@ async fn login_handler(
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<serde_json::Value>)> {
     let username = ControlState::normalize_username(&req.username);
+    let subj_by_name = format!("username:{username}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_by_name) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": msg })),
+        ));
+    }
+    if !state
+        .antifraud
+        .allow_rate(&format!("login:{username}"), 300, 8)
+    {
+        state
+            .antifraud
+            .record_violation(
+                &subj_by_name,
+                None,
+                Some(username.clone()),
+                None,
+                "auth_bruteforce",
+                antifraud::IncidentSeverity::High,
+                100,
+                format!("Превышен лимит попыток входа для @{username} (Brute-Force Guard)"),
+                300,
+            )
+            .await;
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "Слишком много попыток входа. Аккаунт временно защищён антифрод-системой на 5 минут." })),
+        ));
+    }
+
     let user_id = match state.user_id_by_username.get(&username) {
         Some(id) => *id,
         None => {
+            state
+                .antifraud
+                .record_violation(
+                    &subj_by_name,
+                    None,
+                    Some(username.clone()),
+                    None,
+                    "auth_bruteforce",
+                    antifraud::IncidentSeverity::Low,
+                    15,
+                    format!("Попытка входа в несуществующий аккаунт @{username}"),
+                    300,
+                )
+                .await;
             return Err((
                 StatusCode::UNAUTHORIZED,
                 Json(serde_json::json!({ "error": "Пользователь с таким @ником не найден" })),
-            ))
+            ));
         }
     };
+
+    let subj_by_id = format!("user:{user_id}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_by_id) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": msg })),
+        ));
+    }
 
     let mut user = match state.users_by_id.get_mut(&user_id) {
         Some(u) => u,
@@ -212,22 +835,31 @@ async fn login_handler(
 
     let computed_hash = ControlState::hash_password(&req.password, &user.salt_b64);
     if computed_hash != user.password_hash {
+        drop(user);
+        state
+            .antifraud
+            .record_violation(
+                &subj_by_id,
+                Some(user_id),
+                Some(username.clone()),
+                None,
+                "auth_bruteforce",
+                antifraud::IncidentSeverity::Medium,
+                25,
+                format!("Неверный пароль при входе в аккаунт @{username}"),
+                300,
+            )
+            .await;
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Неверный пароль" })),
         ));
     }
 
-    if let Some(pub_key) = req.e2ee_public_key {
-        if !pub_key.is_empty() {
-            user.e2ee_public_key = pub_key;
-        }
-    }
-    if let Some(fp) = req.key_fingerprint {
-        if !fp.is_empty() {
-            user.key_fingerprint = fp;
-        }
-    }
+    user.merge_public_key(
+        req.e2ee_public_key.as_deref().unwrap_or(""),
+        req.key_fingerprint.as_deref().unwrap_or(""),
+    );
 
     let public_profile = user.to_public(true);
     let updated_user = user.clone();
@@ -240,9 +872,10 @@ async fn login_handler(
         )
     })?;
     state.save_users_to_disk();
+    state.notify_user_contacts_presence(&user_id);
 
     let token = ControlState::generate_token();
-    state.tokens.insert(token.clone(), user_id);
+    state.persist_session(&token, user_id).await;
 
     Ok(Json(AuthResponse {
         token,
@@ -414,8 +1047,47 @@ async fn ws_upgrade_handler(
         Some(id) => *id,
         None => return (StatusCode::UNAUTHORIZED, "Invalid session token").into_response(),
     };
+    let subj_key = format!("user:{user_id}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+    let existing_conns = state
+        .sessions
+        .get(&user_id)
+        .map(|s| s.value().len())
+        .unwrap_or(0);
+    if existing_conns >= antifraud::MAX_WS_SESSIONS_PER_USER {
+        let uname = state
+            .users_by_id
+            .get(&user_id)
+            .map(|u| u.username.clone());
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(user_id),
+                uname,
+                None,
+                "ws_flood",
+                antifraud::IncidentSeverity::Medium,
+                25,
+                format!(
+                    "Превышен лимит одновременных WebSocket-сессий ({}/{})",
+                    existing_conns,
+                    antifraud::MAX_WS_SESSIONS_PER_USER
+                ),
+                180,
+            )
+            .await;
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Превышен лимит одновременных подключений",
+        )
+            .into_response();
+    }
 
-    ws.on_upgrade(move |socket| ws::handle_client_socket(socket, state, user_id))
+    ws.max_message_size(128 * 1024)
+        .on_upgrade(move |socket| ws::handle_client_socket(socket, state, user_id))
 }
 
 #[cfg(test)]

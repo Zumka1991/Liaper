@@ -51,6 +51,11 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
     };
     let _ = tx.send(welcome);
 
+    // Доставляем сохранённые конверты E2EE-ключей перед историей сообщений
+    for env in state.envelopes_for_recipient(&user_id) {
+        let _ = tx.send(ControlToClientMsg::KeyEnvelopeReceived { envelope: env });
+    }
+
     // Отправляем историю личных диалогов со взаимными контактами
     for contact in &contacts {
         let dm_id = ControlState::dm_room_id(&user_id, &contact.id);
@@ -112,6 +117,37 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
         Some(u) => u.clone(),
         None => return,
     };
+    let subj_key = format!("user:{user_id}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        state.send_to_user(&caller.id, &ControlToClientMsg::Error { message: msg });
+        return;
+    }
+    if !state
+        .antifraud
+        .allow_rate(&format!("ws_cmd:{user_id}"), 10, 90)
+    {
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(caller.id),
+                Some(caller.username.clone()),
+                None,
+                "ws_flood",
+                crate::antifraud::IncidentSeverity::Medium,
+                25,
+                "Флуд WebSocket-командами (> 90 команд за 10 сек.)".into(),
+                180,
+            )
+            .await;
+        state.send_to_user(
+            &caller.id,
+            &ControlToClientMsg::Error {
+                message: "Сработала антифрод-защита: слишком частая отправка команд".into(),
+            },
+        );
+        return;
+    }
     let _contact_guard = if matches!(
         &cmd,
         ClientToControlMsg::SendContactRequest { .. }
@@ -280,6 +316,65 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             invited_usernames,
             preferred_region,
         } => {
+            if !state
+                .antifraud
+                .allow_rate(&format!("call:{user_id}"), 60, 6)
+            {
+                state
+                    .antifraud
+                    .record_violation(
+                        &subj_key,
+                        Some(caller.id),
+                        Some(caller.username.clone()),
+                        None,
+                        "call_spam",
+                        crate::antifraud::IncidentSeverity::High,
+                        40,
+                        "Спам созданием уроков / Call Bombing (> 6 в минуту)".into(),
+                        300,
+                    )
+                    .await;
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Слишком частое создание уроков. Подождите минуту".into(),
+                    },
+                );
+                return;
+            }
+            let hosted_rooms = state
+                .rooms
+                .iter()
+                .filter(|r| r.host_id == caller.id)
+                .count();
+            if hosted_rooms >= crate::antifraud::MAX_ACTIVE_ROOMS_PER_HOST {
+                state
+                    .antifraud
+                    .record_violation(
+                        &subj_key,
+                        Some(caller.id),
+                        Some(caller.username.clone()),
+                        None,
+                        "call_spam",
+                        crate::antifraud::IncidentSeverity::Medium,
+                        25,
+                        format!(
+                            "Превышен лимит одновременно созданных активных комнат ({}/{})",
+                            hosted_rooms,
+                            crate::antifraud::MAX_ACTIVE_ROOMS_PER_HOST
+                        ),
+                        180,
+                    )
+                    .await;
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "У вас уже открыто максимальное число активных уроков. Завершите текущий звонок".into(),
+                    },
+                );
+                return;
+            }
+            let clean_title: String = title.trim().chars().take(80).collect();
             let assigned_node = state.select_least_loaded_node(preferred_region.as_deref());
             let room_id = Uuid::new_v4();
             let host_participant = RoomParticipantState {
@@ -297,10 +392,10 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
 
             let room = RoomInfo {
                 id: room_id,
-                title: if title.trim().is_empty() {
+                title: if clean_title.is_empty() {
                     format!("Урок @{}", caller.username)
                 } else {
-                    title
+                    clean_title
                 },
                 host_id: caller.id,
                 host_username: caller.username.clone(),
@@ -341,6 +436,32 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             target_username,
             with_video,
         } => {
+            if !state
+                .antifraud
+                .allow_rate(&format!("call:{user_id}"), 60, 6)
+            {
+                state
+                    .antifraud
+                    .record_violation(
+                        &subj_key,
+                        Some(caller.id),
+                        Some(caller.username.clone()),
+                        None,
+                        "call_spam",
+                        crate::antifraud::IncidentSeverity::High,
+                        40,
+                        format!("Call Bombing на @{target_username} (> 6 вызовов в минуту)"),
+                        300,
+                    )
+                    .await;
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Слишком частые вызовы. Подождите минуту".into(),
+                    },
+                );
+                return;
+            }
             let norm = ControlState::normalize_username(&target_username);
             let target_id = match state.user_id_by_username.get(&norm) {
                 Some(id) => *id,
@@ -619,19 +740,124 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
         }
 
         ClientToControlMsg::SendKeyEnvelope { envelope } => {
+            if envelope.encrypted_room_key_b64.len() > crate::antifraud::MAX_ENVELOPE_WRAPPED_KEY_LEN
+                || envelope.sender_public_key.len() > 512
+                || envelope.iv_b64.len() > 128
+            {
+                state
+                    .antifraud
+                    .record_violation(
+                        &subj_key,
+                        Some(caller.id),
+                        Some(caller.username.clone()),
+                        None,
+                        "oversized_payload",
+                        crate::antifraud::IncidentSeverity::Critical,
+                        60,
+                        format!(
+                            "Попытка отправки аномально большого ключевого конверта ({} байт)",
+                            envelope.encrypted_room_key_b64.len()
+                        ),
+                        600,
+                    )
+                    .await;
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Ключевой конверт отклонён антифрод-системой (превышен допустимый размер)".into(),
+                    },
+                );
+                return;
+            }
+            if envelope.sender_id != caller.id {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Недопустимый отправитель ключевого конверта".into(),
+                    },
+                );
+                return;
+            }
             let recipient_id = envelope.recipient_id;
             let room_id = envelope.room_id;
+            let room_allowed = state.rooms.get(&room_id).is_some_and(|room| {
+                room.participants.iter().any(|p| p.user_id == caller.id)
+                    && (recipient_id == caller.id
+                        || room.participants.iter().any(|p| p.user_id == recipient_id)
+                        || state
+                            .room_invitations
+                            .get(&room_id)
+                            .is_some_and(|ids| ids.contains(&recipient_id)))
+            });
+            let dm_allowed = state
+                .contacts_by_user
+                .get(&caller.id)
+                .is_some_and(|contacts| {
+                    contacts.iter().any(|cid| {
+                        ControlState::dm_room_id(&caller.id, cid) == room_id
+                            && (recipient_id == caller.id || recipient_id == *cid)
+                    })
+                });
+            if !room_allowed && !dm_allowed {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Нет доступа для отправки ключа комнаты".into(),
+                    },
+                );
+                return;
+            }
 
-            state
-                .room_key_envelopes
-                .entry((room_id, recipient_id))
-                .or_default()
-                .push(envelope.clone());
+            if state.upsert_key_envelope_in_memory(envelope.clone()) {
+                let _ = state.persist_key_envelope(&envelope).await;
+                state.save_envelopes_to_disk();
+            }
 
             state.send_to_user(
                 &recipient_id,
                 &ControlToClientMsg::KeyEnvelopeReceived { envelope },
             );
+        }
+
+        ClientToControlMsg::UpdatePublicKey {
+            e2ee_public_key,
+            key_fingerprint,
+        } => {
+            let mut updated_user = None;
+            if let Some(mut u) = state.users_by_id.get_mut(&caller.id) {
+                u.merge_public_key(&e2ee_public_key, &key_fingerprint);
+                updated_user = Some(u.clone());
+            }
+            if let Some(u) = updated_user {
+                let _ = state.persist_user(&u).await;
+                state.save_users_to_disk();
+
+                let mut updated_rooms = Vec::new();
+                for mut room_entry in state.rooms.iter_mut() {
+                    let room = room_entry.value_mut();
+                    let mut changed = false;
+                    for p in room.participants.iter_mut() {
+                        if p.user_id == caller.id {
+                            p.e2ee_public_key = u.e2ee_public_key.clone();
+                            p.key_fingerprint = u.key_fingerprint.clone();
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        updated_rooms.push(room.clone());
+                    }
+                }
+                for room in updated_rooms {
+                    let rid = room.id;
+                    state.broadcast_to_room(&rid, &ControlToClientMsg::RoomUpdated { room });
+                }
+
+                state.push_contacts_update(&caller.id);
+                state.notify_user_contacts_presence(&caller.id);
+                state.broadcast_all(&ControlToClientMsg::DirectoryUpdated {
+                    users: state.all_public_users(),
+                });
+            }
         }
 
         ClientToControlMsg::SendEncryptedChat {
@@ -640,6 +866,62 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             iv_b64,
             room_key_id,
         } => {
+            if ciphertext_b64.is_empty()
+                || ciphertext_b64.len() > crate::antifraud::MAX_CHAT_CIPHERTEXT_B64_LEN
+                || iv_b64.len() > 128
+                || room_key_id.len() > 64
+            {
+                state
+                    .antifraud
+                    .record_violation(
+                        &subj_key,
+                        Some(caller.id),
+                        Some(caller.username.clone()),
+                        None,
+                        "oversized_payload",
+                        crate::antifraud::IncidentSeverity::Critical,
+                        60,
+                        format!(
+                            "Memory Bomb Guard: отклонён гигантский пакет чата ({} байт)",
+                            ciphertext_b64.len()
+                        ),
+                        600,
+                    )
+                    .await;
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Сообщение отклонено антифрод-системой: превышен лимит размера зашифрованного пакета (64 КиБ)".into(),
+                    },
+                );
+                return;
+            }
+            if !state
+                .antifraud
+                .allow_rate(&format!("chat:{user_id}"), 10, 40)
+            {
+                state
+                    .antifraud
+                    .record_violation(
+                        &subj_key,
+                        Some(caller.id),
+                        Some(caller.username.clone()),
+                        None,
+                        "ws_flood",
+                        crate::antifraud::IncidentSeverity::Medium,
+                        30,
+                        "Спам сообщениями в чате (> 40 сообщений за 10 сек.)".into(),
+                        180,
+                    )
+                    .await;
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Слишком быстрая отправка сообщений. Подождите несколько секунд".into(),
+                    },
+                );
+                return;
+            }
             let room_allowed = state
                 .rooms
                 .get(&room_id)
@@ -671,6 +953,7 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
                 iv_b64,
                 room_key_id,
                 created_at: Utc::now(),
+                edited_at: None,
             };
 
             if let Err(e) = state.persist_chat(&msg).await {
@@ -711,6 +994,127 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
                     state.send_to_user(&caller.id, &event);
                     if peer_id != caller.id {
                         state.send_to_user(&peer_id, &event);
+                    }
+                }
+            }
+        }
+
+        ClientToControlMsg::EditEncryptedChat {
+            room_id,
+            message_id,
+            ciphertext_b64,
+            iv_b64,
+            room_key_id,
+        } => {
+            if ciphertext_b64.is_empty()
+                || ciphertext_b64.len() > crate::antifraud::MAX_CHAT_CIPHERTEXT_B64_LEN
+                || iv_b64.len() > 128
+                || room_key_id.len() > 64
+            {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Отредактированное сообщение превышает допустимый размер".into(),
+                    },
+                );
+                return;
+            }
+
+            let mut edited_msg = None;
+            if let Some(mut list) = state.room_chats.get_mut(&room_id) {
+                if let Some(item) = list.iter_mut().find(|m| m.id == message_id) {
+                    if item.sender_id != caller.id {
+                        state.send_to_user(
+                            &caller.id,
+                            &ControlToClientMsg::Error {
+                                message: "Редактировать можно только свои сообщения".into(),
+                            },
+                        );
+                        return;
+                    }
+                    item.ciphertext_b64 = ciphertext_b64;
+                    item.iv_b64 = iv_b64;
+                    item.room_key_id = room_key_id;
+                    item.edited_at = Some(Utc::now());
+                    edited_msg = Some(item.clone());
+                }
+            }
+
+            if let Some(msg) = edited_msg {
+                let _ = state.persist_chat(&msg).await;
+                state.save_chats_to_disk();
+
+                let event = ControlToClientMsg::EncryptedChatEdited { message: msg };
+                if state.rooms.contains_key(&room_id) {
+                    state.broadcast_to_room(&room_id, &event);
+                } else {
+                    let mut target_contact_id = None;
+                    if let Some(contact_ids) = state.contacts_by_user.get(&caller.id) {
+                        for cid in contact_ids.iter() {
+                            if ControlState::dm_room_id(&caller.id, cid) == room_id {
+                                target_contact_id = Some(*cid);
+                                break;
+                            }
+                        }
+                    }
+                    state.send_to_user(&caller.id, &event);
+                    if let Some(peer_id) = target_contact_id {
+                        if peer_id != caller.id {
+                            state.send_to_user(&peer_id, &event);
+                        }
+                    }
+                }
+            }
+        }
+
+        ClientToControlMsg::DeleteEncryptedChat {
+            room_id,
+            message_id,
+        } => {
+            let mut removed = false;
+            if let Some(mut list) = state.room_chats.get_mut(&room_id) {
+                if let Some(pos) = list.iter().position(|m| m.id == message_id) {
+                    if list[pos].sender_id != caller.id {
+                        state.send_to_user(
+                            &caller.id,
+                            &ControlToClientMsg::Error {
+                                message: "Удалять можно только свои сообщения".into(),
+                            },
+                        );
+                        return;
+                    }
+                    list.remove(pos);
+                    removed = true;
+                }
+            }
+
+            if removed {
+                let _ = state
+                    .delete_chat_from_pg(&message_id, &room_id, &caller.id)
+                    .await;
+                state.save_chats_to_disk();
+
+                let event = ControlToClientMsg::EncryptedChatDeleted {
+                    room_id,
+                    message_id,
+                };
+                if state.rooms.contains_key(&room_id) {
+                    state.broadcast_to_room(&room_id, &event);
+                } else {
+                    let mut target_contact_id = None;
+                    if let Some(contact_ids) = state.contacts_by_user.get(&caller.id) {
+                        for cid in contact_ids.iter() {
+                            if ControlState::dm_room_id(&caller.id, cid) == room_id {
+                                target_contact_id = Some(*cid);
+                                break;
+                            }
+                        }
+                    }
+                    state.send_to_user(&caller.id, &event);
+                    if let Some(peer_id) = target_contact_id {
+                        if peer_id != caller.id {
+                            state.send_to_user(&peer_id, &event);
+                        }
                     }
                 }
             }
@@ -756,6 +1160,7 @@ fn remove_user_from_all_rooms(state: &Arc<ControlState>, user_id: Uuid) {
 mod contact_tests {
     use super::*;
     use crate::state::StoredUser;
+    use base64::Engine as _;
     use liaper_common::UserRole;
     #[tokio::test]
     async fn only_tutors_invite_students_and_tenth_slot_is_atomic() {
@@ -898,6 +1303,93 @@ mod contact_tests {
         .await;
         assert_eq!(state.rooms.get(&room).unwrap().participants.len(), 2);
         assert_eq!(root.parent(), Some(std::env::temp_dir().as_path()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn key_envelope_requires_room_or_dm_membership_and_merges_x25519_keys() {
+        let root = std::env::temp_dir().join(format!("liaper-keyenv-test-{}", Uuid::new_v4()));
+        let state = ControlState::new(root.join("users.json"));
+        let add = |role| {
+            let id = Uuid::new_v4();
+            let username = id.simple().to_string();
+            state.users_by_id.insert(
+                id,
+                StoredUser {
+                    id,
+                    username: username.clone(),
+                    display_name: "Test".into(),
+                    password_hash: "hash".into(),
+                    salt_b64: "salt".into(),
+                    role,
+                    e2ee_public_key: "legacy_non_32_byte_key".into(),
+                    key_fingerprint: "fp".into(),
+                },
+            );
+            state.user_id_by_username.insert(username, id);
+            id
+        };
+        let tutor = add(UserRole::Tutor);
+        let student = add(UserRole::Student);
+        let outsider = add(UserRole::Student);
+        state.add_mutual_contact(tutor, student);
+
+        let key1 = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let key2 = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        process_client_command(
+            &state,
+            tutor,
+            ClientToControlMsg::UpdatePublicKey {
+                e2ee_public_key: key1.clone(),
+                key_fingerprint: "0101:0101".into(),
+            },
+        )
+        .await;
+        process_client_command(
+            &state,
+            tutor,
+            ClientToControlMsg::UpdatePublicKey {
+                e2ee_public_key: key2.clone(),
+                key_fingerprint: "0202:0202".into(),
+            },
+        )
+        .await;
+        let merged = state.users_by_id.get(&tutor).unwrap().e2ee_public_key.clone();
+        assert_eq!(merged, format!("{},{}", key2, key1));
+
+        let dm_room = ControlState::dm_room_id(&tutor, &student);
+        let valid_env = liaper_common::E2eeKeyEnvelope {
+            room_id: dm_room,
+            sender_id: tutor,
+            sender_username: "tutor".into(),
+            sender_public_key: key2.clone(),
+            recipient_id: student,
+            recipient_username: "student".into(),
+            encrypted_room_key_b64: "cipher".into(),
+            iv_b64: "iv".into(),
+            room_key_id: "ABCD:1234".into(),
+        };
+        // Outsider cannot inject key envelope into tutor-student DM
+        let mut spoofed = valid_env.clone();
+        spoofed.sender_id = outsider;
+        process_client_command(
+            &state,
+            outsider,
+            ClientToControlMsg::SendKeyEnvelope { envelope: spoofed },
+        )
+        .await;
+        assert!(state.envelopes_for_recipient(&student).is_empty());
+
+        // Tutor can send key envelope to student in their DM
+        process_client_command(
+            &state,
+            tutor,
+            ClientToControlMsg::SendKeyEnvelope {
+                envelope: valid_env,
+            },
+        )
+        .await;
+        assert_eq!(state.envelopes_for_recipient(&student).len(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

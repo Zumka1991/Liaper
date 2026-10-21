@@ -7,10 +7,12 @@ class StorageUsageCard extends StatefulWidget {
       {super.key,
       required this.baseUrl,
       required this.token,
-      required this.active});
+      required this.active,
+      this.refreshTrigger = 0});
   final String baseUrl;
   final String token;
   final bool active;
+  final int refreshTrigger;
   @override
   State<StorageUsageCard> createState() => _StorageUsageCardState();
 }
@@ -38,7 +40,8 @@ class _StorageUsageCardState extends State<StorageUsageCard> {
     if (widget.active &&
         (!oldWidget.active ||
             oldWidget.token != widget.token ||
-            oldWidget.baseUrl != widget.baseUrl)) {
+            oldWidget.baseUrl != widget.baseUrl ||
+            oldWidget.refreshTrigger != widget.refreshTrigger)) {
       _refresh();
     }
   }

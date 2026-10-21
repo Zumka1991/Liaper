@@ -152,6 +152,8 @@ pub struct EncryptedChatMessage {
     /// Идентификатор ключа комнаты, которым зашифровано сообщение
     pub room_key_id: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<DateTime<Utc>>,
 }
 
 // ============================================================================
@@ -256,12 +258,30 @@ pub enum ClientToControlMsg {
     SendKeyEnvelope {
         envelope: E2eeKeyEnvelope,
     },
+    /// Обновить публичный ключ устройства для E2EE обмена ключами
+    UpdatePublicKey {
+        e2ee_public_key: String,
+        key_fingerprint: String,
+    },
     /// Отправить зашифрованное (E2EE) сообщение в чат комнаты
     SendEncryptedChat {
         room_id: Uuid,
         ciphertext_b64: String,
         iv_b64: String,
         room_key_id: String,
+    },
+    /// Отредактировать своё зашифрованное (E2EE) сообщение в чате комнаты
+    EditEncryptedChat {
+        room_id: Uuid,
+        message_id: Uuid,
+        ciphertext_b64: String,
+        iv_b64: String,
+        room_key_id: String,
+    },
+    /// Удалить своё сообщение из чата комнаты
+    DeleteEncryptedChat {
+        room_id: Uuid,
+        message_id: Uuid,
     },
 }
 
@@ -314,6 +334,15 @@ pub enum ControlToClientMsg {
     /// Новое зашифрованное сообщение в чате комнаты
     EncryptedChatReceived {
         message: EncryptedChatMessage,
+    },
+    /// Зашифрованное сообщение в чате было отредактировано автором
+    EncryptedChatEdited {
+        message: EncryptedChatMessage,
+    },
+    /// Зашифрованное сообщение в чате было удалено автором
+    EncryptedChatDeleted {
+        room_id: Uuid,
+        message_id: Uuid,
     },
     /// История зашифрованных сообщений при входе в комнату
     RoomChatHistory {

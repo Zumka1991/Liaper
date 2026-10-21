@@ -12,7 +12,7 @@ use axum::{
         ws::{Message, WebSocket},
         State, WebSocketUpgrade,
     },
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -209,7 +209,15 @@ async fn sfu_ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<Arc<NodeState>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_sfu_peer(socket, state))
+    if state.active_peers_count() >= state.max_peers {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "SFU node peer capacity reached",
+        )
+            .into_response();
+    }
+    ws.max_message_size(512 * 1024)
+        .on_upgrade(move |socket| handle_sfu_peer(socket, state))
 }
 
 async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {

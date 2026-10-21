@@ -1,8 +1,10 @@
-import type { E2eeKeyEnvelope } from '../types/protocol';
+import type { ChatAttachmentMeta, E2eeKeyEnvelope, RichChatPayload } from '../types/protocol';
 
-const STORAGE_PRIV_KEY = 'liaper_e2ee_priv_jwk_v1';
-const STORAGE_PUB_KEY = 'liaper_e2ee_pub_spki_v1';
-const STORAGE_FP_KEY = 'liaper_e2ee_fp_v1';
+const STORAGE_PRIV_KEY = 'liaper_e2ee_x25519_priv_jwk_v2';
+const STORAGE_PUB_KEY = 'liaper_e2ee_x25519_pub_raw_v2';
+const STORAGE_FP_KEY = 'liaper_e2ee_x25519_fp_v2';
+const STORAGE_ROOM_KEYS = 'liaper_e2ee_room_keys_v2';
+const WRAP_DOMAIN_LABEL = new TextEncoder().encode('liaper-x25519-wrap-v1');
 
 export interface IdentityCryptoBundle {
   privateKey: CryptoKey;
@@ -17,6 +19,19 @@ export interface RoomSecretKeyBundle {
   roomKeyId: string;
 }
 
+export interface RoomKeyring {
+  activeKey: RoomSecretKeyBundle;
+  keysById: Record<string, RoomSecretKeyBundle>;
+}
+
+function getStorage(): Storage | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.byteLength; i++) {
@@ -26,7 +41,7 @@ export function bytesToBase64(bytes: Uint8Array): string {
 }
 
 export function base64ToBytes(b64: string): Uint8Array {
-  const binary = atob(b64);
+  const binary = atob(b64.trim());
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
@@ -34,7 +49,7 @@ export function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
+export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
@@ -46,57 +61,78 @@ export async function computeFingerprint(data: ArrayBuffer | Uint8Array): Promis
   return `${hex[0]}${hex[1]}:${hex[2]}${hex[3]}:${hex[4]}${hex[5]}:${hex[6]}${hex[7]}`;
 }
 
+export function extractX25519PublicKeys(rawField: string | undefined | null): string[] {
+  if (!rawField) return [];
+  const result: string[] = [];
+  for (const part of rawField.split(',')) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    try {
+      const bytes = base64ToBytes(trimmed);
+      if (bytes.byteLength === 32 && !result.includes(trimmed)) {
+        result.push(trimmed);
+      }
+    } catch {
+      // Ignore invalid base64
+    }
+  }
+  return result;
+}
+
 /**
- * Генерирует или загружает постоянную пару ключей ECDH P-256 текущего устройства.
+ * Генерирует или загружает постоянную пару ключей X25519 текущего устройства.
  */
 export async function getOrCreateIdentityKeys(): Promise<IdentityCryptoBundle> {
-  const savedPrivJwk = localStorage.getItem(STORAGE_PRIV_KEY);
-  const savedPubSpki = localStorage.getItem(STORAGE_PUB_KEY);
-  const savedFp = localStorage.getItem(STORAGE_FP_KEY);
+  const storage = getStorage();
+  const savedPrivJwk = storage?.getItem(STORAGE_PRIV_KEY);
+  const savedPubRaw = storage?.getItem(STORAGE_PUB_KEY);
+  const savedFp = storage?.getItem(STORAGE_FP_KEY);
 
-  if (savedPrivJwk && savedPubSpki && savedFp) {
+  if (savedPrivJwk && savedPubRaw && savedFp) {
     try {
       const privJwk = JSON.parse(savedPrivJwk) as JsonWebKey;
-      const privateKey = await crypto.subtle.importKey(
-        'jwk',
-        privJwk,
-        { name: 'ECDH', namedCurve: 'P-256' },
-        true,
-        ['deriveKey', 'deriveBits']
-      );
-      const pubBytes = base64ToBytes(savedPubSpki);
-      const publicKey = await crypto.subtle.importKey(
-        'spki',
-        toArrayBuffer(pubBytes),
-        { name: 'ECDH', namedCurve: 'P-256' },
-        true,
-        []
-      );
-      return {
-        privateKey,
-        publicKey,
-        publicKeySpkiB64: savedPubSpki,
-        fingerprint: savedFp,
-      };
+      const pubBytes = base64ToBytes(savedPubRaw);
+      if (pubBytes.byteLength === 32) {
+        const privateKey = await crypto.subtle.importKey(
+          'jwk',
+          privJwk,
+          { name: 'X25519' },
+          true,
+          ['deriveBits']
+        );
+        const publicKey = await crypto.subtle.importKey(
+          'raw',
+          toArrayBuffer(pubBytes),
+          { name: 'X25519' },
+          true,
+          []
+        );
+        return {
+          privateKey,
+          publicKey,
+          publicKeySpkiB64: savedPubRaw,
+          fingerprint: savedFp,
+        };
+      }
     } catch {
       // Перегенерация в случае повреждения локального кэша
     }
   }
 
-  const keyPair = await crypto.subtle.generateKey(
-    { name: 'ECDH', namedCurve: 'P-256' },
+  const keyPair = (await crypto.subtle.generateKey(
+    { name: 'X25519' },
     true,
-    ['deriveKey', 'deriveBits']
-  );
+    ['deriveBits']
+  )) as CryptoKeyPair;
 
   const privJwk = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
-  const pubSpkiBuffer = await crypto.subtle.exportKey('spki', keyPair.publicKey);
-  const publicKeySpkiB64 = bytesToBase64(new Uint8Array(pubSpkiBuffer));
-  const fingerprint = await computeFingerprint(pubSpkiBuffer);
+  const pubRawBuffer = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+  const publicKeySpkiB64 = bytesToBase64(new Uint8Array(pubRawBuffer));
+  const fingerprint = await computeFingerprint(pubRawBuffer);
 
-  localStorage.setItem(STORAGE_PRIV_KEY, JSON.stringify(privJwk));
-  localStorage.setItem(STORAGE_PUB_KEY, publicKeySpkiB64);
-  localStorage.setItem(STORAGE_FP_KEY, fingerprint);
+  storage?.setItem(STORAGE_PRIV_KEY, JSON.stringify(privJwk));
+  storage?.setItem(STORAGE_PUB_KEY, publicKeySpkiB64);
+  storage?.setItem(STORAGE_FP_KEY, fingerprint);
 
   return {
     privateKey: keyPair.privateKey,
@@ -107,10 +143,10 @@ export async function getOrCreateIdentityKeys(): Promise<IdentityCryptoBundle> {
 }
 
 /**
- * Детерминированно формирует 256-битный ключ AES-GCM для комнаты урока,
- * обеспечивая мгновенную совместимость зашифрованного чата между Web, Desktop и Android.
+ * Устаревший детерминированный ключ из room_id — используется ТОЛЬКО для чтения
+ * старых текстовых сообщений из истории. Запрещён для новых сообщений и ключей вложений.
  */
-export async function deriveRoomKeyFromId(roomId: string): Promise<RoomSecretKeyBundle> {
+async function deriveLegacyRoomKeyFromId(roomId: string): Promise<RoomSecretKeyBundle> {
   const seed = new TextEncoder().encode(`liaper-room-e2ee-v1:${roomId}`);
   const hashBuffer = await crypto.subtle.digest('SHA-256', toArrayBuffer(seed));
   const rawBytes = new Uint8Array(hashBuffer);
@@ -131,7 +167,7 @@ export async function deriveRoomKeyFromId(roomId: string): Promise<RoomSecretKey
 }
 
 /**
- * Создаёт новый 256-битный ключ AES-GCM для защищённой комнаты урока.
+ * Создаёт новый криптографически случайный 256-битный ключ AES-GCM для комнаты или диалога.
  */
 export async function generateRoomKey(): Promise<RoomSecretKeyBundle> {
   const cryptoKey = await crypto.subtle.generateKey(
@@ -154,6 +190,9 @@ export async function generateRoomKey(): Promise<RoomSecretKeyBundle> {
 
 export async function importRoomKeyFromRawB64(rawKeyB64: string): Promise<RoomSecretKeyBundle> {
   const rawBytes = base64ToBytes(rawKeyB64);
+  if (rawBytes.byteLength !== 32) {
+    throw new Error('Room key must be 32 bytes');
+  }
   const rawBuf = toArrayBuffer(rawBytes);
   const cryptoKey = await crypto.subtle.importKey(
     'raw',
@@ -170,25 +209,108 @@ export async function importRoomKeyFromRawB64(rawKeyB64: string): Promise<RoomSe
   };
 }
 
+interface StoredRoomKeysMap {
+  [roomId: string]: {
+    activeKeyId: string;
+    keys: Record<string, string>; // roomKeyId -> rawKeyB64
+  };
+}
+
+function readStoredRoomKeysMap(): StoredRoomKeysMap {
+  const storage = getStorage();
+  if (!storage) return {};
+  try {
+    const raw = storage.getItem(STORAGE_ROOM_KEYS);
+    if (!raw) return {};
+    return JSON.parse(raw) as StoredRoomKeysMap;
+  } catch {
+    return {};
+  }
+}
+
+export function saveRoomKeyToLocalStore(
+  roomId: string,
+  bundle: RoomSecretKeyBundle,
+  makeActive = true
+): void {
+  const storage = getStorage();
+  if (!storage) return;
+  try {
+    const map = readStoredRoomKeysMap();
+    const existing = map[roomId] ?? { activeKeyId: bundle.roomKeyId, keys: {} };
+    existing.keys[bundle.roomKeyId] = bundle.rawKeyB64;
+    if (makeActive || !existing.activeKeyId) {
+      existing.activeKeyId = bundle.roomKeyId;
+    }
+    map[roomId] = existing;
+    storage.setItem(STORAGE_ROOM_KEYS, JSON.stringify(map));
+  } catch {
+    // Ignore storage quota issues
+  }
+}
+
+export async function loadSavedRoomKeyrings(): Promise<Record<string, RoomKeyring>> {
+  const map = readStoredRoomKeysMap();
+  const result: Record<string, RoomKeyring> = {};
+  for (const [roomId, entry] of Object.entries(map)) {
+    const keysById: Record<string, RoomSecretKeyBundle> = {};
+    let activeKey: RoomSecretKeyBundle | null = null;
+    for (const [keyId, rawB64] of Object.entries(entry.keys ?? {})) {
+      try {
+        const bundle = await importRoomKeyFromRawB64(rawB64);
+        keysById[bundle.roomKeyId] = bundle;
+        if (bundle.roomKeyId === entry.activeKeyId || keyId === entry.activeKeyId) {
+          activeKey = bundle;
+        }
+      } catch {
+        // Ignore corrupted key entry
+      }
+    }
+    const allBundles = Object.values(keysById);
+    if (!activeKey && allBundles.length > 0) {
+      activeKey = allBundles[allBundles.length - 1];
+    }
+    if (activeKey) {
+      result[roomId] = { activeKey, keysById };
+    }
+  }
+  return result;
+}
+
 /**
- * Вычисляет общий секрет ECDH P-256 между локальным приватным ключом и публичным ключом собеседника.
+ * Вычисляет общий секрет X25519 между локальным приватным ключом и 32-байтным публичным ключом собеседника,
+ * затем формирует 256-битный ключ обёртки AES-GCM через SHA-256(sharedSecret || "liaper-x25519-wrap-v1").
  */
 async function deriveSharedWrappingKey(
   myPrivateKey: CryptoKey,
-  peerPublicKeySpkiB64: string
+  peerPublicKeyB64: string
 ): Promise<CryptoKey> {
-  const peerPubBytes = base64ToBytes(peerPublicKeySpkiB64);
+  const peerPubBytes = base64ToBytes(peerPublicKeyB64);
+  if (peerPubBytes.byteLength !== 32) {
+    throw new Error('Invalid X25519 public key length');
+  }
   const peerPublicKey = await crypto.subtle.importKey(
-    'spki',
+    'raw',
     toArrayBuffer(peerPubBytes),
-    { name: 'ECDH', namedCurve: 'P-256' },
+    { name: 'X25519' },
     false,
     []
   );
 
-  return crypto.subtle.deriveKey(
-    { name: 'ECDH', public: peerPublicKey },
+  const sharedSecretBuf = await crypto.subtle.deriveBits(
+    { name: 'X25519', public: peerPublicKey },
     myPrivateKey,
+    256
+  );
+  const sharedBytes = new Uint8Array(sharedSecretBuf);
+  const combined = new Uint8Array(sharedBytes.byteLength + WRAP_DOMAIN_LABEL.byteLength);
+  combined.set(sharedBytes, 0);
+  combined.set(WRAP_DOMAIN_LABEL, sharedBytes.byteLength);
+
+  const digestBuf = await crypto.subtle.digest('SHA-256', toArrayBuffer(combined));
+  return crypto.subtle.importKey(
+    'raw',
+    digestBuf,
     { name: 'AES-GCM', length: 256 },
     false,
     ['encrypt', 'decrypt']
@@ -196,7 +318,7 @@ async function deriveSharedWrappingKey(
 }
 
 /**
- * Запечатывает симметричный ключ комнаты (AES-256-GCM) персонально для участника через ECDH.
+ * Запечатывает симметричный ключ комнаты (AES-256-GCM) персонально для публичного ключа X25519.
  */
 export async function createEncryptedKeyEnvelope(params: {
   roomId: string;
@@ -236,13 +358,52 @@ export async function createEncryptedKeyEnvelope(params: {
 }
 
 /**
- * Распечатывает полученный конверт с ключом комнаты через ECDH.
+ * Создаёт конверты ключа комнаты для всех активных X25519-ключей пользователя.
+ */
+export async function createEncryptedKeyEnvelopesForUser(params: {
+  roomId: string;
+  senderId: string;
+  senderUsername: string;
+  senderPublicKeyB64: string;
+  myPrivateKey: CryptoKey;
+  recipientId: string;
+  recipientUsername: string;
+  recipientPublicKeysField: string;
+  roomKeyBundle: RoomSecretKeyBundle;
+}): Promise<E2eeKeyEnvelope[]> {
+  const pubKeys = extractX25519PublicKeys(params.recipientPublicKeysField);
+  const envelopes: E2eeKeyEnvelope[] = [];
+  for (const pubKeyB64 of pubKeys) {
+    try {
+      const env = await createEncryptedKeyEnvelope({
+        roomId: params.roomId,
+        senderId: params.senderId,
+        senderUsername: params.senderUsername,
+        senderPublicKeyB64: params.senderPublicKeyB64,
+        myPrivateKey: params.myPrivateKey,
+        recipientId: params.recipientId,
+        recipientUsername: params.recipientUsername,
+        recipientPublicKeyB64: pubKeyB64,
+        roomKeyBundle: params.roomKeyBundle,
+      });
+      envelopes.push(env);
+    } catch {
+      // Skip invalid key
+    }
+  }
+  return envelopes;
+}
+
+/**
+ * Распечатывает полученный конверт с ключом комнаты через X25519.
  */
 export async function openEncryptedKeyEnvelope(
   envelope: E2eeKeyEnvelope,
   myPrivateKey: CryptoKey
 ): Promise<RoomSecretKeyBundle> {
-  const sharedKey = await deriveSharedWrappingKey(myPrivateKey, envelope.sender_public_key);
+  const senderKeys = extractX25519PublicKeys(envelope.sender_public_key);
+  const senderPubB64 = senderKeys[0] ?? envelope.sender_public_key.trim();
+  const sharedKey = await deriveSharedWrappingKey(myPrivateKey, senderPubB64);
   const iv = base64ToBytes(envelope.iv_b64);
   const cipherBytes = base64ToBytes(envelope.encrypted_room_key_b64);
 
@@ -256,8 +417,41 @@ export async function openEncryptedKeyEnvelope(
   return importRoomKeyFromRawB64(rawKeyB64);
 }
 
+export function serializeChatPayload(text: string, attachment?: ChatAttachmentMeta): string {
+  if (!attachment) {
+    return text;
+  }
+  const payload: RichChatPayload = {
+    _liaper_msg: 1,
+    text,
+    attachment,
+  };
+  return JSON.stringify(payload);
+}
+
+export function parseChatPayload(
+  rawPlaintext: string,
+  allowAttachment: boolean
+): { text: string; attachment?: ChatAttachmentMeta } {
+  const trimmed = rawPlaintext.trim();
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(trimmed) as Partial<RichChatPayload>;
+      if (parsed && parsed._liaper_msg === 1) {
+        return {
+          text: typeof parsed.text === 'string' ? parsed.text : '',
+          attachment: allowAttachment && parsed.attachment ? parsed.attachment : undefined,
+        };
+      }
+    } catch {
+      // Plain text that happened to start with '{'
+    }
+  }
+  return { text: rawPlaintext };
+}
+
 /**
- * Шифрует текстовое сообщение чата ключом комнаты (AES-256-GCM).
+ * Шифрует текстовое сообщение чата (или JSON-пакет с метаданными вложения) ключом комнаты (AES-256-GCM).
  */
 export async function encryptChatText(
   plaintext: string,
@@ -296,28 +490,61 @@ export async function decryptChatText(
 }
 
 /**
- * Применяет мониторинг защищённых медиа-фреймов WebRTC (DTLS-SRTP + E2EE ключ комнаты),
- * сохраняя полную совместимость кодеков Opus/VP8 между браузером, Tauri и Android (flutter_webrtc).
+ * Расшифровывает сообщение чата с использованием связки ключей комнаты (включая ротированные ключи)
+ * и безопасным fallback только для старых текстовых сообщений.
  */
-export function attachSenderMediaE2ee(
-  _sender: RTCRtpSender,
-  getRoomKey: () => RoomSecretKeyBundle | null,
-  onFrameEncrypted?: (bytesCount: number) => void
-): void {
-  if (getRoomKey()) {
-    onFrameEncrypted?.(128);
+export async function decryptChatMessageWithKeyring(params: {
+  roomId: string;
+  ciphertextB64: string;
+  ivB64: string;
+  roomKeyId: string;
+  keyring?: RoomKeyring | null;
+}): Promise<{
+  plaintext: string;
+  attachment?: ChatAttachmentMeta;
+  verifiedE2ee: boolean;
+}> {
+  const candidateKeys: RoomSecretKeyBundle[] = [];
+  if (params.keyring) {
+    const exact = params.keyring.keysById[params.roomKeyId];
+    if (exact) {
+      candidateKeys.push(exact);
+    }
+    for (const k of Object.values(params.keyring.keysById)) {
+      if (!candidateKeys.some((c) => c.roomKeyId === k.roomKeyId)) {
+        candidateKeys.push(k);
+      }
+    }
   }
-}
 
-/**
- * Применяет мониторинг входящих защищённых медиа-фреймов WebRTC от медиа-ноды.
- */
-export function attachReceiverMediaE2ee(
-  _receiver: RTCRtpReceiver,
-  getRoomKey: () => RoomSecretKeyBundle | null,
-  onFrameDecrypted?: (bytesCount: number) => void
-): void {
-  if (getRoomKey()) {
-    onFrameDecrypted?.(128);
+  for (const keyBundle of candidateKeys) {
+    try {
+      const raw = await decryptChatText(params.ciphertextB64, params.ivB64, keyBundle);
+      const parsed = parseChatPayload(raw, true);
+      return {
+        plaintext: parsed.text,
+        attachment: parsed.attachment,
+        verifiedE2ee: true,
+      };
+    } catch {
+      // Try next key in keyring
+    }
   }
+
+  // Fallback исключительно для исторических текстовых сообщений, зашифрованных старым ключом из room_id
+  const legacyKey = await deriveLegacyRoomKeyFromId(params.roomId);
+  if (params.roomKeyId === legacyKey.roomKeyId || params.roomKeyId.startsWith('rk-')) {
+    const raw = await decryptChatText(params.ciphertextB64, params.ivB64, legacyKey);
+    const parsed = parseChatPayload(raw, false);
+    if (raw.includes('"_liaper_msg":1') && raw.includes('"attachment"')) {
+      throw new Error('Legacy room_id key is not allowed for attachments');
+    }
+    return {
+      plaintext: parsed.text,
+      attachment: undefined,
+      verifiedE2ee: false,
+    };
+  }
+
+  throw new Error('Room key not available for message');
 }

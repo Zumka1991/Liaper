@@ -42,11 +42,31 @@ pub async fn unlock(
     Json(body): Json<UnlockRequest>,
 ) -> Result<StatusCode, ApiError> {
     let id = owner(&state, &headers)?;
+    let subj_key = format!("user:{id}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        return Err(error(StatusCode::TOO_MANY_REQUESTS, &msg));
+    }
     let user = state
         .users_by_id
         .get(&id)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Профиль не найден"))?;
+    let uname = user.username.clone();
     if ControlState::hash_password(&body.password, &user.salt_b64) != user.password_hash {
+        drop(user);
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(id),
+                Some(uname),
+                None,
+                "auth_bruteforce",
+                crate::antifraud::IncidentSeverity::Medium,
+                25,
+                "Неверный пароль при разблокировке архива уроков".into(),
+                300,
+            )
+            .await;
         return Err(error(StatusCode::UNAUTHORIZED, "Неверный пароль"));
     }
     Ok(StatusCode::NO_CONTENT)

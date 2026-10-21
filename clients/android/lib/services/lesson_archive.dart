@@ -73,7 +73,15 @@ Map<String, dynamic> mergeArchive(
           message['sentAt'] ?? message['time'],
           message['text']
         ]);
-    messages[identity] = message;
+    final prev = messages[identity] as Map<String, dynamic>?;
+    messages[identity] = {
+      if (prev != null) ...prev,
+      ...message,
+      if (message['attachment'] != null || prev?['attachment'] != null)
+        'attachment': message['attachment'] ?? prev?['attachment'],
+      if (message['sender_id'] != null || prev?['sender_id'] != null)
+        'sender_id': message['sender_id'] ?? prev?['sender_id'],
+    };
   }
   final ends = [left['endedAt'], right['endedAt']].whereType<String>().toList()
     ..sort();
@@ -115,7 +123,8 @@ String _canonical(Map<String, dynamic> archive) => jsonEncode([
                 m['username'],
                 m['text'],
                 m['time'] ?? '',
-                m['sentAt'] ?? ''
+                m['sentAt'] ?? '',
+                (m['attachment'] is Map) ? (m['attachment']['id'] ?? '') : ''
               ])
           .toList()
     ]);

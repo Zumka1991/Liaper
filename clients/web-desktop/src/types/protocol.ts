@@ -61,11 +61,37 @@ export interface EncryptedChatMessage {
   iv_b64: string;
   room_key_id: string;
   created_at: string;
+  edited_at?: string | null;
+}
+
+export type AttachmentKind = 'pdf' | 'word' | 'image' | 'voice' | 'video_note';
+
+export interface ChatAttachmentMeta {
+  id: string;
+  name: string;
+  mime_type: string;
+  kind: AttachmentKind;
+  plaintext_size: number;
+  ciphertext_size: number;
+  file_key_b64: string;
+  nonce_b64: string;
+  sha256_hex: string;
+  expires_at: string;
+  duration_ms?: number;
+  width?: number;
+  height?: number;
+}
+
+export interface RichChatPayload {
+  _liaper_msg: 1;
+  text: string;
+  attachment?: ChatAttachmentMeta;
 }
 
 export interface DecryptedChatMessage extends EncryptedChatMessage {
   plaintext: string;
   verified_e2ee: boolean;
+  attachment?: ChatAttachmentMeta;
 }
 
 export interface RoomParticipantState {
@@ -201,12 +227,36 @@ export type ClientToControlMsg =
       };
     }
   | {
+      type: 'update_public_key';
+      payload: {
+        e2ee_public_key: string;
+        key_fingerprint: string;
+      };
+    }
+  | {
       type: 'send_encrypted_chat';
       payload: {
         room_id: string;
         ciphertext_b64: string;
         iv_b64: String | string;
         room_key_id: string;
+      };
+    }
+  | {
+      type: 'edit_encrypted_chat';
+      payload: {
+        room_id: string;
+        message_id: string;
+        ciphertext_b64: string;
+        iv_b64: string;
+        room_key_id: string;
+      };
+    }
+  | {
+      type: 'delete_encrypted_chat';
+      payload: {
+        room_id: string;
+        message_id: string;
       };
     };
 
@@ -274,6 +324,19 @@ export type ControlToClientMsg =
       type: 'encrypted_chat_received';
       payload: {
         message: EncryptedChatMessage;
+      };
+    }
+  | {
+      type: 'encrypted_chat_edited';
+      payload: {
+        message: EncryptedChatMessage;
+      };
+    }
+  | {
+      type: 'encrypted_chat_deleted';
+      payload: {
+        room_id: string;
+        message_id: string;
       };
     }
   | {

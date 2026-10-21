@@ -102,7 +102,7 @@ export class SfuMediaNodeClient {
           user_id: this.userId,
           username: this.username,
           display_name: this.displayName,
-          e2ee_enabled: true,
+          e2ee_enabled: false,
           room_key_id: key?.roomKeyId ?? 'AES256',
         },
       });

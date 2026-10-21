@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Check,
   CheckCircle2,
+  Flag,
   Settings,
   Eye,
   EyeOff,
@@ -15,6 +16,7 @@ import {
   Minimize2,
   Monitor,
   MonitorOff,
+  Pencil,
   Phone,
   PhoneIncoming,
   PhoneOff,
@@ -32,21 +34,39 @@ import {
   X,
 } from 'lucide-react';
 import {
-  decryptChatText,
-  deriveRoomKeyFromId,
+  createEncryptedKeyEnvelopesForUser,
+  decryptChatMessageWithKeyring,
   encryptChatText,
+  generateRoomKey,
   getOrCreateIdentityKeys,
+  loadSavedRoomKeyrings,
+  openEncryptedKeyEnvelope,
+  saveRoomKeyToLocalStore,
+  serializeChatPayload,
   type IdentityCryptoBundle,
+  type RoomKeyring,
   type RoomSecretKeyBundle,
 } from './crypto/e2ee';
+import {
+  AttachmentCard,
+  OutgoingTransferCard,
+  type OutgoingAttachmentTransfer,
+} from './components/AttachmentCard';
+import {
+  MediaRecorderBar,
+  type ReadyAttachmentDraft,
+} from './components/MediaRecorderBar';
+import { AdminDashboard } from './components/AdminDashboard';
 import { Modal } from './components/Modal';
 import { StorageUsage } from './components/StorageUsage';
+import { downloadAndDecryptAttachment, uploadEncryptedAttachment } from './services/attachments';
 import { deriveArchiveKey, syncLessonArchives, mergeArchiveLists, type LessonArchive } from './services/lessonArchive';
 import { SfuMediaNodeClient } from './services/webrtcSfu';
 import type {
   AppPlatform,
   AppReleaseManifest,
   AuthResponse,
+  ChatAttachmentMeta,
   ClientToControlMsg,
   ContactRequestInfo,
   ControlToClientMsg,
@@ -285,13 +305,77 @@ export function App() {
   const [remoteVideoFrames, setRemoteVideoFrames] = useState<Record<string, string>>({});
   const [connectedNodeLabel, setConnectedNodeLabel] = useState<string | null>(null);
 
-  // Ключи комнат (прозрачно под капотом)
-  const roomKeysRef = useRef<Map<string, RoomSecretKeyBundle>>(new Map());
+  // Ключи комнат (случайные 256-битные AES-GCM ключи с обменом через X25519 конверты)
+  const roomKeyringsRef = useRef<Map<string, RoomKeyring>>(new Map());
+  const [keyringVersion, setKeyringVersion] = useState(0);
+  const sentEnvelopesRef = useRef<Set<string>>(new Set());
+  const contactsRef = useRef<UserPublicProfile[]>([]);
+  const identityKeysRef = useRef<IdentityCryptoBundle | null>(null);
+  const [outgoingTransfers, setOutgoingTransfers] = useState<OutgoingAttachmentTransfer[]>([]);
+  const uploadAbortRef = useRef<Map<string, AbortController>>(new Map());
+  const [storageRefreshTrigger, setStorageRefreshTrigger] = useState(0);
   const [rawMessages, setRawMessages] = useState<EncryptedChatMessage[]>([]);
   const [decryptedMessages, setDecryptedMessages] = useState<DecryptedChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [selectedChatContact, setSelectedChatContact] = useState<UserPublicProfile | null>(null);
   const [chatMode, setChatMode] = useState<'lesson' | 'direct' | 'archive'>('lesson');
+  const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
+  const [selectedArchiveMsgKeys, setSelectedArchiveMsgKeys] = useState<string[]>([]);
+  const [forwardTargetValue, setForwardTargetValue] = useState<string>('');
+  const [forwardingArchiveMsgs, setForwardingArchiveMsgs] = useState(false);
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [reportReason, setReportReason] = useState('Оскорбления / нарушение правил занятия');
+  const [submittingReport, setSubmittingReport] = useState(false);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+  const [emojiCategoryIdx, setEmojiCategoryIdx] = useState(0);
+  const [editingMessage, setEditingMessage] = useState<DecryptedChatMessage | null>(null);
+  const chatInputRef = useRef<HTMLInputElement>(null);
+
+  const EMOJI_CATEGORIES = [
+    {
+      label: '😀 Эмоции',
+      items: [
+        '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
+        '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😋', '😛', '😜',
+        '🤪', '🤨', '🧐', '🤓', '😎', '🥳', '😏', '😒', '😞', '😔',
+        '😟', '😕', '🙁', '😣', '😖', '😫', '🥺', '😢', '😭', '😤',
+        '😠', '😡', '🤯', '😳', '😱', '🤗', '🤔', '🤭', '🤫', '😶',
+        '😐', '🙄', '😯', '😮', '😲', '🥱', '😴', '🤤', '😷', '🤒',
+      ],
+    },
+    {
+      label: '🎓 Учёба и жесты',
+      items: [
+        '👍', '👎', '👌', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉',
+        '👆', '👇', '☝️', '✋', '👋', '🤝', '🙏', '✍️', '💪', '🧠',
+        '👀', '💡', '📚', '📖', '📝', '✏️', '🖊️', '📐', '📏', '📊',
+        '📈', '📌', '📎', '🔍', '🎓', '🏫', '🏆', '🥇', '🥈', '🥉',
+        '🎯', '✅', '❌', '❓', '❗', '💯', '🔥', '⭐', '🌟', '✨',
+        '🎉', '🎊', '👏', '🙌', '🫶', '🫡', '💻', '🖥️', '📱', '🎧',
+      ],
+    },
+    {
+      label: '❤️ Сердца и разное',
+      items: [
+        '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔',
+        '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☀️',
+        '🌈', '☁️', '❄️', '⚡', '🌸', '🌺', '🌻', '🍀', '🍎', '🍓',
+        '🍕', '☕', '🍵', '🍰', '🍫', '🚀', '✈️', '⏰', '⏳', '🔔',
+        '💬', '💭', '🎵', '🎶', '🎨', '🧩', '🎲', '🐱', '🐶', '🦊',
+      ],
+    },
+  ];
+
+  const insertEmojiIntoChat = (emoji: string) => {
+    setChatInput((prev) => {
+      const next = prev + emoji;
+      if (activeChatRoomId) {
+        draftsRef.current[activeChatRoomId] = next;
+      }
+      return next;
+    });
+    chatInputRef.current?.focus();
+  };
   const [archivedChats, setArchivedChats] = useState<ArchivedLessonChat[]>([]);
   const archivesRef = useRef<ArchivedLessonChat[]>([]);
   const archiveKeyRef = useRef<{ ownerId: string; key: CryptoKey } | null>(null);
@@ -304,6 +388,35 @@ export function App() {
   const [archiveUnlocking, setArchiveUnlocking] = useState(false);
   const [archiveUnlockError, setArchiveUnlockError] = useState<string | null>(null);
   const [panel, setPanel] = useState<'contacts' | 'lesson' | 'chat' | 'settings'>('lesson');
+  const isAdminAccount = Boolean(
+    currentUser &&
+      ['napsy', 'admin'].includes(currentUser.username.trim().toLowerCase())
+  );
+  const [showAdminDashboard, setShowAdminDashboard] = useState<boolean>(
+    () =>
+      typeof window !== 'undefined' &&
+      (window.location.search.includes('admin=1') || window.location.hash === '#admin')
+  );
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyA') {
+        e.preventDefault();
+        setShowAdminDashboard((prev) => !prev);
+      }
+    };
+    const onHashChange = () => {
+      if (window.location.hash === '#admin') {
+        setShowAdminDashboard(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('hashchange', onHashChange);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('hashchange', onHashChange);
+    };
+  }, []);
   const [connected, setConnected] = useState(false);
   const [connectionAttempt, setConnectionAttempt] = useState(0);
   const [showPassword, setShowPassword] = useState(false);
@@ -348,9 +461,24 @@ export function App() {
   }, [currentUser]);
 
   useEffect(() => {
+    contactsRef.current = contacts;
+  }, [contacts]);
+
+  useEffect(() => {
+    identityKeysRef.current = identityKeys;
+  }, [identityKeys]);
+
+  useEffect(() => {
     getOrCreateIdentityKeys().then((bundle) => {
+      identityKeysRef.current = bundle;
       setIdentityKeys(bundle);
     }).catch(() => setAuthError('Не удалось подготовить устройство. Откройте приложение через HTTPS или localhost.'));
+    loadSavedRoomKeyrings().then((loaded) => {
+      for (const [roomId, keyring] of Object.entries(loaded)) {
+        roomKeyringsRef.current.set(roomId, keyring);
+      }
+      setKeyringVersion((v) => v + 1);
+    }).catch(() => {});
     fetchReleases();
   }, []);
 
@@ -506,26 +634,28 @@ export function App() {
     let cancelled = false;
 
     async function decryptAll() {
-      let keyBundle = roomKeysRef.current.get(roomId);
-      if (!keyBundle) {
-        keyBundle = await deriveRoomKeyFromId(roomId);
-        roomKeysRef.current.set(roomId, keyBundle);
-      }
-
+      const keyring = roomKeyringsRef.current.get(roomId) ?? null;
       const result: DecryptedChatMessage[] = [];
       for (const msg of rawMessages) {
         if (msg.room_id !== roomId) continue;
         try {
-          const text = await decryptChatText(msg.ciphertext_b64, msg.iv_b64, keyBundle);
+          const dec = await decryptChatMessageWithKeyring({
+            roomId,
+            ciphertextB64: msg.ciphertext_b64,
+            ivB64: msg.iv_b64,
+            roomKeyId: msg.room_key_id,
+            keyring,
+          });
           result.push({
             ...msg,
-            plaintext: text,
-            verified_e2ee: true,
+            plaintext: dec.plaintext,
+            attachment: dec.attachment,
+            verified_e2ee: dec.verifiedE2ee,
           });
         } catch {
           result.push({
             ...msg,
-            plaintext: 'Не удалось расшифровать сообщение',
+            plaintext: 'Ожидание ключа шифрования или сообщение не удалось расшифровать',
             verified_e2ee: false,
           });
         }
@@ -535,11 +665,11 @@ export function App() {
       }
     }
 
-    decryptAll();
+    void decryptAll();
     return () => {
       cancelled = true;
     };
-  }, [rawMessages, activeChatRoomId]);
+  }, [rawMessages, activeChatRoomId, keyringVersion]);
 
   const sendControl = (msg: ClientToControlMsg): boolean => {
     if (controlWsRef.current?.readyState === WebSocket.OPEN) {
@@ -548,6 +678,111 @@ export function App() {
     }
     setSystemBanner('Нет связи с сервером. Дождитесь подключения и повторите действие.');
     return false;
+  };
+
+  const registerRoomKeyInMemory = (
+    roomId: string,
+    bundle: RoomSecretKeyBundle,
+    makeActive = true
+  ) => {
+    const existing = roomKeyringsRef.current.get(roomId);
+    if (existing) {
+      existing.keysById[bundle.roomKeyId] = bundle;
+      if (makeActive) {
+        existing.activeKey = bundle;
+      }
+    } else {
+      roomKeyringsRef.current.set(roomId, {
+        activeKey: bundle,
+        keysById: { [bundle.roomKeyId]: bundle },
+      });
+    }
+    saveRoomKeyToLocalStore(roomId, bundle, makeActive);
+    setKeyringVersion((v) => v + 1);
+  };
+
+  const ensureAndDistributeRoomKey = async (
+    roomId: string,
+    forceRotate = false
+  ): Promise<RoomSecretKeyBundle> => {
+    let keyring = roomKeyringsRef.current.get(roomId);
+    let activeKey = keyring?.activeKey ?? null;
+    if (!activeKey || forceRotate) {
+      activeKey = await generateRoomKey();
+      registerRoomKeyInMemory(roomId, activeKey, true);
+      keyring = roomKeyringsRef.current.get(roomId);
+    }
+
+    const me = currentUserRef.current;
+    const idKeys = identityKeysRef.current;
+    if (me && idKeys && controlWsRef.current?.readyState === WebSocket.OPEN) {
+      const recipients: Array<{ id: string; username: string; pubKeysField: string }> = [
+        {
+          id: me.id,
+          username: me.username,
+          pubKeysField: [me.e2ee_public_key, idKeys.publicKeySpkiB64].filter(Boolean).join(','),
+        },
+      ];
+
+      if (currentRoomRef.current && currentRoomRef.current.id === roomId) {
+        for (const p of currentRoomRef.current.participants) {
+          if (!recipients.some((r) => r.id === p.user_id)) {
+            const contactProfile = contactsRef.current.find((c) => c.id === p.user_id);
+            recipients.push({
+              id: p.user_id,
+              username: p.username,
+              pubKeysField: [p.e2ee_public_key, contactProfile?.e2ee_public_key]
+                .filter(Boolean)
+                .join(','),
+            });
+          }
+        }
+      } else {
+        for (const c of contactsRef.current) {
+          if (computeDmRoomId(me.id, c.id) === roomId) {
+            if (!recipients.some((r) => r.id === c.id)) {
+              recipients.push({
+                id: c.id,
+                username: c.username,
+                pubKeysField: c.e2ee_public_key,
+              });
+            }
+          }
+        }
+      }
+
+      for (const rec of recipients) {
+        const envelopes = await createEncryptedKeyEnvelopesForUser({
+          roomId,
+          senderId: me.id,
+          senderUsername: me.username,
+          senderPublicKeyB64: idKeys.publicKeySpkiB64,
+          myPrivateKey: idKeys.privateKey,
+          recipientId: rec.id,
+          recipientUsername: rec.username,
+          recipientPublicKeysField: rec.pubKeysField,
+          roomKeyBundle: activeKey,
+        });
+        for (const envelope of envelopes) {
+          const dedupKey = `${roomId}:${activeKey.roomKeyId}:${rec.id}:${envelope.encrypted_room_key_b64.slice(0, 16)}`;
+          // Check by recipient + pubkey implicitly via roomId + roomKeyId + recipientId + senderPublicKey
+          const pubCacheKey = `${roomId}:${activeKey.roomKeyId}:${rec.id}:${rec.pubKeysField}`;
+          if (!sentEnvelopesRef.current.has(pubCacheKey) || forceRotate) {
+            controlWsRef.current.send(
+              JSON.stringify({
+                type: 'send_key_envelope',
+                payload: { envelope },
+              } satisfies ClientToControlMsg)
+            );
+          }
+          void dedupKey;
+        }
+        const pubCacheKey = `${roomId}:${activeKey.roomKeyId}:${rec.id}:${rec.pubKeysField}`;
+        sentEnvelopesRef.current.add(pubCacheKey);
+      }
+    }
+
+    return activeKey;
   };
 
   const connectToAssignedMediaNode = async (
@@ -566,11 +801,7 @@ export function App() {
     sfuClientRef.current = null;
     localStreamRef.current?.getTracks().forEach((track) => track.stop());
 
-    let keyBundle = roomKeysRef.current.get(room.id);
-    if (!keyBundle) {
-      keyBundle = await deriveRoomKeyFromId(room.id);
-      roomKeysRef.current.set(room.id, keyBundle);
-    }
+    const keyBundle = await ensureAndDistributeRoomKey(room.id, false);
 
     let stream: MediaStream | null = null;
     try {
@@ -604,7 +835,7 @@ export function App() {
       userId: me.id,
       username: me.username,
       displayName: me.display_name,
-      getRoomKey: () => roomKeysRef.current.get(room.id) ?? null,
+      getRoomKey: () => roomKeyringsRef.current.get(room.id)?.activeKey ?? keyBundle,
       callbacks: {
         onNodeConnected: (nodeId, nodeName) => {
           setConnectedNodeLabel(`${nodeName} (${nodeId})`);
@@ -631,17 +862,59 @@ export function App() {
   const handleControlMessage = async (msg: ControlToClientMsg) => {
     switch (msg.type) {
       case 'welcome': {
+        currentUserRef.current = msg.payload.self_profile;
+        contactsRef.current = msg.payload.contacts;
         setCurrentUser(msg.payload.self_profile);
         setContacts(msg.payload.contacts);
         setIncomingRequests(msg.payload.incoming_requests);
         setOutgoingRequests(msg.payload.outgoing_requests);
+
+        const idKeys = identityKeysRef.current;
+        if (idKeys && controlWsRef.current?.readyState === WebSocket.OPEN) {
+          controlWsRef.current.send(
+            JSON.stringify({
+              type: 'update_public_key',
+              payload: {
+                e2ee_public_key: idKeys.publicKeySpkiB64,
+                key_fingerprint: idKeys.fingerprint,
+              },
+            } satisfies ClientToControlMsg)
+          );
+        }
         break;
       }
 
       case 'contacts_updated': {
+        contactsRef.current = msg.payload.contacts;
         setContacts(msg.payload.contacts);
         setIncomingRequests(msg.payload.incoming_requests);
         setOutgoingRequests(msg.payload.outgoing_requests);
+
+        // Если у нас уже есть активный ключ для личного чата с контактом, отправляем конверт на новые устройства
+        const me = currentUserRef.current;
+        if (me) {
+          for (const c of msg.payload.contacts) {
+            const dmId = computeDmRoomId(me.id, c.id);
+            if (roomKeyringsRef.current.has(dmId)) {
+              void ensureAndDistributeRoomKey(dmId, false);
+            }
+          }
+        }
+        break;
+      }
+
+      case 'key_envelope_received': {
+        const idKeys = identityKeysRef.current;
+        if (!idKeys) break;
+        try {
+          const unwrapped = await openEncryptedKeyEnvelope(
+            msg.payload.envelope,
+            idKeys.privateKey
+          );
+          registerRoomKeyInMemory(msg.payload.envelope.room_id, unwrapped, true);
+        } catch {
+          // Конверт предназначался для другого устройства этого аккаунта
+        }
         break;
       }
 
@@ -651,10 +924,22 @@ export function App() {
 
       case 'room_updated': {
         const room = msg.payload.room;
-        const wasInRoom = currentRoomRef.current?.id === room.id;
+        const prevRoom = currentRoomRef.current;
+        const wasInRoom = prevRoom?.id === room.id;
+        const prevCount = wasInRoom ? prevRoom?.participants.length ?? 0 : 0;
         currentRoomRef.current = room;
         setCurrentRoom(room);
         setIncomingCall(null);
+
+        const me = currentUserRef.current;
+        if (wasInRoom && room.participants.length < prevCount && me) {
+          // Участник покинул комнату — ротируем ключ комнаты
+          if (room.host_id === me.id || room.participants[0]?.user_id === me.id) {
+            await ensureAndDistributeRoomKey(room.id, true);
+          }
+        } else if (me && (room.host_id === me.id || roomKeyringsRef.current.has(room.id))) {
+          await ensureAndDistributeRoomKey(room.id, false);
+        }
 
         if (!wasInRoom) {
           setChatMode('lesson');
@@ -689,6 +974,21 @@ export function App() {
             ? prev
             : [...prev, msg.payload.message]
         );
+        break;
+      }
+
+      case 'encrypted_chat_edited': {
+        const edited = msg.payload.message;
+        setRawMessages((prev) =>
+          prev.map((m) => (m.id === edited.id ? edited : m))
+        );
+        break;
+      }
+
+      case 'encrypted_chat_deleted': {
+        const { message_id } = msg.payload;
+        setRawMessages((prev) => prev.filter((m) => m.id !== message_id));
+        setEditingMessage((prev) => (prev?.id === message_id ? null : prev));
         break;
       }
 
@@ -785,7 +1085,11 @@ export function App() {
     setUnreadChats({});
     setPasswordInput('');
     setRemoteVideoFrames({});
-    roomKeysRef.current.clear();
+    roomKeyringsRef.current.clear();
+    sentEnvelopesRef.current.clear();
+    uploadAbortRef.current.forEach((c) => c.abort());
+    uploadAbortRef.current.clear();
+    setOutgoingTransfers([]);
     setPanel('lesson');
     controlWsRef.current?.close();
     localStorage.removeItem('liaper_token');
@@ -911,20 +1215,28 @@ export function App() {
     if (!currentRoom) return;
     const ownerId = currentUserRef.current?.id;
     const roomMsgs = rawMessages.filter((m) => m.room_id === currentRoom.id);
-    let keyBundle = roomKeysRef.current.get(currentRoom.id);
-    if (!keyBundle) {
-      keyBundle = await deriveRoomKeyFromId(currentRoom.id);
-      roomKeysRef.current.set(currentRoom.id, keyBundle);
-    }
+    const keyring = roomKeyringsRef.current.get(currentRoom.id) ?? null;
 
     const formatted: ArchivedLessonChat['messages'] = [];
     for (const msg of roomMsgs) {
       let text = 'Не удалось расшифровать сообщение';
+      let attachment: ChatAttachmentMeta | undefined;
       try {
-        text = await decryptChatText(msg.ciphertext_b64, msg.iv_b64, keyBundle);
+        const dec = await decryptChatMessageWithKeyring({
+          roomId: currentRoom.id,
+          ciphertextB64: msg.ciphertext_b64,
+          ivB64: msg.iv_b64,
+          roomKeyId: msg.room_key_id,
+          keyring,
+        });
+        text = dec.plaintext;
+        if (dec.attachment) {
+          attachment = dec.attachment;
+        }
       } catch {}
       formatted.push({
         id: msg.id,
+        sender_id: msg.sender_id,
         sentAt: msg.created_at,
         sender: msg.sender_display_name,
         username: msg.sender_username,
@@ -933,6 +1245,7 @@ export function App() {
           hour: '2-digit',
           minute: '2-digit',
         }),
+        ...(attachment ? { attachment } : {}),
       });
     }
 
@@ -963,7 +1276,114 @@ export function App() {
       downloadArchiveAsTxt(archiveEntry);
       setSystemBanner(`Чат урока «${currentRoom.title}» сохранён в архив и скачан`);
     } else {
-      setSystemBanner(`Чат урока «${currentRoom.title}» автоматически сохранён в архив`);
+      setSystemBanner(`Чат урока «${currentRoom.title}» сохранён в архив`);
+    }
+  };
+
+  const forwardArchiveMessages = async (
+    archive: ArchivedLessonChat,
+    messagesToForward: ArchivedLessonChat['messages']
+  ) => {
+    if (!currentUser || !token || !connected || messagesToForward.length === 0 || forwardingArchiveMsgs) {
+      return;
+    }
+
+    let resolvedTarget = forwardTargetValue;
+    if (!resolvedTarget) {
+      if (currentRoom) {
+        resolvedTarget = `lesson:${currentRoom.id}`;
+      } else if (selectedChatContact) {
+        resolvedTarget = `dm:${selectedChatContact.id}`;
+      } else if (contacts.length > 0) {
+        resolvedTarget = `dm:${contacts[0].id}`;
+      }
+    }
+
+    if (!resolvedTarget) {
+      setSystemBanner('Выберите контакт или начните урок для пересылки сообщений.');
+      return;
+    }
+
+    let targetRoomId = '';
+    let targetMode: 'lesson' | 'direct' = 'lesson';
+    let targetContact: UserPublicProfile | null = null;
+
+    if (resolvedTarget.startsWith('lesson:') && currentRoom) {
+      targetRoomId = currentRoom.id;
+      targetMode = 'lesson';
+    } else if (resolvedTarget.startsWith('dm:')) {
+      const contactId = resolvedTarget.slice(3);
+      targetContact = contacts.find((c) => c.id === contactId) ?? null;
+      if (!targetContact) {
+        setSystemBanner('Контакт для пересылки не найден.');
+        return;
+      }
+      targetRoomId = computeDmRoomId(currentUser.id, targetContact.id);
+      targetMode = 'direct';
+    } else {
+      setSystemBanner('Выберите чат для пересылки.');
+      return;
+    }
+
+    setForwardingArchiveMsgs(true);
+    try {
+      const roomKey = await ensureAndDistributeRoomKey(targetRoomId, false);
+      let sentCount = 0;
+
+      for (const m of messagesToForward) {
+        const header = `↪ Переслано из архива «${archive.title}» (${m.sender}${m.username ? ` @${m.username}` : ''}${m.time ? `, ${m.time}` : ''})`;
+        const bodyText = m.text ? `${header}:\n${m.text}` : header;
+
+        let finalAttachment: ChatAttachmentMeta | undefined = m.attachment;
+        if (m.attachment) {
+          try {
+            const plainBytes = await downloadAndDecryptAttachment({
+              controlBase: DEFAULT_CONTROL_HTTP,
+              token,
+              meta: m.attachment,
+            });
+            finalAttachment = await uploadEncryptedAttachment({
+              controlBase: DEFAULT_CONTROL_HTTP,
+              token,
+              roomId: targetRoomId,
+              fileName: m.attachment.name,
+              mimeType: m.attachment.mime_type,
+              kind: m.attachment.kind,
+              plaintextBytes: plainBytes,
+              durationMs: m.attachment.duration_ms,
+              width: m.attachment.width,
+              height: m.attachment.height,
+            });
+          } catch {
+            finalAttachment = m.attachment;
+          }
+        }
+
+        const serialized = serializeChatPayload(bodyText, finalAttachment);
+        const encrypted = await encryptChatText(serialized, roomKey);
+        const ok = sendControl({
+          type: 'send_encrypted_chat',
+          payload: {
+            room_id: targetRoomId,
+            ciphertext_b64: encrypted.ciphertextB64,
+            iv_b64: encrypted.ivB64,
+            room_key_id: encrypted.roomKeyId,
+          },
+        });
+        if (ok) sentCount++;
+      }
+
+      setSelectedArchiveMsgKeys([]);
+      setSelectedArchiveId(null);
+      if (targetMode === 'direct' && targetContact) {
+        setSelectedChatContact(targetContact);
+      }
+      setChatMode(targetMode);
+      setSystemBanner(`Переслано сообщений в чат: ${sentCount}`);
+    } catch {
+      setSystemBanner('Не удалось переслать выбранные сообщения.');
+    } finally {
+      setForwardingArchiveMsgs(false);
     }
   };
 
@@ -1063,18 +1483,235 @@ export function App() {
     const draft = chatInput;
     setSendingChat(true);
     try {
-      let roomKey = roomKeysRef.current.get(activeChatRoomId);
-      if (!roomKey) { roomKey = await deriveRoomKeyFromId(activeChatRoomId); roomKeysRef.current.set(activeChatRoomId, roomKey); }
-      const encrypted = await encryptChatText(draft.trim(), roomKey);
-      if (sendControl({ type: 'send_encrypted_chat', payload: {
-        room_id: activeChatRoomId, ciphertext_b64: encrypted.ciphertextB64,
-        iv_b64: encrypted.ivB64, room_key_id: encrypted.roomKeyId,
-      } })) {
-        delete draftsRef.current[activeChatRoomId];
-        setChatInput((value) => value === draft ? '' : value);
+      const roomKey = await ensureAndDistributeRoomKey(activeChatRoomId, false);
+      if (editingMessage && editingMessage.room_id === activeChatRoomId) {
+        const payloadText = editingMessage.attachment
+          ? serializeChatPayload(draft.trim(), editingMessage.attachment)
+          : draft.trim();
+        const encrypted = await encryptChatText(payloadText, roomKey);
+        if (
+          sendControl({
+            type: 'edit_encrypted_chat',
+            payload: {
+              room_id: activeChatRoomId,
+              message_id: editingMessage.id,
+              ciphertext_b64: encrypted.ciphertextB64,
+              iv_b64: encrypted.ivB64,
+              room_key_id: encrypted.roomKeyId,
+            },
+          })
+        ) {
+          setEditingMessage(null);
+          delete draftsRef.current[activeChatRoomId];
+          setChatInput('');
+        }
+      } else {
+        const encrypted = await encryptChatText(draft.trim(), roomKey);
+        if (sendControl({ type: 'send_encrypted_chat', payload: {
+          room_id: activeChatRoomId, ciphertext_b64: encrypted.ciphertextB64,
+          iv_b64: encrypted.ivB64, room_key_id: encrypted.roomKeyId,
+        } })) {
+          delete draftsRef.current[activeChatRoomId];
+          setChatInput((value) => value === draft ? '' : value);
+        }
       }
     } catch { setSystemBanner('Не удалось отправить сообщение. Текст сохранён в поле ввода.'); }
     finally { setSendingChat(false); }
+  };
+
+  const startEditingChatMessage = (m: DecryptedChatMessage) => {
+    const defaultAutoCaption =
+      m.attachment &&
+      (m.plaintext.startsWith('Вложение: ') ||
+        m.plaintext.startsWith('Голосовое сообщение') ||
+        m.plaintext.startsWith('Видеокружок'));
+    setEditingMessage(m);
+    setChatInput(defaultAutoCaption ? '' : m.plaintext);
+    window.setTimeout(() => chatInputRef.current?.focus(), 20);
+  };
+
+  const handleDeleteChatMessage = (m: DecryptedChatMessage) => {
+    sendControl({
+      type: 'delete_encrypted_chat',
+      payload: {
+        room_id: m.room_id,
+        message_id: m.id,
+      },
+    });
+    setRawMessages((prev) => prev.filter((item) => item.id !== m.id));
+    if (editingMessage?.id === m.id) {
+      setEditingMessage(null);
+      setChatInput('');
+    }
+  };
+
+  const executeAttachmentTransfer = async (transfer: OutgoingAttachmentTransfer) => {
+    if (!token) return;
+    const controller = new AbortController();
+    uploadAbortRef.current.set(transfer.localId, controller);
+
+    setOutgoingTransfers((prev) =>
+      prev.map((item) =>
+        item.localId === transfer.localId
+          ? { ...item, status: 'uploading', progress: 0.05, errorMessage: undefined }
+          : item
+      )
+    );
+
+    try {
+      const roomKey = await ensureAndDistributeRoomKey(transfer.roomId, false);
+      const meta = await uploadEncryptedAttachment({
+        controlBase: DEFAULT_CONTROL_HTTP,
+        token,
+        roomId: transfer.roomId,
+        fileName: transfer.fileName,
+        mimeType: transfer.mimeType,
+        kind: transfer.kind,
+        plaintextBytes: transfer.plaintextBytes,
+        durationMs: transfer.durationMs,
+        width: transfer.width,
+        height: transfer.height,
+        onProgress: (fraction) => {
+          setOutgoingTransfers((prev) =>
+            prev.map((item) =>
+              item.localId === transfer.localId ? { ...item, progress: fraction } : item
+            )
+          );
+        },
+        signal: controller.signal,
+      });
+
+      setStorageRefreshTrigger((n) => n + 1);
+
+      const payloadText = serializeChatPayload(transfer.captionText, meta);
+      const encrypted = await encryptChatText(payloadText, roomKey);
+      const sent = sendControl({
+        type: 'send_encrypted_chat',
+        payload: {
+          room_id: transfer.roomId,
+          ciphertext_b64: encrypted.ciphertextB64,
+          iv_b64: encrypted.ivB64,
+          room_key_id: encrypted.roomKeyId,
+        },
+      });
+      if (!sent) {
+        throw new Error('Вложение загружено, но нет связи с сервером чата. Нажмите «Повторить».');
+      }
+
+      setOutgoingTransfers((prev) => prev.filter((item) => item.localId !== transfer.localId));
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') {
+        setOutgoingTransfers((prev) => prev.filter((item) => item.localId !== transfer.localId));
+        return;
+      }
+      const message = err instanceof Error ? err.message : 'Ошибка загрузки вложения';
+      setOutgoingTransfers((prev) =>
+        prev.map((item) =>
+          item.localId === transfer.localId
+            ? { ...item, status: 'error', errorMessage: message }
+            : item
+        )
+      );
+    } finally {
+      uploadAbortRef.current.delete(transfer.localId);
+    }
+  };
+
+  const handleReadyAttachment = (draft: ReadyAttachmentDraft) => {
+    if (!activeChatRoomId) {
+      setSystemBanner('Сначала выберите контакт или начните урок');
+      return;
+    }
+    const caption = chatInput.trim();
+    if (caption) {
+      delete draftsRef.current[activeChatRoomId];
+      setChatInput('');
+    }
+    const transfer: OutgoingAttachmentTransfer = {
+      localId: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      roomId: activeChatRoomId,
+      fileName: draft.fileName,
+      mimeType: draft.mimeType,
+      kind: draft.kind,
+      plaintextBytes: draft.plaintextBytes,
+      captionText: caption,
+      durationMs: draft.durationMs,
+      width: draft.width,
+      height: draft.height,
+      progress: 0.05,
+      status: 'uploading',
+    };
+    setOutgoingTransfers((prev) => [...prev, transfer]);
+    void executeAttachmentTransfer(transfer);
+  };
+
+  const cancelAttachmentTransfer = (localId: string) => {
+    const ctrl = uploadAbortRef.current.get(localId);
+    if (ctrl) {
+      ctrl.abort();
+      uploadAbortRef.current.delete(localId);
+    }
+    setOutgoingTransfers((prev) => prev.filter((item) => item.localId !== localId));
+  };
+
+  const retryAttachmentTransfer = (localId: string) => {
+    const found = outgoingTransfers.find((item) => item.localId === localId);
+    if (found) {
+      void executeAttachmentTransfer(found);
+    }
+  };
+
+  const dismissAttachmentTransfer = (localId: string) => {
+    setOutgoingTransfers((prev) => prev.filter((item) => item.localId !== localId));
+  };
+
+  const handleSubmitChatReport = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !activeChatRoomId || !reportReason.trim()) return;
+    setSubmittingReport(true);
+    try {
+      await ensureAndDistributeRoomKey(activeChatRoomId, false);
+      const keyring = roomKeyringsRef.current.get(activeChatRoomId);
+      const disclosedKeys = keyring
+        ? Object.values(keyring.keysById).map((k) => ({
+            key_id: k.roomKeyId,
+            raw_key_b64: k.rawKeyB64,
+            created_at: new Date().toISOString(),
+          }))
+        : [];
+      const roomTitle =
+        chatMode === 'lesson' && currentRoom
+          ? `Урок: ${currentRoom.title}`
+          : selectedChatContact
+            ? `Личный чат: ${selectedChatContact.display_name} (@${selectedChatContact.username})`
+            : `Чат ${activeChatRoomId.slice(0, 8)}`;
+
+      const res = await fetch(`${DEFAULT_CONTROL_HTTP}/api/reports`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          room_id: activeChatRoomId,
+          room_title: roomTitle,
+          reason: reportReason.trim(),
+          disclosed_keys: disclosedKeys,
+        }),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      await ensureAndDistributeRoomKey(activeChatRoomId, true);
+      setShowReportModal(false);
+      setSystemBanner(
+        'Жалоба отправлена в Админку. Ключ переписки раскрыт модератору, а для новых сообщений выпущен новый ключ E2EE.'
+      );
+    } catch {
+      setSystemBanner('Не удалось отправить жалобу. Проверьте соединение с сервером.');
+    } finally {
+      setSubmittingReport(false);
+    }
   };
 
   const handleInviteByNick = (e: React.FormEvent) => {
@@ -1272,6 +1909,19 @@ export function App() {
   // ============================================================================
   return (
     <div className="app-shell" data-panel={panel}>
+      {showAdminDashboard && (
+        <AdminDashboard
+          controlBase={DEFAULT_CONTROL_HTTP}
+          token={token}
+          currentUsername={currentUser?.username}
+          onClose={() => {
+            setShowAdminDashboard(false);
+            if (window.location.hash === '#admin') {
+              window.history.replaceState(null, '', window.location.pathname + window.location.search);
+            }
+          }}
+        />
+      )}
       <header className="app-topbar">
         <a className="app-brand" href="#" onClick={(e) => { e.preventDefault(); setPanel('lesson'); }} aria-label="Liaper — рабочее пространство">
           <span className="brand-mark">L</span><span>Liaper<small>Учебное пространство</small></span>
@@ -1289,9 +1939,22 @@ export function App() {
             </button>
           ))}
         </nav>
-        <span className={`connection-status ${connected ? 'is-connected' : ''}`} role="status">
-          <span />{connected ? 'На связи' : 'Подключение…'}
-        </span>
+        <div className="flex items-center gap-2">
+          {isAdminAccount && (
+            <button
+              type="button"
+              onClick={() => setShowAdminDashboard(true)}
+              title="Админка владельца (Ctrl+Shift+A)"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100"
+            >
+              <Server className="h-3.5 w-3.5" />
+              Админка
+            </button>
+          )}
+          <span className={`connection-status ${connected ? 'is-connected' : ''}`} role="status">
+            <span />{connected ? 'На связи' : 'Подключение…'}
+          </span>
+        </div>
       </header>
       {!connected && <div className="connection-banner" role="status">
         Нет связи с сервером. Переподключаемся автоматически.
@@ -1901,7 +2564,11 @@ export function App() {
               <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
                 <button
                   type="button"
-                  onClick={() => setChatMode('lesson')}
+                  onClick={() => {
+                    setChatMode('lesson');
+                    setSelectedArchiveId(null);
+                    setSelectedArchiveMsgKeys([]);
+                  }}
                   className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
                     chatMode === 'lesson'
                       ? 'bg-white text-slate-900 shadow-2xs'
@@ -1912,7 +2579,11 @@ export function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setChatMode('direct')}
+                  onClick={() => {
+                    setChatMode('direct');
+                    setSelectedArchiveId(null);
+                    setSelectedArchiveMsgKeys([]);
+                  }}
                   className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
                     chatMode === 'direct'
                       ? 'bg-white text-slate-900 shadow-2xs'
@@ -1939,14 +2610,25 @@ export function App() {
                   <span className="truncate text-xs font-medium text-slate-600">
                     Урок: <strong className="text-slate-900">{currentRoom.title}</strong>
                   </span>
-                  <button
-                    type="button"
-                    onClick={() => void saveCurrentLessonToArchive(true, false, false)}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white"
-                  >
-                    <Download className="h-3 w-3" />
-                    В архив (.txt)
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowReportModal(true)}
+                      title="Пожаловаться и раскрыть ключ переписки для проверки в админке"
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-[11px] font-medium text-rose-700 hover:bg-rose-600 hover:text-white"
+                    >
+                      <Flag className="h-3 w-3" />
+                      Жалоба
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void saveCurrentLessonToArchive(false, false, false)}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white"
+                    >
+                      <Download className="h-3 w-3" />
+                      В архив
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -1958,7 +2640,7 @@ export function App() {
                       const found = contacts.find((c) => c.id === e.target.value) ?? null;
                       setSelectedChatContact(found);
                     }}
-                    className="w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-900 focus:outline-none"
+                    className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-900 focus:outline-none"
                   >
                     <option value="">— Выберите контакт для переписки —</option>
                     {contacts.map((c) => (
@@ -1967,60 +2649,311 @@ export function App() {
                       </option>
                     ))}
                   </select>
+                  {selectedChatContact && (
+                    <button
+                      type="button"
+                      onClick={() => setShowReportModal(true)}
+                      title="Пожаловаться и раскрыть ключ переписки для проверки в админке"
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 hover:bg-rose-600 hover:text-white"
+                    >
+                      <Flag className="h-3 w-3" />
+                      Жалоба
+                    </button>
+                  )}
                 </div>
               )}
             </div>
 
             {chatMode === 'archive' ? (
-              <div className="flex-1 space-y-3 overflow-y-auto p-4">
-                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
-                  <p role="status">{archiveSyncStatus}</p>
-                  <button type="button" className="mt-2 font-medium text-slate-900 underline" onClick={() => {
-                    if (archiveUnlocked) void syncArchives(); else { setArchiveUnlockError(null); setShowArchiveUnlock(true); }
-                  }}>{archiveUnlocked ? 'Синхронизировать' : 'Разблокировать архив'}</button>
-                </div>
-                {archivedChats.length === 0 ? (
-                  <div className="flex h-full flex-col items-center justify-center text-center text-xs text-slate-400">
-                    <Download className="mb-2 h-6 w-6 stroke-1" />
-                    Сохранённых архивов уроков пока нет. В конце урока чат сохраняется автоматически или по кнопке «В архив (.txt)».
-                  </div>
-                ) : (
-                  archivedChats.map((arch) => (
-                    <div
-                      key={`${arch.id}-${arch.savedAt}`}
-                      className="rounded-xl border border-slate-200 bg-slate-50/60 p-3.5 space-y-2"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <div className="text-xs font-semibold text-slate-900">
-                            {arch.title}
+              (() => {
+                const openedArchive = selectedArchiveId
+                  ? archivedChats.find((a) => a.id === selectedArchiveId) ?? null
+                  : null;
+
+                if (openedArchive) {
+                  const allKeys = openedArchive.messages.map(
+                    (m, idx) => m.id || `idx-${idx}`
+                  );
+                  const allSelected =
+                    allKeys.length > 0 &&
+                    selectedArchiveMsgKeys.length === allKeys.length;
+                  const selectedMsgs = openedArchive.messages.filter((m, idx) =>
+                    selectedArchiveMsgKeys.includes(m.id || `idx-${idx}`)
+                  );
+                  const effectiveForwardTarget =
+                    forwardTargetValue ||
+                    (currentRoom
+                      ? `lesson:${currentRoom.id}`
+                      : selectedChatContact
+                        ? `dm:${selectedChatContact.id}`
+                        : contacts[0]
+                          ? `dm:${contacts[0].id}`
+                          : '');
+
+                  return (
+                    <div className="flex flex-1 flex-col overflow-hidden">
+                      <div className="flex items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5">
+                        <div className="min-w-0 flex-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSelectedArchiveId(null);
+                              setSelectedArchiveMsgKeys([]);
+                            }}
+                            className="text-[11px] font-semibold text-slate-700 hover:text-slate-900"
+                          >
+                            ← К списку архивов
+                          </button>
+                          <div className="truncate text-xs font-semibold text-slate-900">
+                            {openedArchive.title}
                           </div>
                           <div className="text-[11px] text-slate-500">
-                            {new Date(arch.savedAt).toLocaleString('ru-RU')} • Сообщений:{' '}
-                            {arch.messages.length}
+                            Сообщений: {openedArchive.messages.length} • Нажмите на сообщения для пересылки
                           </div>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() => downloadArchiveAsTxt(arch)}
-                          className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-slate-800"
-                        >
-                          <Download className="h-3 w-3" />
-                          .txt
-                        </button>
+                        <div className="flex items-center gap-1.5">
+                          {openedArchive.messages.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSelectedArchiveMsgKeys(allSelected ? [] : allKeys)
+                              }
+                              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                            >
+                              {allSelected ? 'Снять' : 'Выбрать все'}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => downloadArchiveAsTxt(openedArchive)}
+                            title="Скачать текстовую копию (.txt)"
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                          >
+                            <Download className="h-3 w-3" />
+                            .txt
+                          </button>
+                        </div>
                       </div>
-                      <div className="max-h-36 space-y-1 overflow-y-auto rounded-lg border border-slate-200 bg-white p-2.5 text-[11px]">
-                        {arch.messages.map((m, idx) => (
-                          <div key={idx} className="text-slate-700">
-                            <span className="text-slate-400">[{m.time}]</span>{' '}
-                            <strong className="text-slate-900">{m.sender}:</strong> {m.text}
+
+                      <div className="flex-1 space-y-3 overflow-y-auto p-4">
+                        {openedArchive.messages.length === 0 ? (
+                          <div className="flex h-full items-center justify-center text-center text-xs text-slate-400">
+                            В этом уроке не было сообщений в чате.
                           </div>
-                        ))}
+                        ) : (
+                          openedArchive.messages.map((m, idx) => {
+                            const msgKey = m.id || `idx-${idx}`;
+                            const isSelected = selectedArchiveMsgKeys.includes(msgKey);
+                            const isMine = Boolean(
+                              (m.sender_id && m.sender_id === currentUser.id) ||
+                                (m.username &&
+                                  m.username.toLowerCase() ===
+                                    currentUser.username.toLowerCase())
+                            );
+                            const hideDefaultCaption =
+                              Boolean(m.attachment) &&
+                              (m.text.startsWith('Вложение: ') ||
+                                m.text.startsWith('Голосовое сообщение') ||
+                                m.text.startsWith('Видеокружок'));
+
+                            return (
+                              <div
+                                key={msgKey}
+                                onClick={() => {
+                                  setSelectedArchiveMsgKeys((prev) =>
+                                    prev.includes(msgKey)
+                                      ? prev.filter((k) => k !== msgKey)
+                                      : [...prev, msgKey]
+                                  );
+                                }}
+                                className={`flex cursor-pointer items-center gap-2 rounded-2xl p-1.5 transition ${
+                                  isSelected ? 'bg-sky-50 ring-1 ring-sky-200' : 'hover:bg-slate-50/70'
+                                } ${isMine ? 'justify-end' : 'justify-start'}`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={() => {}}
+                                  aria-label={`Выбрать сообщение от ${m.sender}`}
+                                  className="h-4 w-4 shrink-0 rounded border-slate-300 text-slate-900"
+                                />
+                                <div
+                                  className={`flex max-w-[85%] flex-col ${
+                                    isMine ? 'items-end' : 'items-start'
+                                  }`}
+                                >
+                                  <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
+                                    <span className="font-medium text-slate-700">
+                                      {isMine ? 'Вы' : m.sender}
+                                    </span>
+                                    <span>@{m.username}</span>
+                                    {m.time && <span>• {m.time}</span>}
+                                  </div>
+                                  {(!hideDefaultCaption && m.text) || !m.attachment ? (
+                                    <div
+                                      className={`w-full whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                                        isMine
+                                          ? 'bg-slate-900 text-white'
+                                          : 'border border-slate-200 bg-white text-slate-800'
+                                      }`}
+                                    >
+                                      {m.text}
+                                    </div>
+                                  ) : null}
+                                  {m.attachment && token && (
+                                    <div
+                                      className={(!hideDefaultCaption && m.text) ? 'mt-1.5' : ''}
+                                      onClick={(e) => e.stopPropagation()}
+                                    >
+                                      <AttachmentCard
+                                        meta={m.attachment}
+                                        controlBase={DEFAULT_CONTROL_HTTP}
+                                        token={token}
+                                        isMine={isMine}
+                                      />
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      <div className="border-t border-slate-200 bg-slate-100 px-4 py-3">
+                        {selectedMsgs.length === 0 ? (
+                          <div className="text-center text-xs font-medium text-slate-500">
+                            🔒 Архив урока — только для чтения. Отметьте сообщения, чтобы переслать их в чат.
+                          </div>
+                        ) : (
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between gap-2 text-xs">
+                              <span className="font-semibold text-slate-900">
+                                Выбрано сообщений: {selectedMsgs.length}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => setSelectedArchiveMsgKeys([])}
+                                className="text-slate-500 hover:text-slate-900"
+                              >
+                                Сбросить
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <select
+                                value={effectiveForwardTarget}
+                                onChange={(e) => setForwardTargetValue(e.target.value)}
+                                className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-900 focus:outline-none"
+                              >
+                                {currentRoom && (
+                                  <option value={`lesson:${currentRoom.id}`}>
+                                    Текущий урок: {currentRoom.title}
+                                  </option>
+                                )}
+                                {contacts.map((c) => (
+                                  <option key={c.id} value={`dm:${c.id}`}>
+                                    Личный чат: {c.display_name} (@{c.username})
+                                  </option>
+                                ))}
+                                {!currentRoom && contacts.length === 0 && (
+                                  <option value="">Нет доступных чатов</option>
+                                )}
+                              </select>
+                              <button
+                                type="button"
+                                disabled={
+                                  forwardingArchiveMsgs ||
+                                  !connected ||
+                                  !effectiveForwardTarget
+                                }
+                                onClick={() =>
+                                  void forwardArchiveMessages(
+                                    openedArchive,
+                                    selectedMsgs
+                                  )
+                                }
+                                className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                              >
+                                <Send className="h-3.5 w-3.5" />
+                                Переслать ({selectedMsgs.length})
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     </div>
-                  ))
-                )}
-              </div>
+                  );
+                }
+
+                return (
+                  <div className="flex-1 space-y-3 overflow-y-auto p-4">
+                    <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+                      <p role="status">{archiveSyncStatus}</p>
+                      <button
+                        type="button"
+                        className="mt-2 font-medium text-slate-900 underline"
+                        onClick={() => {
+                          if (archiveUnlocked) void syncArchives();
+                          else {
+                            setArchiveUnlockError(null);
+                            setShowArchiveUnlock(true);
+                          }
+                        }}
+                      >
+                        {archiveUnlocked ? 'Синхронизировать' : 'Разблокировать архив'}
+                      </button>
+                    </div>
+                    {archivedChats.length === 0 ? (
+                      <div className="flex h-full flex-col items-center justify-center text-center text-xs text-slate-400">
+                        <Download className="mb-2 h-6 w-6 stroke-1" />
+                        Сохранённых архивов уроков пока нет. В конце урока чат сохраняется автоматически или по кнопке «В архив».
+                      </div>
+                    ) : (
+                      archivedChats.map((arch) => (
+                        <div
+                          key={`${arch.id}-${arch.savedAt}`}
+                          onClick={() => {
+                            setSelectedArchiveId(arch.id);
+                            setSelectedArchiveMsgKeys([]);
+                          }}
+                          className="cursor-pointer rounded-xl border border-slate-200 bg-white p-3.5 space-y-2 transition hover:border-slate-400"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <div className="text-xs font-semibold text-slate-900">
+                                {arch.title}
+                              </div>
+                              <div className="text-[11px] text-slate-500">
+                                {new Date(arch.savedAt).toLocaleString('ru-RU')} • Сообщений:{' '}
+                                {arch.messages.length}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedArchiveId(arch.id);
+                                setSelectedArchiveMsgKeys([]);
+                              }}
+                              className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-slate-800"
+                            >
+                              Открыть чат
+                            </button>
+                          </div>
+                          {arch.messages.length > 0 && (
+                            <div className="truncate text-[11px] text-slate-600">
+                              <strong className="text-slate-800">
+                                {arch.messages[arch.messages.length - 1].sender}:
+                              </strong>{' '}
+                              {arch.messages[arch.messages.length - 1].text}
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                );
+              })()
             ) : (
               <>
                 <div className="flex-1 space-y-3 overflow-y-auto p-5">
@@ -2031,46 +2964,181 @@ export function App() {
                         ? 'Выберите контакт из списка слева (иконка чата) или в меню выше, чтобы начать личную переписку'
                         : 'Начните звонок или переключитесь на «Личный чат», чтобы написать контакту напрямую'}
                     </div>
-                  ) : decryptedMessages.length === 0 ? (
+                  ) : decryptedMessages.length === 0 &&
+                    outgoingTransfers.filter((t) => t.roomId === activeChatRoomId).length === 0 ? (
                     <div className="rounded-xl border border-dashed border-slate-200 p-5 text-center text-xs text-slate-400">
-                      Сообщений пока нет. Напишите первое сообщение!
+                      Сообщений пока нет. Напишите сообщение или прикрепите вложение!
                     </div>
                   ) : (
-                    decryptedMessages.map((m) => {
-                      const isMine = m.sender_id === currentUser.id;
-                      return (
-                        <div
-                          key={m.id}
-                          className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
-                        >
-                          <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
-                            <span className="font-medium text-slate-700">
-                              {m.sender_display_name}
-                            </span>
-                            <span>@{m.sender_username}</span>
-                          </div>
+                    <>
+                      {decryptedMessages.map((m) => {
+                        const isMine = m.sender_id === currentUser.id;
+                        const hideDefaultCaption =
+                          Boolean(m.attachment) &&
+                          (m.plaintext.startsWith('Вложение: ') ||
+                            m.plaintext.startsWith('Голосовое сообщение') ||
+                            m.plaintext.startsWith('Видеокружок'));
+                        const hasTextBubble =
+                          (!hideDefaultCaption && Boolean(m.plaintext.trim())) || !m.attachment;
+                        const msgTime = m.created_at
+                          ? new Date(m.created_at).toLocaleTimeString('ru-RU', {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })
+                          : '';
+
+                        return (
                           <div
-                            className={`max-w-[85%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                              isMine
-                                ? 'bg-slate-900 text-white'
-                                : 'border border-slate-200 bg-slate-50 text-slate-900'
-                            }`}
+                            key={m.id}
+                            className={`group flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
                           >
-                            {m.plaintext}
+                            <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
+                              <span className="font-medium text-slate-700">
+                                {isMine ? 'Вы' : m.sender_display_name}
+                              </span>
+                              <span>@{m.sender_username}</span>
+                              {msgTime && <span>• {msgTime}</span>}
+                              {m.edited_at && (
+                                <span className="italic text-slate-400" title="Сообщение изменено">
+                                  (изм.)
+                                </span>
+                              )}
+                              {isMine && (
+                                <span className="ml-1 inline-flex items-center gap-0.5 opacity-80 transition group-hover:opacity-100">
+                                  <button
+                                    type="button"
+                                    onClick={() => startEditingChatMessage(m)}
+                                    title="Редактировать сообщение"
+                                    className="rounded p-0.5 text-slate-400 hover:bg-slate-200/70 hover:text-slate-800"
+                                  >
+                                    <Pencil className="h-3 w-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteChatMessage(m)}
+                                    title="Удалить сообщение"
+                                    className="rounded p-0.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                                  >
+                                    <Trash2 className="h-3 w-3" />
+                                  </button>
+                                </span>
+                              )}
+                            </div>
+
+                            {hasTextBubble && (
+                              <div
+                                className={`max-w-[88%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                                  isMine
+                                    ? 'bg-slate-900 text-white'
+                                    : 'border border-slate-200 bg-slate-50 text-slate-900'
+                                }`}
+                              >
+                                {m.plaintext}
+                              </div>
+                            )}
+
+                            {m.attachment && token && (
+                              <div className={`max-w-[88%] ${hasTextBubble ? 'mt-1.5' : ''}`}>
+                                <AttachmentCard
+                                  meta={m.attachment}
+                                  controlBase={DEFAULT_CONTROL_HTTP}
+                                  token={token}
+                                  isMine={isMine}
+                                />
+                              </div>
+                            )}
                           </div>
-                        </div>
-                      );
-                    })
+                        );
+                      })}
+                      {outgoingTransfers
+                        .filter((t) => t.roomId === activeChatRoomId)
+                        .map((transfer) => (
+                          <OutgoingTransferCard
+                            key={transfer.localId}
+                            transfer={transfer}
+                            onCancel={cancelAttachmentTransfer}
+                            onRetry={retryAttachmentTransfer}
+                            onDismiss={dismissAttachmentTransfer}
+                          />
+                        ))}
+                    </>
                   )}
                   <div ref={chatEndRef} />
                 </div>
 
                 <form
                   onSubmit={handleSendChatMessage}
-                  className="border-t border-slate-200 p-4"
+                  className="relative border-t border-slate-200 p-4"
                 >
+                  {editingMessage && (
+                    <div className="mb-2 flex items-center justify-between gap-2 rounded-xl border border-indigo-200 bg-indigo-50/80 px-3 py-1.5 text-xs text-indigo-950">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 font-semibold text-indigo-700">
+                          <Pencil className="h-3.5 w-3.5 shrink-0" />
+                          <span>Редактирование сообщения</span>
+                        </div>
+                        <p className="truncate text-[11px] text-slate-600">
+                          {editingMessage.plaintext}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingMessage(null);
+                          setChatInput('');
+                        }}
+                        className="rounded-lg p-1 text-slate-500 hover:bg-indigo-100 hover:text-slate-900"
+                        title="Отменить редактирование"
+                      >
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
+                  )}
+                  {showEmojiPicker && activeChatRoomId && (
+                    <div className="mb-2.5 rounded-2xl border border-slate-200 bg-slate-50 p-2.5 shadow-xs">
+                      <div className="mb-2 flex items-center justify-between gap-1 border-b border-slate-200 pb-1.5">
+                        <div className="flex flex-wrap gap-1">
+                          {EMOJI_CATEGORIES.map((cat, idx) => (
+                            <button
+                              key={cat.label}
+                              type="button"
+                              onClick={() => setEmojiCategoryIdx(idx)}
+                              className={`rounded-lg px-2 py-1 text-[11px] font-semibold transition ${
+                                emojiCategoryIdx === idx
+                                  ? 'bg-slate-900 text-white'
+                                  : 'bg-white text-slate-600 hover:bg-slate-200/70'
+                              }`}
+                            >
+                              {cat.label}
+                            </button>
+                          ))}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setShowEmojiPicker(false)}
+                          className="rounded-md p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700"
+                          title="Закрыть панель эмодзи"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      <div className="grid max-h-36 grid-cols-10 gap-1 overflow-y-auto pr-1">
+                        {EMOJI_CATEGORIES[emojiCategoryIdx].items.map((emoji, i) => (
+                          <button
+                            key={`${emoji}-${i}`}
+                            type="button"
+                            onClick={() => insertEmojiIntoChat(emoji)}
+                            className="flex h-8 w-8 items-center justify-center rounded-lg text-lg transition hover:scale-110 hover:bg-white"
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   <div className="flex items-center gap-2">
                     <input
+                      ref={chatInputRef}
                       type="text"
                       disabled={!activeChatRoomId || !connected}
                       placeholder={
@@ -2084,11 +3152,18 @@ export function App() {
                       onChange={(e) => { setChatInput(e.target.value); if (activeChatRoomId) draftsRef.current[activeChatRoomId] = e.target.value; }}
                       className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-slate-900 focus:outline-none disabled:bg-slate-100"
                     />
+                    <MediaRecorderBar
+                      disabled={!activeChatRoomId || !connected}
+                      onReadyAttachment={handleReadyAttachment}
+                      onError={(msg) => setSystemBanner(msg)}
+                      onToggleEmoji={() => setShowEmojiPicker((v) => !v)}
+                      emojiOpen={showEmojiPicker}
+                    />
                     <button
                       type="submit"
                       aria-label="Отправить сообщение"
                       disabled={!activeChatRoomId || !chatInput.trim() || !connected || sendingChat}
-                      className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40"
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40"
                     >
                       <Send className="h-4 w-4" />
                     </button>
@@ -2102,7 +3177,14 @@ export function App() {
         {/* ВКЛАДКА 3: Обновления Приложений */}
         {panel === 'settings' && (
           <div className="flex-1 space-y-5 overflow-y-auto p-5">
-            {token && <StorageUsage key={currentUser?.id} baseUrl={DEFAULT_CONTROL_HTTP} token={token} />}
+            {token && (
+              <StorageUsage
+                key={currentUser?.id}
+                baseUrl={DEFAULT_CONTROL_HTTP}
+                token={token}
+                refreshTrigger={storageRefreshTrigger}
+              />
+            )}
             <div>
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-slate-900">
@@ -2215,6 +3297,51 @@ export function App() {
           }}>Удалить</button>
         </div>
       </Modal>}
+      {showReportModal && activeChatRoomId && (
+        <Modal label="Пожаловаться на переписку" onClose={() => setShowReportModal(false)}>
+          <div className="flex items-center gap-2 text-rose-700">
+            <Flag className="h-5 w-5" />
+            <h2 className="text-lg font-semibold">Жалоба с раскрытием ключа E2EE</h2>
+          </div>
+          <p className="mt-2 text-xs leading-relaxed text-slate-600">
+            По умолчанию переписка зашифрована сквозным шифрованием (AES-256-GCM) и недоступна серверу.
+            При отправке жалобы вы добровольно передаёте в Админку <strong>ключи текущей комнаты</strong> и
+            снимок сообщений для модерации. Сразу после отправки ключ комнаты будет автоматически <strong>ротирован</strong>.
+          </p>
+          <form onSubmit={handleSubmitChatReport} className="mt-4 space-y-3">
+            <div>
+              <label className="mb-1 block text-xs font-semibold text-slate-700">
+                Причина обращения / комментарий
+              </label>
+              <textarea
+                rows={3}
+                required
+                value={reportReason}
+                onChange={(e) => setReportReason(e.target.value)}
+                placeholder="Опишите нарушение или причину жалобы..."
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-slate-900 focus:outline-none"
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowReportModal(false)}
+                className="rounded-lg border border-slate-300 px-3.5 py-2 text-xs font-medium text-slate-700 hover:bg-slate-50"
+              >
+                Отмена
+              </button>
+              <button
+                type="submit"
+                disabled={submittingReport || !reportReason.trim()}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-500 disabled:opacity-50"
+              >
+                <Flag className="h-3.5 w-3.5" />
+                {submittingReport ? 'Отправка…' : 'Раскрыть ключ и отправить жалобу'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
     </div>
   );
 }

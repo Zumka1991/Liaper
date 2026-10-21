@@ -1,4 +1,5 @@
 import { base64ToBytes, bytesToBase64 } from '../crypto/e2ee.ts';
+import type { ChatAttachmentMeta } from '../types/protocol.ts';
 
 export interface LessonArchive {
   id: string;
@@ -6,7 +7,16 @@ export interface LessonArchive {
   savedAt: string;
   startedAt?: string;
   endedAt?: string;
-  messages: { id?: string; sender: string; username: string; text: string; time: string; sentAt?: string }[];
+  messages: {
+    id?: string;
+    sender_id?: string;
+    sender: string;
+    username: string;
+    text: string;
+    time: string;
+    sentAt?: string;
+    attachment?: ChatAttachmentMeta;
+  }[];
 }
 
 export interface ArchiveBlob {
@@ -46,7 +56,13 @@ export function mergeArchive(left: LessonArchive, right: LessonArchive): LessonA
   const messages = new Map<string, LessonArchive['messages'][number]>();
   for (const message of [...left.messages, ...right.messages]) {
     const identity = message.id || JSON.stringify([message.sender, message.username, message.sentAt || message.time, message.text]);
-    messages.set(identity, message);
+    const prev = messages.get(identity);
+    messages.set(identity, {
+      ...(prev || {}),
+      ...message,
+      attachment: message.attachment ?? prev?.attachment,
+      sender_id: message.sender_id ?? prev?.sender_id,
+    });
   }
   return { ...newer, startedAt: left.startedAt || right.startedAt,
     endedAt: [left.endedAt, right.endedAt].filter(Boolean).sort().at(-1),
@@ -61,7 +77,7 @@ export function mergeArchiveLists(...lists: LessonArchive[][]): LessonArchive[] 
 
 function canonical(archive: LessonArchive): string {
   return JSON.stringify([archive.title, archive.startedAt || '', archive.endedAt || '', archive.savedAt,
-    archive.messages.map((m) => [m.id || '', m.sender, m.username, m.text, m.time || '', m.sentAt || ''])]);
+    archive.messages.map((m) => [m.id || '', m.sender, m.username, m.text, m.time || '', m.sentAt || '', m.attachment?.id || ''])]);
 }
 
 async function checked(response: Response): Promise<Response> {

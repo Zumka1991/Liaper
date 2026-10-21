@@ -91,6 +91,34 @@ pub async fn reserve(
     Json(body): Json<Reservation>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let id = owner(&state, &headers)?;
+    let subj_key = format!("user:{id}");
+    if let Err(msg) = state.antifraud.check_quarantine(&subj_key) {
+        return Err(error(StatusCode::TOO_MANY_REQUESTS, &msg));
+    }
+    let uname = state.users_by_id.get(&id).map(|u| u.username.clone());
+    if !state
+        .antifraud
+        .allow_rate(&format!("upload_reserve:{id}"), 60, 20)
+    {
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(id),
+                uname,
+                None,
+                "upload_abuse",
+                crate::antifraud::IncidentSeverity::Medium,
+                30,
+                "Превышен лимит частоты резервации вложений (> 20/мин.)".into(),
+                300,
+            )
+            .await;
+        return Err(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Слишком много запросов на загрузку файлов. Повторите через минуту",
+        ));
+    }
     if body.size_bytes < 16
         || body.size_bytes > MAX_BLOB_BYTES
         || body.sha256.len() != 64
@@ -122,6 +150,38 @@ pub async fn reserve(
     }
     let key = secret()?;
     let db = database(&state).await?;
+    let pending_cnt: i64 = db
+        .query_one(
+            "SELECT COALESCE(COUNT(*) FILTER(WHERE state='pending' AND reservation_until > NOW()), 0)::BIGINT FROM file_attachments WHERE owner_id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(db_error)?
+        .get(0);
+    if pending_cnt >= crate::antifraud::MAX_PENDING_UPLOADS_PER_USER {
+        let uname = state.users_by_id.get(&id).map(|u| u.username.clone());
+        state
+            .antifraud
+            .record_violation(
+                &subj_key,
+                Some(id),
+                uname,
+                None,
+                "upload_abuse",
+                crate::antifraud::IncidentSeverity::High,
+                40,
+                format!(
+                    "Попытка исчерпания квоты незавершёнными резервациями (pending={})",
+                    pending_cnt
+                ),
+                300,
+            )
+            .await;
+        return Err(error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "У вас уже есть 5 незавершённых загрузок. Дождитесь их окончания",
+        ));
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
@@ -255,10 +315,20 @@ pub async fn download(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = owner(&state, &headers)?;
+    let reported_rooms: Vec<Uuid> = state.reports.iter().map(|r| r.value().room_id).collect();
+    let user_opt = owner(&state, &headers).ok();
+    if user_opt.is_none() && reported_rooms.is_empty() {
+        return Err(error(StatusCode::UNAUTHORIZED, "Необходима авторизация"));
+    }
     let db = database(&state).await?;
-    let row=db.query_opt("SELECT node_id,size_bytes,sha256,expires_at,state FROM file_attachments f WHERE id=$1 AND EXISTS(SELECT 1 FROM file_attachment_readers r WHERE r.attachment_id=f.id AND r.user_id=$2)",&[&id,&user]).await.map_err(db_error)?
-        .ok_or_else(||error(StatusCode::NOT_FOUND,"Файл не найден"))?;
+    let row = db
+        .query_opt(
+            "SELECT node_id,size_bytes,sha256,expires_at,state FROM file_attachments f WHERE id=$1 AND (room_id = ANY($3) OR ($2::UUID IS NOT NULL AND EXISTS(SELECT 1 FROM file_attachment_readers r WHERE r.attachment_id=f.id AND r.user_id=$2)))",
+            &[&id, &user_opt, &reported_rooms],
+        )
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "Файл не найден"))?;
     let expiry: Option<chrono::DateTime<Utc>> = row.get(3);
     if row.get::<_, String>(4) != "ready" {
         return Err(error(StatusCode::CONFLICT, "Файл ещё загружается"));

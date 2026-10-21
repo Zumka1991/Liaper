@@ -67,6 +67,30 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE INDEX IF NOT EXISTS idx_chat_messages_room_id ON chat_messages (room_id, created_at);
 
+CREATE TABLE IF NOT EXISTS e2ee_key_envelopes (
+    room_id UUID NOT NULL,
+    sender_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sender_username VARCHAR(64) NOT NULL,
+    sender_public_key TEXT NOT NULL,
+    recipient_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recipient_username VARCHAR(64) NOT NULL,
+    encrypted_room_key_b64 TEXT NOT NULL,
+    iv_b64 TEXT NOT NULL,
+    room_key_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (room_id, recipient_id, room_key_id, sender_public_key, encrypted_room_key_b64)
+);
+
+CREATE INDEX IF NOT EXISTS idx_e2ee_key_envelopes_recipient ON e2ee_key_envelopes (recipient_id, room_id);
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+    token TEXT PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions (user_id);
+
 -- Minimal routing/access metadata only. File names, types and keys stay in encrypted messages.
 CREATE TABLE IF NOT EXISTS file_attachments (
     id UUID PRIMARY KEY,
