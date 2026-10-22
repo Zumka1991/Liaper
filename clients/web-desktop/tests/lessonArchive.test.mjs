@@ -18,6 +18,10 @@ test('merges concurrent messages without duplicates',()=>{
   const b={...a,savedAt:'2026-10-22T12:01:00Z',messages:[...a.messages,{...a.messages[0],id:'message-2',text:'Ответ'}]};
   assert.equal(mergeArchiveLists([a],[b])[0].messages.length,2);
 });
+test('drops lessons without messages',()=>{
+  const a=fixture.archive;
+  assert.deepEqual(mergeArchiveLists([a],[{...a,id:'empty-lesson',messages:[]}]).map((x)=>x.id),[a.id]);
+});
 test('unreadable remote archive stops sync before any upload',async()=>{
   let writes=0;
   const fetcher=async(_url,options)=>{if(options.method==='PUT') writes++;return Response.json([fixture.blob]);};

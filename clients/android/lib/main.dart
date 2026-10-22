@@ -12,6 +12,7 @@ import 'package:http/http.dart' as http;
 import 'package:open_filex/open_filex.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import 'widgets/draggable_self_view.dart';
@@ -46,7 +47,7 @@ void main() {
   runApp(const LiaperMobileApp());
 }
 
-const String kCurrentAppVersion = '0.2.0';
+const String kCurrentAppVersion = '0.2.1';
 const String kPlatformAndroid = 'android_arm64';
 
 class LiaperMobileApp extends StatelessWidget {
@@ -249,7 +250,16 @@ class LiaperHomeScreen extends StatefulWidget {
   State<LiaperHomeScreen> createState() => _LiaperHomeScreenState();
 }
 
-class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
+/// Сокет с таймаутом подключения и ping: после смены сети (Wi-Fi ↔ мобильный, VPN)
+/// мёртвое соединение закрывается само и запускает переподключение, а не «висит» молча.
+WebSocketChannel _openSocket(Uri uri) => IOWebSocketChannel.connect(
+      uri,
+      pingInterval: const Duration(seconds: 15),
+      connectTimeout: const Duration(seconds: 10),
+    );
+
+class _LiaperHomeScreenState extends State<LiaperHomeScreen>
+    with WidgetsBindingObserver {
   static const MethodChannel _mediaChannel = MethodChannel('com.liaper.audio');
 
   String _serverUrl = _defaultServerUrl;
@@ -290,6 +300,17 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // Состояние WebSocket и контактов
   WebSocketChannel? _wsChannel;
   bool _wsConnected = false;
+  // Баннер «Нет связи» только если связи нет дольше пары секунд: после сворачивания
+  // Android рвёт сокет, и короткое переподключение пользователю показывать незачем
+  bool _showOfflineBanner = false;
+  Timer? _offlineBannerTimer;
+
+  void _armOfflineBanner() {
+    if (_wsConnected || (_offlineBannerTimer?.isActive ?? false)) return;
+    _offlineBannerTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted && !_wsConnected) setState(() => _showOfflineBanner = true);
+    });
+  }
   Timer? _reconnectTimer;
   int _reconnectFailures = 0;
   List<dynamic> _contacts = [];
@@ -638,12 +659,24 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       }
       return null;
     });
+    WidgetsBinding.instance.addObserver(this);
     _initIdentityAndSession();
+  }
+
+  // Вернулись в приложение без связи — переподключаемся сразу, не дожидаясь таймера
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _token != null && !_wsConnected) {
+      _reconnectFailures = 0;
+      _connectWebSocket();
+    }
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _reconnectTimer?.cancel();
+    _offlineBannerTimer?.cancel();
     _archiveSaveTimer?.cancel();
     _noteTimer?.cancel();
     _noteFrameCaptureTimer?.cancel();
@@ -1798,6 +1831,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     final roomId = _currentRoom!['id'].toString();
     final roomTitle = (_currentRoom!['title'] ?? 'Урок').toString();
     final roomMsgs = _chatMessages.where((m) => m.roomId == roomId).toList();
+    if (roomMsgs.isEmpty) {
+      if (showNotification) {
+        setState(() => _statusMessage =
+            'В чате урока «$roomTitle» пока нет сообщений — сохранять нечего');
+      }
+      return;
+    }
     final entry = {
       'id': roomId,
       'title': roomTitle,
@@ -1981,8 +2021,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
     try {
       _sfuChannel?.sink.close();
-      final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+      final channel = _openSocket(Uri.parse(wsUrl));
       _sfuChannel = channel;
+      // Ошибку подключения обработает onDone ниже (повтор через 2 с)
+      channel.ready.catchError((_) {});
 
       channel.sink.add(
         jsonEncode({
@@ -2050,9 +2092,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       );
 
       _videoFrameTimer?.cancel();
-      // ~15 FPS (65 мс) для плавной передачи 720p видео с телефона
+      // ~10 к/с: JPEG-кадры идут тем же сокетом, что и звук, и не должны его задерживать
       _videoFrameTimer = Timer.periodic(
-        const Duration(milliseconds: 65),
+        const Duration(milliseconds: 100),
         (_) => _captureAndSendVideoFrame(),
       );
     } catch (_) {}
@@ -2270,7 +2312,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   void _scheduleReconnect(WebSocketChannel channel) {
     if (!mounted || _token == null || _wsChannel != channel) return;
     setState(() => _wsConnected = false);
-    _reconnectTimer?.cancel();
+    _armOfflineBanner();
+    // Ошибка и закрытие одного сокета приходят оба — второе уже не нужно
+    if (_reconnectTimer?.isActive ?? false) return;
     final seconds = (2 * (1 << _reconnectFailures.clamp(0, 3))).clamp(2, 16);
     _reconnectFailures++;
     _reconnectTimer = Timer(Duration(seconds: seconds), _connectWebSocket);
@@ -2285,8 +2329,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     final wsUri = Uri.parse(
       '${_serverUrl.replaceFirst(RegExp(r'^http'), 'ws')}/ws?token=${Uri.encodeComponent(_token!)}',
     );
-    final channel = WebSocketChannel.connect(wsUri);
+    final channel = _openSocket(wsUri);
     _wsChannel = channel;
+    _armOfflineBanner();
+    // Не дождались рукопожатия (таймаут, сервер недоступен) — планируем повтор
+    channel.ready.catchError((_) => _scheduleReconnect(channel));
     channel.stream.listen(
       (message) {
         if (!mounted || _wsChannel != channel) return;
@@ -2319,6 +2366,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         Future.microtask(_registerPushToken);
         setState(() {
           _wsConnected = true;
+          _showOfflineBanner = false;
           _currentUser = payload?['self_profile'] as Map<String, dynamic>?;
           _contacts = (payload?['contacts'] as List<dynamic>?) ?? [];
           _incomingRequests =
@@ -3178,7 +3226,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           body: SafeArea(
             child: Column(
               children: [
-                if (!_wsConnected)
+                if (!_wsConnected && _showOfflineBanner)
                   MaterialBanner(
                     content: const Text('Нет связи. Переподключаемся…'),
                     leading: const Icon(Icons.wifi_off, size: 20),

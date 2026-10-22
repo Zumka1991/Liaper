@@ -106,7 +106,10 @@ List<Map<String, dynamic>> mergeArchiveLists(
     entries[id] =
         entries.containsKey(id) ? mergeArchive(entries[id]!, archive) : archive;
   }
-  return entries.values.toList()
+  // Урок без единого сообщения в архиве не нужен (в том числе уже сохранённые раньше)
+  return entries.values
+      .where((a) => (a['messages'] as List?)?.isNotEmpty ?? false)
+      .toList()
     ..sort(
         (a, b) => b['savedAt'].toString().compareTo(a['savedAt'].toString()));
 }

@@ -1538,6 +1538,10 @@ export function App() {
     if (!currentRoom) return;
     const ownerId = currentUserRef.current?.id;
     const roomMsgs = rawMessages.filter((m) => m.room_id === currentRoom.id);
+    if (roomMsgs.length === 0) {
+      if (!quiet) setSystemBanner(`В чате урока «${currentRoom.title}» пока нет сообщений — сохранять нечего`);
+      return;
+    }
     const keyring = roomKeyringsRef.current.get(currentRoom.id) ?? null;
 
     const formatted: ArchivedLessonChat['messages'] = [];

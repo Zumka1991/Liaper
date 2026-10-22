@@ -102,6 +102,9 @@ void main() {
       ]),
     });
     await openApp(tester, const Size(320, 640), textScale: 1.3);
+    // Короткий обрыв не показываем — баннер появляется, если связи нет дольше 3 с
+    expect(find.text('Нет связи. Переподключаемся…'), findsNothing);
+    await tester.pump(const Duration(seconds: 4));
     expect(find.text('Нет связи. Переподключаемся…'), findsOneWidget);
     expect(find.text('Добавить'),findsNothing);
     expect(find.text('Пока нет преподавателей'),findsOneWidget);
@@ -118,5 +121,7 @@ void main() {
     expect(tester.takeException(), isNull);
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pumpAndSettle();
+    // Дать истечь таймаутам подключения к серверу и баннера «Нет связи»
+    await tester.pump(const Duration(seconds: 11));
   });
 }

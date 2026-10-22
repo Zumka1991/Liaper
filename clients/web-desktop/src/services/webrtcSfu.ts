@@ -8,6 +8,12 @@ import type {
   NodeToClientMsg,
 } from '../types/protocol';
 
+// Задержка звука: запас на неровную доставку и потолок очереди воспроизведения
+const PLAYBACK_LEAD_S = 0.06;
+const MAX_PLAYBACK_QUEUE_S = 0.2;
+// Видео 12 к/с вместо 20: JPEG-кадры не должны вытеснять звук из общего сокета
+const VIDEO_FPS = 12;
+
 export interface SfuConnectionCallbacks {
   onNodeConnected: (nodeId: string, nodeName: string) => void;
   onRemoteVideoFrame: (peerId: string, dataUrl: string) => void;
@@ -17,7 +23,7 @@ export interface SfuConnectionCallbacks {
 
 /**
  * Высокопроизводительный клиент медиа-ноды (SFU) без P2P:
- * Передаёт чистый звук (PCM16 16kHz) и HD-видео / демонстрацию экрана (до 1280x720, 20 FPS)
+ * Передаёт чистый звук (PCM16 16kHz) и видео / демонстрацию экрана (до 1280x720, 12 FPS)
  * строго через серверную ноду `liaper-node` с контролем буфера сокета.
  */
 export class SfuMediaNodeClient {
@@ -225,13 +231,14 @@ export class SfuMediaNodeClient {
     if (stream.getAudioTracks().length > 0 && this.audioCtx) {
       try {
         this.micSource = this.audioCtx.createMediaStreamSource(stream);
-        this.micProcessor = this.audioCtx.createScriptProcessor(2048, 1, 1);
+        // 512 сэмплов = 32 мс: меньше порция — меньше задержка на захвате (было 128 мс)
+        this.micProcessor = this.audioCtx.createScriptProcessor(512, 1, 1);
         this.micProcessor.onaudioprocess = (ev) => {
           if (!this.audioEnabled || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
             return;
           }
-          // Защита от переполнения буфера сокета
-          if (this.ws.bufferedAmount > 512 * 1024) return;
+          // Сокет забит: старый звук уже не нужен, лучше пропустить порцию, чем копить задержку
+          if (this.ws.bufferedAmount > 64 * 1024) return;
 
           const input = ev.inputBuffer.getChannelData(0);
           const pcm16 = new Int16Array(input.length);
@@ -285,7 +292,7 @@ export class SfuMediaNodeClient {
         clearInterval(this.videoInterval);
       }
 
-      // 50 мс = 20 кадров/сек (с автоматическим пропуском кадра при заполнении буфера сокета)
+      // VIDEO_FPS кадров/сек; кадр пропускается, пока буфер сокета не освободится
       this.videoInterval = window.setInterval(() => {
         if (
           !this.videoEnabled ||
@@ -296,13 +303,13 @@ export class SfuMediaNodeClient {
         ) {
           return;
         }
-        // Не копим задержку в буфере сокета
-        if (this.ws.bufferedAmount > 384 * 1024) return;
+        // Видео не должно стоять в сокете перед звуком: кадр пропускаем, пока очередь не уйдёт
+        if (this.ws.bufferedAmount > 32 * 1024) return;
         if (this.captureVideoEl.readyState < 2) return;
 
         const srcW = this.captureVideoEl.videoWidth || 1280;
         const srcH = this.captureVideoEl.videoHeight || 720;
-        const maxWidth = this.isScreenShare ? 1280 : 854;
+        const maxWidth = this.isScreenShare ? 1280 : 640;
         const scale = Math.min(1, maxWidth / srcW);
         const targetW = Math.max(320, Math.round(srcW * scale));
         const targetH = Math.max(200, Math.round(srcH * scale));
@@ -319,7 +326,7 @@ export class SfuMediaNodeClient {
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(this.captureVideoEl, 0, 0, targetW, targetH);
 
-        const quality = this.isScreenShare ? 0.88 : 0.82;
+        const quality = this.isScreenShare ? 0.8 : 0.65;
         const dataUrl = this.captureCanvas.toDataURL('image/jpeg', quality);
         const b64 = dataUrl.split(',')[1];
         if (!b64) return;
@@ -338,7 +345,7 @@ export class SfuMediaNodeClient {
             timestamp_ms: Date.now(),
           },
         });
-      }, 50);
+      }, 1000 / VIDEO_FPS);
     }
   }
 
@@ -366,8 +373,12 @@ export class SfuMediaNodeClient {
       source.connect(this.audioCtx.destination);
 
       const now = this.audioCtx.currentTime;
-      if (this.nextPlayTime < now || this.nextPlayTime > now + 0.35) {
-        this.nextPlayTime = now + 0.03;
+      if (this.nextPlayTime < now) {
+        // Очередь опустела: небольшой запас на неровную доставку
+        this.nextPlayTime = now + PLAYBACK_LEAD_S;
+      } else if (this.nextPlayTime > now + MAX_PLAYBACK_QUEUE_S) {
+        // Пришла пачка с опозданием — выбрасываем, чтобы не говорить «в прошлом»
+        return;
       }
       source.start(this.nextPlayTime);
       this.nextPlayTime += audioBuffer.duration;

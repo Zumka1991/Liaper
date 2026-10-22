@@ -42,4 +42,10 @@ void main() {
     };
     expect(mergeArchiveLists([a], [b]).single['messages'], hasLength(2));
   });
+
+  test('drops lessons without messages', () {
+    final a = Map<String, dynamic>.from(fixture['archive'] as Map);
+    final empty = {...a, 'id': 'empty-lesson', 'messages': <dynamic>[]};
+    expect(mergeArchiveLists([a], [empty]).map((e) => e['id']), [a['id']]);
+  });
 }

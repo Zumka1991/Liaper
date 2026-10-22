@@ -72,7 +72,10 @@ export function mergeArchive(left: LessonArchive, right: LessonArchive): LessonA
 export function mergeArchiveLists(...lists: LessonArchive[][]): LessonArchive[] {
   const entries = new Map<string, LessonArchive>();
   for (const archive of lists.flat()) entries.set(archive.id, entries.has(archive.id) ? mergeArchive(entries.get(archive.id)!, archive) : archive);
-  return [...entries.values()].sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+  // Урок без единого сообщения в архиве не нужен (в том числе уже сохранённые раньше)
+  return [...entries.values()]
+    .filter((archive) => archive.messages.length > 0)
+    .sort((a, b) => b.savedAt.localeCompare(a.savedAt));
 }
 
 function canonical(archive: LessonArchive): string {

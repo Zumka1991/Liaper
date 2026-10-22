@@ -41,6 +41,7 @@ class MainActivity : FlutterActivity() {
     private var micMuted = false
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
+    private var playFramesWritten = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // Запись голосовых сообщений и звука видеокружков (16 кГц моно PCM16 -> WAV)
@@ -65,6 +66,8 @@ class MainActivity : FlutterActivity() {
         private const val REQ_PERMISSIONS = 1001
         private const val REQ_PICK_FILE = 1002
         private const val REQ_NOTIFICATIONS = 1003
+        // Потолок очереди воспроизведения звонка: 200 мс при 16 кГц
+        private const val MAX_PLAYBACK_QUEUE_FRAMES = 3200L
         private const val MAX_PLAIN_FILE_BYTES = 134_217_712L // 128 MiB - 16B GCM tag
     }
 
@@ -232,7 +235,8 @@ class MainActivity : FlutterActivity() {
                         try {
                             val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                             if (bmp != null) {
-                                val maxDim = 720
+                                // Лёгкие кадры: видео идёт тем же сокетом, что и звук, и не должно его задерживать
+                                val maxDim = 640
                                 val ratio = bmp.width.toFloat() / bmp.height.toFloat()
                                 val targetW: Int
                                 val targetH: Int
@@ -249,7 +253,7 @@ class MainActivity : FlutterActivity() {
                                     bmp
                                 }
                                 val out = ByteArrayOutputStream()
-                                scaled.compress(Bitmap.CompressFormat.JPEG, 82, out)
+                                scaled.compress(Bitmap.CompressFormat.JPEG, 65, out)
                                 result.success(out.toByteArray())
                             } else {
                                 result.success(bytes)
@@ -669,7 +673,8 @@ class MainActivity : FlutterActivity() {
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(6400)
+        ).coerceAtLeast(3200)
+        playFramesWritten = 0L
 
         audioTrack = AudioTrack.Builder()
             .setAudioAttributes(
@@ -687,6 +692,11 @@ class MainActivity : FlutterActivity() {
             )
             .setBufferSizeInBytes(minPlayBuf * 2)
             .setTransferMode(AudioTrack.MODE_STREAM)
+            .apply {
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                    setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                }
+            }
             .build()
         audioTrack?.play()
 
@@ -708,7 +718,8 @@ class MainActivity : FlutterActivity() {
                 audioRecord = recorder
                 recorder.startRecording()
 
-                val chunkBuf = ByteArray(2560)
+                // 1024 байта = 32 мс при 16 кГц: меньше порция — меньше задержка (было 80 мс)
+                val chunkBuf = ByteArray(1024)
                 while (isRecording) {
                     val read = recorder.read(chunkBuf, 0, chunkBuf.size)
                     if (read > 0 && isRecording) {
@@ -733,8 +744,14 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun playPcmChunk(bytes: ByteArray) {
+        val track = audioTrack ?: return
         try {
-            audioTrack?.write(bytes, 0, bytes.size)
+            // Звук, пришедший пачкой с опозданием, выбрасываем: иначе собеседника слышно «из прошлого»
+            val queued = playFramesWritten - (track.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
+            if (queued > MAX_PLAYBACK_QUEUE_FRAMES) return
+            // Без блокировки главного потока: не влезло в буфер — значит, уже поздно
+            val written = track.write(bytes, 0, bytes.size, AudioTrack.WRITE_NON_BLOCKING)
+            if (written > 0) playFramesWritten += written / 2
         } catch (_: Exception) {
         }
     }

@@ -1,7 +1,7 @@
 use std::{
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -29,12 +29,22 @@ use uuid::Uuid;
 
 type PeerSender = mpsc::UnboundedSender<NodeToClientMsg>;
 
+/// Сколько видеокадров может ждать отправки одному получателю. Если его канал медленнее
+/// отправителя, лишние кадры выбрасываем: иначе очередь растёт, а звук стоит за видео.
+const MAX_VIDEO_BACKLOG: usize = 2;
+
+fn is_video_frame(msg: &NodeToClientMsg) -> bool {
+    matches!(msg, NodeToClientMsg::RelayedEncryptedMediaFrame { kind, .. } if kind.starts_with("video"))
+}
+
 #[derive(Clone)]
 struct ConnectedSfuPeer {
     /// Идентификатор WebSocket-соединения: один аккаунт может зайти с нескольких устройств
     conn_id: Uuid,
     summary: SfuPeerSummary,
     tx: PeerSender,
+    /// Видеокадры в очереди этого соединения
+    video_backlog: Arc<AtomicUsize>,
 }
 
 struct NodeState {
@@ -238,13 +248,19 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<NodeToClientMsg>();
     let conn_id = Uuid::new_v4();
+    let video_backlog = Arc::new(AtomicUsize::new(0));
 
+    let send_backlog = video_backlog.clone();
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
+            let video = is_video_frame(&msg);
             if let Ok(json) = serde_json::to_string(&msg) {
                 if ws_sender.send(Message::Text(json.into())).await.is_err() {
                     break;
                 }
+            }
+            if video {
+                send_backlog.fetch_sub(1, Ordering::Relaxed);
             }
         }
     });
@@ -324,6 +340,7 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                                 conn_id,
                                 summary: peer_summary,
                                 tx: tx.clone(),
+                                video_backlog: video_backlog.clone(),
                             });
                         }
 
@@ -488,6 +505,7 @@ fn relay_to_room(
     if !room_peers.iter().any(|p| p.conn_id == from_conn_id) {
         return false;
     }
+    let video = is_video_frame(&msg);
     {
         for peer in room_peers.iter() {
             if peer.summary.user_id == from_peer_id {
@@ -497,6 +515,12 @@ fn relay_to_room(
                 if peer.summary.user_id != target {
                     continue;
                 }
+            }
+            if video {
+                if peer.video_backlog.load(Ordering::Relaxed) >= MAX_VIDEO_BACKLOG {
+                    continue;
+                }
+                peer.video_backlog.fetch_add(1, Ordering::Relaxed);
             }
             let _ = peer.tx.send(msg.clone());
         }
