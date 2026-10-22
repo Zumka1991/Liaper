@@ -92,7 +92,7 @@ import type {
   UserRole,
 } from './types/protocol';
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.2.0';
 const runtimeEnv = (import.meta as unknown as { env?: { VITE_CONTROL_URL?: string; DEV?: boolean } }).env;
 const DEFAULT_CONTROL_HTTP = (runtimeEnv?.VITE_CONTROL_URL ||
   ('__TAURI_INTERNALS__' in window ? 'http://127.0.0.1:4000'

@@ -1,7 +1,7 @@
 name: liaper_android
 description: Liaper Mobile (Android) — защищённые групповые звонки и чат для репетиторства с E2EE и автообновлением.
 publish_to: "none"
-version: 0.1.0+1
+version: 0.2.0+2
 
 environment:
   sdk: ">=3.4.0 <4.0.0"

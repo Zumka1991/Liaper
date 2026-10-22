@@ -1,0 +1,37 @@
+# Продакшен на общем VPS 191.215.45.93 за edge-Caddy (/opt/edge, сеть edge).
+# Кладётся рядом с docker-compose.yml в /opt/liaper; наружу порты не публикуются,
+# HTTPS и сертификаты — на edge (сайт deploy/edge/liaper.ru.caddy).
+services:
+  postgres:
+    ports: !reset []
+  liaper-control:
+    ports: !reset []
+  liaper-files:
+    ports: !reset []
+    networks:
+      default:
+      edge:
+        aliases: [liaper-files]
+  liaper-node-1:
+    ports: !reset []
+    networks:
+      default:
+      edge:
+        aliases: [liaper-node-1]
+  liaper-node-2:
+    ports: !reset []
+    networks:
+      default:
+      edge:
+        aliases: [liaper-node-2]
+  liaper-web:
+    ports: !reset []
+    networks:
+      default:
+      edge:
+        aliases: [liaper-web]
+
+networks:
+  default:
+  edge:
+    external: true

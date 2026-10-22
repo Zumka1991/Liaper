@@ -1161,7 +1161,8 @@ struct UpdateCheckQuery {
 }
 
 fn parse_platform(raw: &str) -> AppPlatform {
-    match raw.trim().to_lowercase().as_str() {
+    // Клиенты присылают и `android_arm64`, и `android-arm64`
+    match raw.trim().to_lowercase().replace('_', "-").as_str() {
         "windows" | "windows-x86_64" | "win64" => AppPlatform::WindowsX86_64,
         "linux" | "linux-x86_64" => AppPlatform::LinuxX86_64,
         "android" | "android-arm64" | "android-aarch64" => AppPlatform::AndroidArm64,
@@ -1215,7 +1216,10 @@ async fn publish_release_handler(
     State(state): State<Arc<ControlState>>,
     Json(req): Json<PublishReleaseRequest>,
 ) -> Result<Json<AppReleaseManifest>, (StatusCode, Json<serde_json::Value>)> {
-    if state.admin_secret.as_deref() != Some(req.admin_secret.as_str()) {
+    let secret_ok = state.admin_secret.as_deref().is_some_and(|s| {
+        !s.is_empty() && bool::from(subtle::ConstantTimeEq::ct_eq(s.as_bytes(), req.admin_secret.as_bytes()))
+    });
+    if !secret_ok {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "error": "Неверный секретный ключ администратора релизов" })),

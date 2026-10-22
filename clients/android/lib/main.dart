@@ -46,7 +46,7 @@ void main() {
   runApp(const LiaperMobileApp());
 }
 
-const String kCurrentAppVersion = '0.1.0';
+const String kCurrentAppVersion = '0.2.0';
 const String kPlatformAndroid = 'android_arm64';
 
 class LiaperMobileApp extends StatelessWidget {
