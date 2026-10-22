@@ -70,6 +70,7 @@ import { Modal } from './components/Modal';
 import { MessageMenu, type MessageMenuState } from './components/MessageMenu';
 import { Avatar } from './components/Avatar';
 import { LinkifiedText } from './components/LinkifiedText';
+import { checkDesktopUpdate, installDesktopUpdate, isDesktopApp, type DesktopUpdate } from './services/desktopUpdate';
 import { Landing } from './components/Landing';
 import { LogoMark } from './components/Logo';
 import { StorageUsage } from './components/StorageUsage';
@@ -94,7 +95,7 @@ import type {
   UserRole,
 } from './types/protocol';
 
-const APP_VERSION = '0.2.2';
+const APP_VERSION = '0.2.3';
 const runtimeEnv = (import.meta as unknown as { env?: { VITE_CONTROL_URL?: string; DEV?: boolean } }).env;
 const DEFAULT_CONTROL_HTTP = (runtimeEnv?.VITE_CONTROL_URL ||
   ('__TAURI_INTERNALS__' in window ? 'http://127.0.0.1:4000'
@@ -632,6 +633,40 @@ export function App() {
   const [releases, setReleases] = useState<AppReleaseManifest[]>([]);
   const [updateCheckResult, setUpdateCheckResult] = useState<UpdateCheckResponse | null>(null);
   const [selectedUpdatePlatform, setSelectedUpdatePlatform] = useState<AppPlatform>('windows_x86_64');
+  // Десктоп: обновление внутри приложения (скачать → установить → перезапустить)
+  const [desktopUpdate, setDesktopUpdate] = useState<DesktopUpdate | null>(null);
+  const [desktopUpdating, setDesktopUpdating] = useState(false);
+  const [desktopUpdateProgress, setDesktopUpdateProgress] = useState<number | null>(null);
+  // Плашку можно закрыть крестиком — до следующего запуска приложения
+  const [desktopUpdateDismissed, setDesktopUpdateDismissed] = useState(false);
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+    checkDesktopUpdate().then(setDesktopUpdate).catch(() => {});
+  }, []);
+  const startDesktopUpdate = async () => {
+    if (desktopUpdating) return;
+    setDesktopUpdating(true);
+    setDesktopUpdateProgress(null);
+    try {
+      const update = desktopUpdate ?? (await checkDesktopUpdate());
+      if (!update) {
+        setSystemBanner(`Установлена последняя версия (v${APP_VERSION})`);
+        setDesktopUpdating(false);
+        return;
+      }
+      await installDesktopUpdate(update, setDesktopUpdateProgress);
+    } catch {
+      setDesktopUpdating(false);
+      setSystemBanner('Не удалось установить обновление. Проверьте интернет и попробуйте ещё раз.');
+    }
+  };
+  const desktopUpdateLabel = desktopUpdating
+    ? desktopUpdateProgress === null
+      ? 'Загружаем обновление…'
+      : desktopUpdateProgress >= 1
+        ? 'Устанавливаем, приложение перезапустится…'
+        : `Загружаем обновление… ${Math.round(desktopUpdateProgress * 100)}%`
+    : null;
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -2354,6 +2389,19 @@ export function App() {
         <button type="button" onClick={() => setConnectionAttempt((n) => n + 1)}>Повторить</button>
         <button type="button" onClick={handleLogout}>Войти заново</button>
       </div>}
+      {desktopUpdate && (!desktopUpdateDismissed || desktopUpdating) && (
+        <div className="notification-banner" role="status">
+          <span>
+            {desktopUpdateLabel ?? `Доступна новая версия Liaper ${desktopUpdate.version}${desktopUpdate.body ? ` — ${desktopUpdate.body}` : ''}`}
+          </span>
+          {!desktopUpdating && (
+            <>
+              <button type="button" onClick={() => void startDesktopUpdate()}>Обновить и перезапустить</button>
+              <button type="button" aria-label="Скрыть уведомление об обновлении" onClick={() => setDesktopUpdateDismissed(true)}><X size={18} /></button>
+            </>
+          )}
+        </div>
+      )}
       {systemBanner && <div className="notification-banner" role="status"><span>{systemBanner}</span>
         <button type="button" aria-label="Закрыть уведомление" onClick={() => setSystemBanner(null)}><X size={18} /></button>
       </div>}
@@ -3875,15 +3923,27 @@ export function App() {
                       <p className="text-slate-600">
                         {updateCheckResult.latest.release_notes}
                       </p>
-                      <a
-                        href={updateCheckResult.latest.download_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-white hover:bg-emerald-500"
-                      >
-                        <Download className="h-3.5 w-3.5" />
-                        Скачать обновление
-                      </a>
+                      {isDesktopApp() && selectedUpdatePlatform !== 'android_arm64' ? (
+                        <button
+                          type="button"
+                          disabled={desktopUpdating}
+                          onClick={() => void startDesktopUpdate()}
+                          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-white hover:bg-emerald-500 disabled:opacity-70"
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                          {desktopUpdateLabel ?? 'Обновить и перезапустить'}
+                        </button>
+                      ) : (
+                        <a
+                          href={updateCheckResult.latest.download_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1.5 text-white hover:bg-emerald-500"
+                        >
+                          <Download className="h-3.5 w-3.5" />
+                          Скачать обновление
+                        </a>
+                      )}
                     </div>
                   ) : (
                     <div className="flex items-center gap-2 text-slate-600">

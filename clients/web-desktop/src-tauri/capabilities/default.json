@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Входящие звонки (уведомление, внимание к окну) и ссылки из чата во внешнем браузере",
+  "description": "Входящие звонки (уведомление, внимание к окну), ссылки из чата во внешнем браузере, обновление с перезапуском",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -11,6 +11,8 @@
     "core:window:allow-show",
     "core:window:allow-is-focused",
     "notification:default",
+    "updater:default",
+    "process:allow-restart",
     {
       "identifier": "opener:allow-open-url",
       "allow": [{ "url": "https://*" }, { "url": "http://*" }]
