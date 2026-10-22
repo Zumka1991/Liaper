@@ -155,3 +155,13 @@ CREATE TABLE IF NOT EXISTS app_releases (
     mandatory BOOLEAN NOT NULL DEFAULT FALSE,
     published_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- FCM-токены устройств для push о входящих звонках (токен переезжает к последнему вошедшему)
+CREATE TABLE IF NOT EXISTS push_tokens (
+    token TEXT PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    platform VARCHAR(32) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_push_tokens_user ON push_tokens (user_id);

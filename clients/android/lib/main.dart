@@ -312,12 +312,35 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     }
     final caller = call['caller'] as Map<String, dynamic>? ?? const {};
     final displayName = (caller['display_name'] ?? '').toString();
-    _mediaChannel.invokeMethod('startRinging', {
+    _mediaChannel.invokeMethod<String>('startRinging', {
+      'roomId': nextId,
       'callerName':
           displayName.isNotEmpty ? displayName : '@${caller['username'] ?? ''}',
       'roomTitle': (call['room']?['title'] ?? '').toString(),
       'withVideo': call['with_video'] == true,
+    }).then((pending) {
+      // В push-уведомлении уже нажали «Принять»/«Отклонить», пока приложение запускалось
+      if (pending == null || !mounted) return;
+      if (_incomingCall?['room']?['id']?.toString() != nextId) return;
+      if (pending == 'accept') _acceptIncomingCall();
+      if (pending == 'decline') _declineIncomingCall();
     }).catchError((_) => null);
+  }
+
+  // FCM-токен устройства: сервер будит им приложение при входящем звонке
+  String? _pushToken;
+
+  Future<void> _registerPushToken([String? token]) async {
+    token ??= await _mediaChannel
+        .invokeMethod<String>('getPushToken')
+        .catchError((_) => null);
+    if (token == null || token.isEmpty) return;
+    _pushToken = token;
+    if (!_wsConnected || _wsChannel == null) return;
+    _wsChannel!.sink.add(jsonEncode({
+      'type': 'register_push_token',
+      'payload': {'token': token, 'platform': 'android'},
+    }));
   }
   // Урок этого аккаунта, который сейчас идёт на другом устройстве
   Map<String, dynamic>? _otherDeviceCall;
@@ -595,13 +618,25 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           _sendAudioPcmToSfu(raw);
         }
       } else if (call.method == 'onCallNotificationAction') {
-        if (_incomingCall == null) return;
-        if (call.arguments == 'accept') {
+        final args = Map<String, dynamic>.from(call.arguments as Map);
+        // Звонок ещё не пришёл по WebSocket — native выполнит действие, когда придёт
+        if (_incomingCall?['room']?['id']?.toString() != args['roomId']) {
+          return false;
+        }
+        if (args['action'] == 'accept') {
           _acceptIncomingCall();
-        } else if (call.arguments == 'decline') {
+        } else if (args['action'] == 'decline') {
           _declineIncomingCall();
         }
+        return true;
+      } else if (call.method == 'onCallCancelledByPush') {
+        if (_incomingCall?['room']?['id']?.toString() == call.arguments) {
+          setState(() => _incomingCall = null);
+        }
+      } else if (call.method == 'onPushToken') {
+        _registerPushToken(call.arguments as String?);
       }
+      return null;
     });
     _initIdentityAndSession();
   }
@@ -2280,6 +2315,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               .invokeMethod('requestNotificationPermission')
               .catchError((_) => null);
         }
+        // После setState ниже соединение уже помечено живым
+        Future.microtask(_registerPushToken);
         setState(() {
           _wsConnected = true;
           _currentUser = payload?['self_profile'] as Map<String, dynamic>?;
@@ -2613,6 +2650,14 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         'Для синхронизации разблокируйте архив паролем аккаунта';
     _reconnectTimer?.cancel();
     _archiveSaveTimer?.cancel();
+    // Вышедший аккаунт не должен получать звонки на это устройство
+    final pushToken = _pushToken;
+    if (pushToken != null && _wsConnected && _wsChannel != null) {
+      _wsChannel!.sink.add(jsonEncode({
+        'type': 'unregister_push_token',
+        'payload': {'token': pushToken},
+      }));
+    }
     final revokedToken = _token;
     if (revokedToken != null) {
       // Отзываем сессию на сервере; выход не ждёт сети

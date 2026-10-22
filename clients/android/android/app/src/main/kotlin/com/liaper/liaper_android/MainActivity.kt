@@ -3,10 +3,7 @@ package com.liaper.liaper_android
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -63,12 +60,6 @@ class MainActivity : FlutterActivity() {
 
     // Рингтон, вибрация и уведомление о входящем звонке
     private val callAlert by lazy { IncomingCallAlert(this) }
-    private val declineReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            callAlert.stop()
-            methodChannel?.invokeMethod("onCallNotificationAction", "decline")
-        }
-    }
 
     companion object {
         private const val REQ_PERMISSIONS = 1001
@@ -87,12 +78,74 @@ class MainActivity : FlutterActivity() {
         callAlert.onForegroundChanged(false)
     }
 
+    override fun onCreate(savedInstanceState: android.os.Bundle?) {
+        super.onCreate(savedInstanceState)
+        CallRingState.activity = java.lang.ref.WeakReference(this)
+        handleCallIntent(intent)
+    }
+
     // Нажатия в уведомлении о звонке (activity singleTop — приходят сюда)
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        if (intent.action == IncomingCallAlert.ACTION_ACCEPT) {
+        handleCallIntent(intent)
+    }
+
+    private fun handleCallIntent(intent: Intent?) {
+        val roomId = intent?.getStringExtra(CallNotifications.EXTRA_ROOM_ID) ?: return
+        when (intent.action) {
+            CallNotifications.ACTION_ACCEPT -> {
+                callAlert.stop()
+                onCallActionFromNotification(roomId, "accept")
+            }
+            // Открыли по уведомлению: дальше звонит само приложение, когда звонок придёт по WebSocket
+            CallNotifications.ACTION_OPEN -> {
+                if (CallRingState.pushRoomId == roomId) CallNotifications.cancel(this)
+            }
+        }
+    }
+
+    /**
+     * Кнопка в уведомлении. Если приложение уже знает о звонке — выполняем сразу,
+     * иначе (только что запустилось по push) — когда звонок придёт по WebSocket.
+     */
+    fun onCallActionFromNotification(roomId: String, action: String) {
+        CallRingState.setPendingAction(roomId, action)
+        mainHandler.post {
+            methodChannel?.invokeMethod(
+                "onCallNotificationAction",
+                mapOf("roomId" to roomId, "action" to action),
+                object : MethodChannel.Result {
+                    override fun success(result: Any?) {
+                        if (result == true) CallRingState.clearPendingAction(roomId)
+                    }
+                    override fun error(code: String, msg: String?, details: Any?) {}
+                    override fun notImplemented() {}
+                }
+            )
+        }
+    }
+
+    fun onCallCancelledByPush(roomId: String) {
+        mainHandler.post {
             callAlert.stop()
-            methodChannel?.invokeMethod("onCallNotificationAction", "accept")
+            methodChannel?.invokeMethod("onCallCancelledByPush", roomId)
+        }
+    }
+
+    fun onPushTokenChanged(token: String) {
+        mainHandler.post { methodChannel?.invokeMethod("onPushToken", token) }
+    }
+
+    private fun fetchPushToken(result: MethodChannel.Result) {
+        try {
+            com.google.firebase.messaging.FirebaseMessaging.getInstance().token
+                .addOnCompleteListener { task ->
+                    val token = if (task.isSuccessful) task.result else LiaperMessagingService.savedToken(this)
+                    result.success(token)
+                }
+        } catch (_: Exception) {
+            // Нет Google Play Services — push недоступен, звонки только пока приложение открыто
+            result.success(null)
         }
     }
 
@@ -112,10 +165,6 @@ class MainActivity : FlutterActivity() {
 
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
         methodChannel = channel
-        ContextCompat.registerReceiver(
-            this, declineReceiver, IntentFilter(IncomingCallAlert.ACTION_DECLINE),
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
 
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -243,13 +292,22 @@ class MainActivity : FlutterActivity() {
                     }
                 }
                 "startRinging" -> {
-                    callAlert.start(
-                        call.argument<String>("callerName") ?: "",
-                        call.argument<String>("roomTitle") ?: "",
-                        call.argument<Boolean>("withVideo") ?: false
-                    )
-                    result.success(true)
+                    val roomId = call.argument<String>("roomId") ?: ""
+                    // Уже нажали «Принять»/«Отклонить» в push-уведомлении — звонить не нужно
+                    val pending = CallRingState.takePendingAction(roomId)
+                    if (pending != null) {
+                        CallNotifications.cancel(this)
+                    } else {
+                        callAlert.start(
+                            roomId,
+                            call.argument<String>("callerName") ?: "",
+                            call.argument<String>("roomTitle") ?: "",
+                            call.argument<Boolean>("withVideo") ?: false
+                        )
+                    }
+                    result.success(pending)
                 }
+                "getPushToken" -> fetchPushToken(result)
                 "stopRinging" -> {
                     callAlert.stop()
                     result.success(true)
@@ -700,10 +758,7 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         callAlert.stop()
-        try {
-            unregisterReceiver(declineReceiver)
-        } catch (_: Exception) {
-        }
+        if (CallRingState.activity?.get() === this) CallRingState.activity = null
         stopNoteAudioCapture(cancel = true)
         stopWavPlayer()
         stopAudioEngine()

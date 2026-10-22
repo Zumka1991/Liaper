@@ -5,13 +5,13 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use liaper_common::{
     ClientToControlMsg, ControlToClientMsg, EncryptedChatMessage, RoomInfo, RoomParticipantState,
-    UserRole,
+    UserPublicProfile, UserRole,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::state::{ControlState, StoredContactRequest};
+use crate::state::{ControlState, PendingCall, StoredContactRequest, PENDING_CALL_TTL};
 
 pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, user_id: Uuid) {
     let conn_id = Uuid::new_v4();
@@ -57,6 +57,25 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
             room_id: room.id,
             room: Some(room),
         });
+    }
+    // Звонок, на который ещё не ответили: устройство могло проснуться от push именно ради него
+    state.pending_calls.retain(|_, call| call.started.elapsed() < PENDING_CALL_TTL);
+    let pending: Vec<(Uuid, PendingCall)> = state
+        .pending_calls
+        .iter()
+        .filter(|e| e.key().1 == user_id)
+        .map(|e| (e.key().0, e.value().clone()))
+        .collect();
+    for (room_id, call) in pending {
+        if let Some(room) = state.rooms.get(&room_id) {
+            if !room.participants.iter().any(|p| p.user_id == user_id) {
+                let _ = tx.send(ControlToClientMsg::IncomingCall {
+                    room: room.clone(),
+                    caller: call.caller,
+                    with_video: call.with_video,
+                });
+            }
+        }
     }
 
     // Доставляем сохранённые конверты E2EE-ключей перед историей сообщений
@@ -481,14 +500,7 @@ async fn process_client_command_on(
                             .entry(room_id)
                             .or_default()
                             .insert(*target_id);
-                        state.send_to_user(
-                            &target_id,
-                            &ControlToClientMsg::IncomingCall {
-                                room: room.clone(),
-                                caller: caller.to_public(true),
-                                with_video: false,
-                            },
-                        );
+                        ring_user(state, *target_id, &room, caller.to_public(true), false);
                     }
                 }
             }
@@ -602,14 +614,7 @@ async fn process_client_command_on(
             state.set_call_device(caller.id, room_id, conn_id);
             state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room: room.clone() });
 
-            state.send_to_user(
-                &target_id,
-                &ControlToClientMsg::IncomingCall {
-                    room,
-                    caller: caller.to_public(true),
-                    with_video,
-                },
-            );
+            ring_user(state, target_id, &room, caller.to_public(true), with_video);
         }
 
         ClientToControlMsg::InviteByNick {
@@ -655,14 +660,8 @@ async fn process_client_command_on(
                     .entry(room_id)
                     .or_default()
                     .insert(target_id);
-                state.send_to_user(
-                    &target_id,
-                    &ControlToClientMsg::IncomingCall {
-                        room: room.clone(),
-                        caller: caller.to_public(true),
-                        with_video: false,
-                    },
-                );
+                let room = room.clone();
+                ring_user(state, target_id, &room, caller.to_public(true), false);
             }
         }
 
@@ -717,6 +716,7 @@ async fn process_client_command_on(
             if let Some(room) = updated_room {
                 // Звонок переходит на это устройство; прежнее получит CallOnOtherDevice и отключится
                 state.set_call_device(caller.id, room_id, conn_id);
+                end_pending_call(state, room_id, caller.id);
                 state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room });
 
                 if let Some(envelopes) = state.room_key_envelopes.get(&(room_id, caller.id)) {
@@ -757,6 +757,7 @@ async fn process_client_command_on(
             } else {
                 return;
             }
+            end_pending_call(state, room_id, caller.id);
             state.send_to_user(
                 &caller.id,
                 &ControlToClientMsg::CallOnOtherDevice { room_id, room: None },
@@ -772,6 +773,25 @@ async fn process_client_command_on(
                         },
                     );
                 }
+            }
+        }
+
+        ClientToControlMsg::RegisterPushToken { token, platform } => {
+            let token = token.trim();
+            if token.is_empty() || token.len() > 4096 || platform != "android" {
+                return;
+            }
+            state.register_push_token(caller.id, token, &platform).await;
+        }
+
+        ClientToControlMsg::UnregisterPushToken { token } => {
+            let token = token.trim();
+            let owned = state
+                .push_tokens
+                .get(&caller.id)
+                .is_some_and(|t| t.contains(token));
+            if owned {
+                state.remove_push_token(token).await;
             }
         }
 
@@ -1224,6 +1244,45 @@ async fn process_client_command_on(
     }
 }
 
+/// Входящий звонок: по WebSocket на живые устройства и push на Android (вдруг приложение спит)
+fn ring_user(
+    state: &Arc<ControlState>,
+    target_id: Uuid,
+    room: &RoomInfo,
+    caller: UserPublicProfile,
+    with_video: bool,
+) {
+    state.pending_calls.insert(
+        (room.id, target_id),
+        PendingCall {
+            caller: caller.clone(),
+            with_video,
+            started: std::time::Instant::now(),
+        },
+    );
+    let caller_name = if caller.display_name.trim().is_empty() {
+        format!("@{}", caller.username)
+    } else {
+        caller.display_name.clone()
+    };
+    crate::push::notify_incoming_call(state, target_id, room.id, &room.title, &caller_name, with_video);
+    state.send_to_user(
+        &target_id,
+        &ControlToClientMsg::IncomingCall {
+            room: room.clone(),
+            caller,
+            with_video,
+        },
+    );
+}
+
+/// Адресат ответил (или звонок отменён) — гасим звонящее push-уведомление на его устройствах
+fn end_pending_call(state: &Arc<ControlState>, room_id: Uuid, user_id: Uuid) {
+    if state.pending_calls.remove(&(room_id, user_id)).is_some() {
+        crate::push::notify_call_cancelled(state, user_id, room_id);
+    }
+}
+
 fn remove_user_from_room(state: &Arc<ControlState>, room_id: Uuid, user_id: Uuid) {
     let mut updated_room = None;
     let mut should_remove_room = false;
@@ -1244,6 +1303,17 @@ fn remove_user_from_room(state: &Arc<ControlState>, room_id: Uuid, user_id: Uuid
     if should_remove_room {
         state.rooms.remove(&room_id);
         state.room_invitations.remove(&room_id);
+        // Звонящий сбросил, пока адресат не ответил: у адресата звонок должен прекратиться
+        let unanswered: Vec<Uuid> = state
+            .pending_calls
+            .iter()
+            .filter(|e| e.key().0 == room_id)
+            .map(|e| e.key().1)
+            .collect();
+        for invitee in unanswered {
+            end_pending_call(state, room_id, invitee);
+            state.send_to_user(&invitee, &ControlToClientMsg::CallOnOtherDevice { room_id, room: None });
+        }
     } else if let Some(room) = updated_room {
         state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room });
     }
@@ -1588,6 +1658,71 @@ mod contact_tests {
         assert!(!state.rooms.get(&room_id).unwrap().participants.iter().any(|p| p.user_id == student));
         assert!(drain(&mut phone_rx).iter().any(|m| matches!(m, ControlToClientMsg::CallOnOtherDevice { room: None, .. })));
         assert!(state.call_devices.get(&student).is_none());
+    }
+
+    #[tokio::test]
+    async fn unanswered_call_is_remembered_and_cancelled_when_caller_hangs_up() {
+        let root = std::env::temp_dir().join(format!("liaper-pending-test-{}", Uuid::new_v4()));
+        let state = ControlState::new(root.join("users.json"));
+        let add = |role| {
+            let id = Uuid::new_v4();
+            let username = id.simple().to_string();
+            state.users_by_id.insert(
+                id,
+                StoredUser {
+                    id,
+                    username: username.clone(),
+                    display_name: "Test".into(),
+                    password_hash: "hash".into(),
+                    salt_b64: "salt".into(),
+                    role,
+                    e2ee_public_key: "key".into(),
+                    key_fingerprint: "fp".into(),
+                },
+            );
+            state.user_id_by_username.insert(username, id);
+            id
+        };
+        let tutor = add(UserRole::Tutor);
+        let student = add(UserRole::Student);
+        state.add_mutual_contact(tutor, student);
+        let (tutor_conn, student_conn) = (Uuid::new_v4(), Uuid::new_v4());
+        let (tx, mut student_rx) = mpsc::unbounded_channel();
+        state.sessions.entry(student).or_default().push((student_conn, tx));
+        let call = || ClientToControlMsg::CallByNick { target_username: student.simple().to_string(), with_video: false };
+
+        // Отклонённый звонок забывается
+        process_client_command_on(&state, tutor, tutor_conn, call()).await;
+        let first_room = state.rooms.iter().next().unwrap().id;
+        assert!(state.pending_calls.contains_key(&(first_room, student)));
+        process_client_command_on(&state, student, student_conn, ClientToControlMsg::DeclineCall { room_id: first_room, reason: None }).await;
+        assert!(!state.pending_calls.contains_key(&(first_room, student)));
+        process_client_command_on(&state, tutor, tutor_conn, ClientToControlMsg::LeaveRoom { room_id: first_room }).await;
+
+        // Звонящий сбросил до ответа — у адресата звонок гаснет
+        process_client_command_on(&state, tutor, tutor_conn, call()).await;
+        let room_id = state.rooms.iter().next().unwrap().id;
+        assert!(state.pending_calls.contains_key(&(room_id, student)));
+        while student_rx.try_recv().is_ok() {}
+        process_client_command_on(&state, tutor, tutor_conn, ClientToControlMsg::LeaveRoom { room_id }).await;
+        assert!(state.pending_calls.is_empty());
+        let mut cancelled = false;
+        while let Ok(m) = student_rx.try_recv() {
+            cancelled |= matches!(m, ControlToClientMsg::CallOnOtherDevice { room_id: r, room: None } if r == room_id);
+        }
+        assert!(cancelled);
+
+        // Токен push переезжает к аккаунту, который вошёл на устройстве последним
+        let register = |token: &str| ClientToControlMsg::RegisterPushToken { token: token.into(), platform: "android".into() };
+        process_client_command_on(&state, student, student_conn, register("device-1")).await;
+        process_client_command_on(&state, tutor, tutor_conn, register("device-1")).await;
+        assert!(!state.push_tokens.get(&student).unwrap().contains("device-1"));
+        assert!(state.push_tokens.get(&tutor).unwrap().contains("device-1"));
+        // Чужой токен удалить нельзя
+        process_client_command_on(&state, student, student_conn, ClientToControlMsg::UnregisterPushToken { token: "device-1".into() }).await;
+        assert!(state.push_tokens.get(&tutor).unwrap().contains("device-1"));
+        process_client_command_on(&state, tutor, tutor_conn, ClientToControlMsg::UnregisterPushToken { token: "device-1".into() }).await;
+        assert!(!state.push_tokens.get(&tutor).unwrap().contains("device-1"));
     }
 
     #[tokio::test]

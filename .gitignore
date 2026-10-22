@@ -23,6 +23,8 @@ clients/android/android/.kotlin/
 /data/postgres/
 /data/*.postgres-imported
 .env
+# Ключ сервисного аккаунта Firebase (FCM) и прочие секреты-файлы
+/secrets/
 .env.local
 /releases/*.apk
 /releases/*.exe

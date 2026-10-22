@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "415257623182",
+    "project_id": "liaper-772f7",
+    "storage_bucket": "liaper-772f7.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:415257623182:android:02a3d18321f64b8542e7df",
+        "android_client_info": {
+          "package_name": "com.liaper.liaper_android"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB2Eq-0U4yYkfdNZ9Iqd82xsmH3uKeOdwE"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -118,6 +118,18 @@ pub struct AdminMasterCredentials {
 
 pub type ClientSender = mpsc::UnboundedSender<ControlToClientMsg>;
 
+/// Звонок, который адресат ещё не принял и не отклонил: его повторяем при переподключении
+/// (приложение, открытое по push, иначе не узнает о звонке)
+#[derive(Debug, Clone)]
+pub struct PendingCall {
+    pub caller: UserPublicProfile,
+    pub with_video: bool,
+    pub started: std::time::Instant,
+}
+
+/// Сколько звонок «висит» у адресата, прежде чем считается пропущенным
+pub const PENDING_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+
 pub struct ControlState {
     pub users_by_id: DashMap<Uuid, StoredUser>,
     pub user_id_by_username: DashMap<String, Uuid>,
@@ -149,6 +161,11 @@ pub struct ControlState {
     pub pow: crate::pow::PowGuard,
     pub pg_client: tokio::sync::RwLock<Option<Arc<tokio_postgres::Client>>>,
     pub contact_mutations: tokio::sync::Mutex<()>,
+    /// (room, user) → ещё не отвеченный входящий звонок
+    pub pending_calls: DashMap<(Uuid, Uuid), PendingCall>,
+    /// user → FCM-токены его Android-устройств
+    pub push_tokens: DashMap<Uuid, HashSet<String>>,
+    pub fcm: Option<Arc<crate::push::FcmClient>>,
 }
 
 impl ControlState {
@@ -204,6 +221,9 @@ impl ControlState {
             pow: crate::pow::PowGuard::new(),
             pg_client: tokio::sync::RwLock::new(None),
             contact_mutations: tokio::sync::Mutex::new(()),
+            pending_calls: DashMap::new(),
+            push_tokens: DashMap::new(),
+            fcm: crate::push::FcmClient::from_env(),
         });
         state.load_users_from_disk();
         state.load_contacts_from_disk();
@@ -358,6 +378,22 @@ impl ControlState {
             let uid: Uuid = row.get(1);
             self.tokens.insert(token, uid);
         }
+        // Токены, которые давно не обновлялись, скорее всего принадлежат удалённым приложениям
+        let _ = client
+            .execute(
+                "DELETE FROM push_tokens WHERE updated_at < NOW() - INTERVAL '90 days'",
+                &[],
+            )
+            .await;
+        self.push_tokens.clear();
+        for row in client
+            .query("SELECT token,user_id FROM push_tokens", &[])
+            .await?
+        {
+            let token: String = row.get(0);
+            let uid: Uuid = row.get(1);
+            self.push_tokens.entry(uid).or_default().insert(token);
+        }
         if let Some(parent) = migration_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -491,6 +527,35 @@ impl ControlState {
                     "INSERT INTO user_sessions (token,user_id) VALUES ($1,$2) ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id",
                     &[&token, &user_id],
                 )
+                .await;
+        }
+    }
+
+    pub async fn register_push_token(&self, user_id: Uuid, token: &str, platform: &str) {
+        // Токен принадлежит устройству: после входа другим аккаунтом он переезжает
+        for mut entry in self.push_tokens.iter_mut() {
+            if *entry.key() != user_id {
+                entry.value_mut().remove(token);
+            }
+        }
+        self.push_tokens.entry(user_id).or_default().insert(token.to_string());
+        if let Some(client) = self.pg_client.read().await.clone() {
+            let _ = client
+                .execute(
+                    "INSERT INTO push_tokens (token,user_id,platform) VALUES ($1,$2,$3) ON CONFLICT (token) DO UPDATE SET user_id=EXCLUDED.user_id,platform=EXCLUDED.platform,updated_at=NOW()",
+                    &[&token, &user_id, &platform],
+                )
+                .await;
+        }
+    }
+
+    pub async fn remove_push_token(&self, token: &str) {
+        for mut entry in self.push_tokens.iter_mut() {
+            entry.value_mut().remove(token);
+        }
+        if let Some(client) = self.pg_client.read().await.clone() {
+            let _ = client
+                .execute("DELETE FROM push_tokens WHERE token=$1", &[&token])
                 .await;
         }
     }

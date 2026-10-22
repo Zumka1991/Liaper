@@ -4,6 +4,7 @@ mod attachments;
 #[cfg(test)]
 mod persistence_tests;
 mod pow;
+mod push;
 mod state;
 mod ws;
 

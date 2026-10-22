@@ -3,6 +3,8 @@ import java.util.Properties
 plugins {
     id("com.android.application")
     id("dev.flutter.flutter-gradle-plugin")
+    // Push о входящих звонках (FCM); конфиг проекта — app/google-services.json
+    id("com.google.gms.google-services")
 }
 
 // Ключ подписи релиза: android/key.properties (не коммитится), см. README
@@ -60,4 +62,9 @@ kotlin {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation(platform("com.google.firebase:firebase-bom:34.4.0"))
+    implementation("com.google.firebase:firebase-messaging")
 }

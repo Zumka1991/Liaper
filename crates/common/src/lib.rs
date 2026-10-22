@@ -248,6 +248,15 @@ pub enum ClientToControlMsg {
         room_id: Uuid,
         reason: Option<String>,
     },
+    /// Сохранить FCM-токен устройства для push о входящих звонках
+    RegisterPushToken {
+        token: String,
+        platform: String,
+    },
+    /// Забыть FCM-токен (выход из аккаунта на устройстве)
+    UnregisterPushToken {
+        token: String,
+    },
     /// Покинуть текущий звонок
     LeaveRoom {
         room_id: Uuid,

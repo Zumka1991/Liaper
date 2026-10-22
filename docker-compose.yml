@@ -53,11 +53,14 @@ services:
       FILE_NODE_PUBLIC_URL: "${FILE_NODE_PUBLIC_URL:-http://127.0.0.1:4201}"
       DATABASE_URL: "postgres://${POSTGRES_USER:-liaper}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-liaper}"
       RUST_LOG: "liaper_control=info,tower_http=warn"
+      # Ключ сервисного аккаунта Firebase для push о звонках; без файла push выключен
+      FCM_SERVICE_ACCOUNT_FILE: "${FCM_SERVICE_ACCOUNT_FILE:-/app/secrets/fcm-service-account.json}"
     ports:
       - "127.0.0.1:4000:4000"
     volumes:
       - ./data:/app/data
       - ./releases:/app/releases
+      - ./secrets:/app/secrets:ro
 
   liaper-files:
     <<: *backend
