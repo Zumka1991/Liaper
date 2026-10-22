@@ -2,9 +2,11 @@
 # docker build -f deploy/linux-build/Dockerfile -t liaper-linux-build . && docker run --rm \
 #   -e TAURI_SIGNING_PRIVATE_KEY -e TAURI_SIGNING_PRIVATE_KEY_PASSWORD -v "$PWD/out:/out" liaper-linux-build
 FROM rust:1.95-bookworm
+# Плагины GStreamer кладутся в AppImage (bundleMediaFramework): без них WebKit не играет звук и не берёт микрофон
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
       libssl-dev patchelf file xdg-utils curl ca-certificates \
+      gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-pipewire \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*

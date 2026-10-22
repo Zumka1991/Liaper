@@ -48,7 +48,7 @@ void main() {
   runApp(const LiaperMobileApp());
 }
 
-const String kCurrentAppVersion = '0.2.2';
+const String kCurrentAppVersion = '0.2.4';
 const String kPlatformAndroid = 'android_arm64';
 
 class LiaperMobileApp extends StatelessWidget {
@@ -290,7 +290,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
   String _publicKeyB64 = '';
   String _fingerprint = '';
   final Map<String, RoomKeyring> _roomKeyrings = {};
+  // Каким ключам устройств уже отправлен конверт: «комната|ключ|получатель|ключ устройства».
+  // Хранится между запусками, чтобы перерассылка при каждом входе не плодила конверты на сервере
   final Set<String> _deliveredEnvelopeCache = {};
+  static const _sentEnvelopesPrefsKey = 'liaper_e2ee_sent_envelopes_v1';
+  static const _maxSentEnvelopeMarks = 5000;
   List<String> _prevRoomParticipantIds = [];
 
   // Навигация
@@ -829,7 +833,18 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
   List<Map<String, dynamic>> _getRoomRecipients(String roomId) {
     final myId = _currentUser?['id']?.toString();
     if (myId == null) return [];
-    final recipients = <Map<String, dynamic>>[];
+    // Свои же другие устройства (десктоп, браузер) тоже должны получить ключ
+    final selfKeys = <String>{
+      ...extractX25519PublicKeys(_currentUser?['e2ee_public_key']?.toString()),
+      if (_publicKeyB64.isNotEmpty) _publicKeyB64,
+    };
+    final recipients = <Map<String, dynamic>>[
+      {
+        'id': myId,
+        'username': _currentUser?['username'],
+        'e2ee_public_key': selfKeys.join(','),
+      },
+    ];
 
     if (_currentRoom != null && _currentRoom!['id']?.toString() == roomId) {
       final participants =
@@ -934,10 +949,17 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
       final rId = (r['id'] ?? '').toString();
       final rUsername = (r['username'] ?? '').toString();
       final rPubField = r['e2ee_public_key']?.toString();
-      final cacheKey = '$roomId:${bundle.roomKeyId}:$rId:${rPubField ?? ''}';
-      if (!forceResend && _deliveredEnvelopeCache.contains(cacheKey)) {
-        continue;
-      }
+      // Конверт нужен только тем устройствам получателя, которым этот ключ ещё не отправляли
+      final pending = extractX25519PublicKeys(rPubField)
+          .where((pk) =>
+              forceResend ||
+              !_deliveredEnvelopeCache
+                  .contains('$roomId|${bundle.roomKeyId}|$rId|$pk'))
+          .toList();
+      if (pending.isEmpty) continue;
+      final marks =
+          pending.map((pk) => '$roomId|${bundle.roomKeyId}|$rId|$pk').toList();
+      _deliveredEnvelopeCache.addAll(marks);
       final envelopes = await AndroidE2eeService.createKeyEnvelopesForUser(
         roomId: roomId,
         senderId: senderId,
@@ -945,23 +967,40 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
         myIdentity: _myIdentity!,
         recipientId: rId,
         recipientUsername: rUsername,
-        recipientPublicKeysField: rPubField,
+        recipientPublicKeysField: pending.join(','),
         roomKeyBundle: bundle,
       );
-      if (envelopes.isNotEmpty) {
-        bool allSent = true;
-        for (final env in envelopes) {
-          if (!_sendWs({
-            'type': 'send_key_envelope',
-            'payload': {'envelope': env},
-          })) {
-            allSent = false;
-          }
-        }
-        if (allSent) {
-          _deliveredEnvelopeCache.add(cacheKey);
+      for (final env in envelopes) {
+        if (!_sendWs({
+          'type': 'send_key_envelope',
+          'payload': {'envelope': env},
+        })) {
+          _deliveredEnvelopeCache.removeAll(marks);
+          break;
         }
       }
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final allMarks = _deliveredEnvelopeCache.toList();
+    // Самые старые отметки отбрасываем: в худшем случае конверт уйдёт повторно
+    await prefs.setStringList(
+        _sentEnvelopesPrefsKey,
+        allMarks.length > _maxSentEnvelopeMarks
+            ? allMarks.sublist(allMarks.length - _maxSentEnvelopeMarks)
+            : allMarks);
+  }
+
+  /// Отправляет ключи личных диалогов всем устройствам — своим и собеседников, — которые их ещё не получили.
+  /// Без этого новое устройство не может прочитать старую переписку.
+  void _redistributeDirectKeys() {
+    final myId = _currentUser?['id']?.toString();
+    if (myId == null) return;
+    for (final raw in _contacts) {
+      final cId = (raw as Map<String, dynamic>)['id']?.toString();
+      if (cId == null) continue;
+      final dmId = _computeDmRoomId(myId, cId);
+      final ring = _roomKeyrings[dmId];
+      if (ring != null) _distributeRoomKeyToRecipients(dmId, ring.activeKey);
     }
   }
 
@@ -2326,6 +2365,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
       _roomKeyrings
         ..clear()
         ..addAll(savedKeyrings);
+      _deliveredEnvelopeCache
+        ..clear()
+        ..addAll(prefs.getStringList(_sentEnvelopesPrefsKey) ?? const []);
       _identityReady = true;
       _token = savedUser == null ? null : prefs.getString('liaper_token');
       _currentUser = savedUser;
@@ -2431,6 +2473,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
             },
           });
         }
+        _redistributeDirectKeys();
         _syncArchives();
         break;
 
@@ -2442,10 +2485,26 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
           _outgoingRequests =
               (payload?['outgoing_requests'] as List<dynamic>?) ?? [];
         });
-        final activeId = _activeChatRoomId;
-        if (activeId != null && _roomKeyrings.containsKey(activeId)) {
-          _distributeRoomKeyToRecipients(
-              activeId, _roomKeyrings[activeId]!.activeKey);
+        // У контакта могло появиться новое устройство: отправляем ему ключи всех наших диалогов
+        _redistributeDirectKeys();
+        break;
+
+      case 'directory_updated':
+        {
+          // Новое устройство своего же аккаунта видно только здесь: contacts_updated не несёт свой профиль
+          final myId = _currentUser?['id']?.toString();
+          final users = (payload?['users'] as List<dynamic>?) ?? [];
+          final fresh = users.whereType<Map<String, dynamic>>().where(
+              (u) => myId != null && u['id']?.toString() == myId);
+          if (fresh.isNotEmpty &&
+              fresh.first['e2ee_public_key'] !=
+                  _currentUser?['e2ee_public_key']) {
+            setState(() => _currentUser = {
+                  ..._currentUser!,
+                  'e2ee_public_key': fresh.first['e2ee_public_key'],
+                });
+            _redistributeDirectKeys();
+          }
         }
         break;
 

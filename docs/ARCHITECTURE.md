@@ -103,6 +103,7 @@ flowchart LR
 - У каждого устройства своя пара ключей **X25519**. Публичные ключи хранятся в профиле, у аккаунта до 8 ключей.
 - У комнаты или личного диалога свой случайный ключ **AES-256-GCM**. Клиент упаковывает его для каждого X25519-ключа каждого участника. Ключ обёртки — SHA-256 от общего секрета и метки `liaper-x25519-wrap-v1`. Готовые конверты передаются через `send_key_envelope` и хранятся в `e2ee_key_envelopes`.
 - Когда участник уходит из комнаты, ключ ротируется.
+- Ключи личных диалогов перерассылаются при каждом входе, при обновлении контактов и при появлении нового устройства своего аккаунта (`directory_updated`) — всем устройствам, своим и собеседника, у которых их ещё нет. Какому ключу устройства какой конверт уже отправлен, клиент помнит между запусками (`liaper_e2ee_sent_envelopes_v1`), чтобы не плодить конверты на сервере.
 - Сообщение шифруется ключом комнаты на устройстве. Сервер хранит в `chat_messages` только шифротекст, IV и id ключа. Внутри шифротекста — текст, данные пересылки и описание вложения с ключом файла.
 - Ссылки в сообщениях кликабельны (`http`, `https`, `www.`) и открываются во внешнем браузере. Превью не загружаются, чтобы сайт не узнал о прочтении.
 
@@ -139,7 +140,7 @@ flowchart LR
 
 Реестр — `data/releases.json` на сервере, публикация — `POST /api/releases/publish` с `LIAPER_ADMIN_SECRET`. Файлы лежат в `releases/` и раздаются по `/releases/…`.
 
-- **Desktop:** Tauri updater, `GET /api/releases/tauri/:target/:arch/:current_version`. Сборки подписываются ключом Ed25519 (minisign), публичный ключ — в `tauri.conf.json`. Windows собирается локально (`npx tauri build`), Linux — в контейнере `deploy/linux-build/Dockerfile`.
+- **Desktop:** Tauri updater, `GET /api/releases/tauri/:target/:arch/:current_version`. Сборки подписываются ключом Ed25519 (minisign), публичный ключ — в `tauri.conf.json`. Windows собирается локально (`npx tauri build`), Linux — в контейнере `deploy/linux-build/Dockerfile`; AppImage несёт свои плагины GStreamer (`bundleMediaFramework`), без них WebKitGTK не играет звук и не берёт микрофон.
 - **Android:** `GET /api/releases/check?platform=android_arm64&version=…`, проверка SHA-256, установка поверх. Release-APK подписывается ключом из `android/key.properties`, адрес сервера задаётся при сборке: `--dart-define=LIAPER_SERVER_URL=https://liaper.ru`.
 - Версия задаётся в нескольких местах, при выпуске надо поднять все:
   - `pubspec.yaml` и `kCurrentAppVersion` в `lib/main.dart` (Android);

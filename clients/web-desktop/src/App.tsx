@@ -46,6 +46,7 @@ import {
   createEncryptedKeyEnvelopesForUser,
   decryptChatMessageWithKeyring,
   encryptChatText,
+  extractX25519PublicKeys,
   generateRoomKey,
   getOrCreateIdentityKeys,
   loadSavedRoomKeyrings,
@@ -95,7 +96,7 @@ import type {
   UserRole,
 } from './types/protocol';
 
-const APP_VERSION = '0.2.3';
+const APP_VERSION = '0.2.4';
 const runtimeEnv = (import.meta as unknown as { env?: { VITE_CONTROL_URL?: string; DEV?: boolean } }).env;
 const DEFAULT_CONTROL_HTTP = (runtimeEnv?.VITE_CONTROL_URL ||
   ('__TAURI_INTERNALS__' in window ? 'http://127.0.0.1:4000'
@@ -126,6 +127,27 @@ function computeDmRoomId(u1: string, u2: string): string {
   const s2 = u2.toLowerCase();
   const [first, second] = s1 <= s2 ? [s1, s2] : [s2, s1];
   return `${first.slice(0, 18)}${second.slice(18, 36)}`;
+}
+
+const SENT_ENVELOPES_STORAGE = 'liaper_e2ee_sent_envelopes_v1';
+const MAX_SENT_ENVELOPE_MARKS = 5000;
+
+function loadSentEnvelopeMarks(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SENT_ENVELOPES_STORAGE);
+    return new Set(raw ? (JSON.parse(raw) as string[]) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSentEnvelopeMarks(marks: Set<string>): void {
+  try {
+    // Самые старые отметки отбрасываем: в худшем случае конверт уйдёт повторно
+    localStorage.setItem(SENT_ENVELOPES_STORAGE, JSON.stringify([...marks].slice(-MAX_SENT_ENVELOPE_MARKS)));
+  } catch {
+    // Хранилище переполнено — отметки останутся только в памяти
+  }
 }
 
 const VideoTile: React.FC<{
@@ -398,7 +420,9 @@ export function App() {
   // Ключи комнат (случайные 256-битные AES-GCM ключи с обменом через X25519 конверты)
   const roomKeyringsRef = useRef<Map<string, RoomKeyring>>(new Map());
   const [keyringVersion, setKeyringVersion] = useState(0);
-  const sentEnvelopesRef = useRef<Set<string>>(new Set());
+  // Каким ключам устройств уже отправлен конверт: «комната|ключ|получатель|ключ устройства».
+  // Хранится между запусками, чтобы перерассылка при каждом входе не плодила конверты на сервере
+  const sentEnvelopesRef = useRef<Set<string>>(loadSentEnvelopeMarks());
   const contactsRef = useRef<UserPublicProfile[]>([]);
   const identityKeysRef = useRef<IdentityCryptoBundle | null>(null);
   const [outgoingTransfers, setOutgoingTransfers] = useState<OutgoingAttachmentTransfer[]>([]);
@@ -996,6 +1020,13 @@ export function App() {
       }
 
       for (const rec of recipients) {
+        // Конверт нужен только тем устройствам получателя, которым этот ключ ещё не отправляли
+        const pending = extractX25519PublicKeys(rec.pubKeysField).filter(
+          (pk) => !sentEnvelopesRef.current.has(`${roomId}|${activeKey.roomKeyId}|${rec.id}|${pk}`)
+        );
+        if (pending.length === 0) continue;
+        const marks = pending.map((pk) => `${roomId}|${activeKey.roomKeyId}|${rec.id}|${pk}`);
+        marks.forEach((m) => sentEnvelopesRef.current.add(m));
         const envelopes = await createEncryptedKeyEnvelopesForUser({
           roomId,
           senderId: me.id,
@@ -1004,29 +1035,35 @@ export function App() {
           myPrivateKey: idKeys.privateKey,
           recipientId: rec.id,
           recipientUsername: rec.username,
-          recipientPublicKeysField: rec.pubKeysField,
+          recipientPublicKeysField: pending.join(','),
           roomKeyBundle: activeKey,
         });
-        for (const envelope of envelopes) {
-          const dedupKey = `${roomId}:${activeKey.roomKeyId}:${rec.id}:${envelope.encrypted_room_key_b64.slice(0, 16)}`;
-          // Check by recipient + pubkey implicitly via roomId + roomKeyId + recipientId + senderPublicKey
-          const pubCacheKey = `${roomId}:${activeKey.roomKeyId}:${rec.id}:${rec.pubKeysField}`;
-          if (!sentEnvelopesRef.current.has(pubCacheKey) || forceRotate) {
-            controlWsRef.current.send(
-              JSON.stringify({
-                type: 'send_key_envelope',
-                payload: { envelope },
-              } satisfies ClientToControlMsg)
-            );
-          }
-          void dedupKey;
+        const ws = controlWsRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          marks.forEach((m) => sentEnvelopesRef.current.delete(m));
+          continue;
         }
-        const pubCacheKey = `${roomId}:${activeKey.roomKeyId}:${rec.id}:${rec.pubKeysField}`;
-        sentEnvelopesRef.current.add(pubCacheKey);
+        for (const envelope of envelopes) {
+          ws.send(JSON.stringify({ type: 'send_key_envelope', payload: { envelope } } satisfies ClientToControlMsg));
+        }
       }
+      saveSentEnvelopeMarks(sentEnvelopesRef.current);
     }
 
     return activeKey;
+  };
+
+  /**
+   * Отправляет ключи личных диалогов всем устройствам — своим и собеседников, — которые их ещё не получили.
+   * Без этого новое устройство не может прочитать старую переписку, пока собеседник случайно не окажется онлайн.
+   */
+  const redistributeDirectKeys = () => {
+    const me = currentUserRef.current;
+    if (!me) return;
+    for (const c of contactsRef.current) {
+      const dmId = computeDmRoomId(me.id, c.id);
+      if (roomKeyringsRef.current.has(dmId)) void ensureAndDistributeRoomKey(dmId, false);
+    }
   };
 
   const connectToAssignedMediaNode = async (
@@ -1145,6 +1182,13 @@ export function App() {
             } satisfies ClientToControlMsg)
           );
         }
+        // После выхода и повторного входа связка в памяти пуста, а ключи остались в хранилище
+        const saved = await loadSavedRoomKeyrings().catch(() => ({} as Record<string, RoomKeyring>));
+        for (const [roomId, keyring] of Object.entries(saved)) {
+          if (!roomKeyringsRef.current.has(roomId)) roomKeyringsRef.current.set(roomId, keyring);
+        }
+        setKeyringVersion((v) => v + 1);
+        redistributeDirectKeys();
         break;
       }
 
@@ -1154,15 +1198,20 @@ export function App() {
         setIncomingRequests(msg.payload.incoming_requests);
         setOutgoingRequests(msg.payload.outgoing_requests);
 
-        // Если у нас уже есть активный ключ для личного чата с контактом, отправляем конверт на новые устройства
+        // У контакта могло появиться новое устройство: отправляем ему ключи наших диалогов
+        redistributeDirectKeys();
+        break;
+      }
+
+      case 'directory_updated': {
+        // Новое устройство своего же аккаунта видно только здесь: contacts_updated не несёт свой профиль
         const me = currentUserRef.current;
-        if (me) {
-          for (const c of msg.payload.contacts) {
-            const dmId = computeDmRoomId(me.id, c.id);
-            if (roomKeyringsRef.current.has(dmId)) {
-              void ensureAndDistributeRoomKey(dmId, false);
-            }
-          }
+        const fresh = me && msg.payload.users.find((u) => u.id === me.id);
+        if (fresh && fresh.e2ee_public_key !== me.e2ee_public_key) {
+          const updated = { ...me, e2ee_public_key: fresh.e2ee_public_key };
+          currentUserRef.current = updated;
+          setCurrentUser(updated);
+          redistributeDirectKeys();
         }
         break;
       }
@@ -1421,7 +1470,6 @@ export function App() {
     setPasswordInput('');
     setRemoteVideoFrames({});
     roomKeyringsRef.current.clear();
-    sentEnvelopesRef.current.clear();
     uploadAbortRef.current.forEach((c) => c.abort());
     uploadAbortRef.current.clear();
     setOutgoingTransfers([]);
