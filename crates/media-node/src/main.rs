@@ -19,6 +19,7 @@ use axum::{
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use liaper_common::{
+    sfu_access::{node_secret_from_env, SfuTicket},
     ClientToNodeMsg, IceServerConfig, MediaNodeHeartbeat, NodeToClientMsg, SfuPeerSummary,
 };
 use tokio::sync::mpsc;
@@ -30,6 +31,8 @@ type PeerSender = mpsc::UnboundedSender<NodeToClientMsg>;
 
 #[derive(Clone)]
 struct ConnectedSfuPeer {
+    /// Идентификатор WebSocket-соединения: один аккаунт может зайти с нескольких устройств
+    conn_id: Uuid,
     summary: SfuPeerSummary,
     tx: PeerSender,
 }
@@ -42,6 +45,8 @@ struct NodeState {
     public_http_url: String,
     control_url: String,
     max_peers: u32,
+    /// Общий секрет с сервером управления: подпись heartbeat и проверка допусков в комнаты
+    node_secret: Option<Vec<u8>>,
     /// Комнаты на этой медиа-ноде: room_id -> список подключённых участников
     rooms: DashMap<Uuid, Vec<ConnectedSfuPeer>>,
     /// Счётчик пересланных байт за интервал для расчёта реального битрейта (Мбит/с)
@@ -111,6 +116,10 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
 
+    if node_secret_from_env().is_none() {
+        warn!("LIAPER_NODE_SECRET не задан (>= 32 символов): нода принимает вход в комнаты без допуска. Только для разработки!");
+    }
+
     let state = Arc::new(NodeState {
         node_id: node_id.clone(),
         name: name.clone(),
@@ -119,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
         public_http_url,
         control_url,
         max_peers,
+        node_secret: node_secret_from_env(),
         rooms: DashMap::new(),
         bytes_relayed_interval: AtomicU64::new(0),
     });
@@ -157,7 +167,11 @@ async fn main() -> anyhow::Result<()> {
                 bandwidth_mbps,
             };
 
-            if let Err(err) = client.post(&endpoint).json(&hb).send().await {
+            let mut request = client.post(&endpoint).json(&hb);
+            if let Some(secret) = &hb_state.node_secret {
+                request = request.bearer_auth(String::from_utf8_lossy(secret));
+            }
+            if let Err(err) = request.send().await {
                 warn!("Could not send heartbeat to control server ({}): {}", endpoint, err);
             }
 
@@ -223,6 +237,7 @@ async fn sfu_ws_upgrade(
 async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<NodeToClientMsg>();
+    let conn_id = Uuid::new_v4();
 
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -253,10 +268,36 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                         display_name,
                         e2ee_enabled,
                         room_key_id,
+                        ticket,
                     } => {
+                        if let Some(secret) = &state.node_secret {
+                            let valid = ticket
+                                .as_deref()
+                                .and_then(|t| SfuTicket::verify(t, secret, chrono::Utc::now()))
+                                .filter(|t| {
+                                    t.room_id == room_id
+                                        && t.user_id == user_id
+                                        && t.node_id == state.node_id
+                                });
+                            let Some(valid) = valid else {
+                                warn!("[{}] Rejected SFU join without valid ticket", state.node_id);
+                                break;
+                            };
+                            current_username = valid.username;
+                        } else {
+                            current_username = username.chars().take(64).collect();
+                        }
+                        // Повторный вход в другую комнату из того же сокета: выходим из прежней
+                        if let (Some(prev_room), Some(prev_user)) = (current_room_id, current_user_id) {
+                            if prev_room != room_id || prev_user != user_id {
+                                remove_peer_from_sfu_room(&state, prev_room, prev_user, conn_id);
+                            }
+                        }
                         current_room_id = Some(room_id);
                         current_user_id = Some(user_id);
-                        current_username = username.clone();
+                        let username = current_username.clone();
+                        let display_name: String = display_name.chars().take(64).collect();
+                        let room_key_id: String = room_key_id.chars().take(64).collect();
 
                         let peer_summary = SfuPeerSummary {
                             user_id,
@@ -269,6 +310,8 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                         let mut existing_peers = Vec::new();
                         {
                             let mut room_peers = state.rooms.entry(room_id).or_default();
+                            // Тот же аккаунт с другого устройства: звонок переходит на новое соединение,
+                            // старое отключается при следующем кадре
                             room_peers.retain(|p| p.summary.user_id != user_id);
                             for existing in room_peers.iter() {
                                 existing_peers.push(existing.summary.clone());
@@ -278,6 +321,7 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                                 });
                             }
                             room_peers.push(ConnectedSfuPeer {
+                                conn_id,
                                 summary: peer_summary,
                                 tx: tx.clone(),
                             });
@@ -302,10 +346,14 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                         target_peer_id,
                         sdp,
                     } => {
-                        if let Some(from_id) = current_user_id {
-                            relay_to_room(
+                        if let (Some(from_id), Some(joined_room)) = (current_user_id, current_room_id) {
+                            if joined_room != room_id {
+                                continue;
+                            }
+                            if !relay_to_room(
                                 &state,
                                 room_id,
+                                conn_id,
                                 from_id,
                                 target_peer_id,
                                 NodeToClientMsg::RelayedSdpOffer {
@@ -314,7 +362,9 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                                     from_username: current_username.clone(),
                                     sdp,
                                 },
-                            );
+                            ) {
+                                break;
+                            }
                         }
                     }
 
@@ -323,10 +373,14 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                         target_peer_id,
                         sdp,
                     } => {
-                        if let Some(from_id) = current_user_id {
-                            relay_to_room(
+                        if let (Some(from_id), Some(joined_room)) = (current_user_id, current_room_id) {
+                            if joined_room != room_id {
+                                continue;
+                            }
+                            if !relay_to_room(
                                 &state,
                                 room_id,
+                                conn_id,
                                 from_id,
                                 target_peer_id,
                                 NodeToClientMsg::RelayedSdpAnswer {
@@ -334,7 +388,9 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                                     from_peer_id: from_id,
                                     sdp,
                                 },
-                            );
+                            ) {
+                                break;
+                            }
                         }
                     }
 
@@ -345,10 +401,14 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                         sdp_mid,
                         sdp_mline_index,
                     } => {
-                        if let Some(from_id) = current_user_id {
-                            relay_to_room(
+                        if let (Some(from_id), Some(joined_room)) = (current_user_id, current_room_id) {
+                            if joined_room != room_id {
+                                continue;
+                            }
+                            if !relay_to_room(
                                 &state,
                                 room_id,
+                                conn_id,
                                 from_id,
                                 target_peer_id,
                                 NodeToClientMsg::RelayedIceCandidate {
@@ -358,7 +418,9 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                                     sdp_mid,
                                     sdp_mline_index,
                                 },
-                            );
+                            ) {
+                                break;
+                            }
                         }
                     }
 
@@ -370,10 +432,14 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                         room_key_id,
                         timestamp_ms,
                     } => {
-                        if let Some(from_id) = current_user_id {
-                            relay_to_room(
+                        if let (Some(from_id), Some(joined_room)) = (current_user_id, current_room_id) {
+                            if joined_room != room_id {
+                                continue;
+                            }
+                            if !relay_to_room(
                                 &state,
                                 room_id,
+                                conn_id,
                                 from_id,
                                 None,
                                 NodeToClientMsg::RelayedEncryptedMediaFrame {
@@ -386,14 +452,13 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
                                     room_key_id,
                                     timestamp_ms,
                                 },
-                            );
+                            ) {
+                                break;
+                            }
                         }
                     }
 
-                    ClientToNodeMsg::LeaveSfuRoom { room_id } => {
-                        if let Some(uid) = current_user_id {
-                            remove_peer_from_sfu_room(&state, room_id, uid);
-                        }
+                    ClientToNodeMsg::LeaveSfuRoom { .. } => {
                         break;
                     }
                 }
@@ -403,18 +468,27 @@ async fn handle_sfu_peer(socket: WebSocket, state: Arc<NodeState>) {
 
     send_task.abort();
     if let (Some(room_id), Some(uid)) = (current_room_id, current_user_id) {
-        remove_peer_from_sfu_room(&state, room_id, uid);
+        remove_peer_from_sfu_room(&state, room_id, uid, conn_id);
     }
 }
 
+/// Пересылает сообщение участникам комнаты. Возвращает `false`, если отправитель
+/// больше не в комнате (звонок перенесён на другое устройство) — соединение нужно закрыть.
 fn relay_to_room(
     state: &Arc<NodeState>,
     room_id: Uuid,
+    from_conn_id: Uuid,
     from_peer_id: Uuid,
     target_peer_id: Option<Uuid>,
     msg: NodeToClientMsg,
-) {
-    if let Some(room_peers) = state.rooms.get(&room_id) {
+) -> bool {
+    let Some(room_peers) = state.rooms.get(&room_id) else {
+        return false;
+    };
+    if !room_peers.iter().any(|p| p.conn_id == from_conn_id) {
+        return false;
+    }
+    {
         for peer in room_peers.iter() {
             if peer.summary.user_id == from_peer_id {
                 continue;
@@ -427,14 +501,22 @@ fn relay_to_room(
             let _ = peer.tx.send(msg.clone());
         }
     }
+    true
 }
 
-fn remove_peer_from_sfu_room(state: &Arc<NodeState>, room_id: Uuid, user_id: Uuid) {
+/// Убирает из комнаты только это соединение: если аккаунт уже перешёл на другое устройство,
+/// новое соединение остаётся в звонке.
+fn remove_peer_from_sfu_room(state: &Arc<NodeState>, room_id: Uuid, user_id: Uuid, conn_id: Uuid) {
     let mut should_remove_room = false;
     if let Some(mut room_peers) = state.rooms.get_mut(&room_id) {
-        room_peers.retain(|p| p.summary.user_id != user_id);
-        for peer in room_peers.iter() {
-            let _ = peer.tx.send(NodeToClientMsg::PeerLeftSfu { room_id, user_id });
+        let before = room_peers.len();
+        room_peers.retain(|p| p.conn_id != conn_id);
+        let removed = room_peers.len() != before;
+        let still_present = room_peers.iter().any(|p| p.summary.user_id == user_id);
+        if removed && !still_present {
+            for peer in room_peers.iter() {
+                let _ = peer.tx.send(NodeToClientMsg::PeerLeftSfu { room_id, user_id });
+            }
         }
         if room_peers.is_empty() {
             should_remove_room = true;

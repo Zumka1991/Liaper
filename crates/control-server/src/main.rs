@@ -3,14 +3,15 @@ mod archives;
 mod attachments;
 #[cfg(test)]
 mod persistence_tests;
+mod pow;
 mod state;
 mod ws;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State, WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -79,8 +80,11 @@ async fn main() -> anyhow::Result<()> {
             axum::routing::put(archives::put),
         )
         // Авторизация и каталог @ников
+        .route("/api/auth/challenge", get(pow_challenge_handler))
         .route("/api/auth/register", post(register_handler))
         .route("/api/auth/login", post(login_handler))
+        .route("/api/auth/logout", post(logout_handler))
+        .route("/api/rooms/:id/sfu-ticket", post(sfu_ticket_handler))
         .route("/api/users", get(list_users_handler))
         .route("/api/users/search", get(search_users_handler))
         // Балансировщик и реестр медиа-нод
@@ -98,15 +102,44 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", get(ws_upgrade_handler))
         // Статическая раздача бинарников обновлений (.exe, .msi, .AppImage, .deb, .apk)
         .nest_service("/releases", ServeDir::new("releases"))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(state);
+
+    if liaper_common::sfu_access::node_secret_from_env().is_none() {
+        tracing::warn!("LIAPER_NODE_SECRET не задан (>= 32 символов): heartbeat медиа-нод и вход в SFU не защищены. Только для разработки!");
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     info!("Liaper Control Server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
+}
+
+/// `LIAPER_ALLOWED_ORIGINS=https://app.example.com,tauri://localhost` ограничивает CORS.
+/// Без переменной сервер работает в режиме разработки и разрешает любой origin.
+fn cors_layer() -> CorsLayer {
+    use axum::http::{header, HeaderValue, Method};
+    let origins: Vec<HeaderValue> = std::env::var("LIAPER_ALLOWED_ORIGINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    if origins.is_empty() {
+        tracing::warn!("LIAPER_ALLOWED_ORIGINS не задан: CORS разрешён для любых источников");
+        return CorsLayer::permissive();
+    }
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("x-admin-password-b64"),
+        ])
 }
 
 async fn health_handler(State(state): State<Arc<ControlState>>) -> Json<serde_json::Value> {
@@ -235,10 +268,10 @@ async fn admin_setup_password_handler(
         return Err(archives::error(StatusCode::TOO_MANY_REQUESTS, &msg));
     }
     let clean_new = req.new_password.trim();
-    if clean_new.len() < 4 || clean_new.len() > 128 {
+    if clean_new.chars().count() < 12 || clean_new.len() > 128 {
         return Err(archives::error(
             StatusCode::BAD_REQUEST,
-            "Мастер-пароль должен содержать от 4 до 128 символов",
+            "Мастер-пароль должен содержать от 12 до 128 символов",
         ));
     }
     if state.is_admin_password_configured() {
@@ -341,9 +374,14 @@ async fn admin_overview_handler(
 
     let file_node_url = std::env::var("FILE_NODE_PUBLIC_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:4201".to_string());
-    let file_node_online = tokio::net::TcpStream::connect("127.0.0.1:4201")
+    let file_node_internal = std::env::var("FILE_NODE_INTERNAL_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:4201".to_string());
+    let file_node_online = reqwest::Client::new()
+        .get(format!("{}/health", file_node_internal.trim_end_matches('/')))
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
         .await
-        .is_ok();
+        .is_ok_and(|r| r.status().is_success());
 
     let mut users_list = Vec::new();
     let mut online_users = 0usize;
@@ -586,6 +624,27 @@ async fn submit_report_handler(
         ));
     }
 
+    let is_member = state
+        .rooms
+        .get(&req.room_id)
+        .is_some_and(|r| r.participants.iter().any(|p| p.user_id == reporter_id))
+        || state
+            .room_invitations
+            .get(&req.room_id)
+            .is_some_and(|ids| ids.contains(&reporter_id))
+        || state.room_key_envelopes.contains_key(&(req.room_id, reporter_id))
+        || state.contacts_by_user.get(&reporter_id).is_some_and(|contacts| {
+            contacts
+                .iter()
+                .any(|cid| ControlState::dm_room_id(&reporter_id, cid) == req.room_id)
+        });
+    if !is_member {
+        return Err(archives::error(
+            StatusCode::FORBIDDEN,
+            "Жалобу можно отправить только на переписку, в которой вы участвуете",
+        ));
+    }
+
     let reason = req.reason.trim();
     let clean_reason = if reason.is_empty() {
         "Жалоба на нарушение правил общения".to_string()
@@ -662,10 +721,30 @@ async fn resolve_report_handler(
 // Авторизация и Пользователи
 // ============================================================================
 
+fn too_many(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": msg })))
+}
+
+/// Выдаёт задачу proof-of-work для регистрации.
+async fn pow_challenge_handler(
+    State(state): State<Arc<ControlState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<pow::PowChallenge>, (StatusCode, Json<serde_json::Value>)> {
+    let ip = pow::client_ip(&headers, peer);
+    if !state.antifraud.allow_rate(&format!("pow:ip:{ip}"), 600, 40) {
+        return Err(too_many("Слишком много попыток регистрации с вашего адреса. Подождите 10 минут."));
+    }
+    Ok(Json(state.pow.issue(chrono::Utc::now().timestamp())))
+}
+
 async fn register_handler(
     State(state): State<Arc<ControlState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let ip = pow::client_ip(&headers, peer);
     let username = ControlState::normalize_username(&req.username);
     if username.len() < 3 || username.len() > 32 {
         return Err((
@@ -675,20 +754,57 @@ async fn register_handler(
             ),
         ));
     }
-    if req.password.len() < 4 || req.password.len() > 256 || req.display_name.len() > 64 || req.e2ee_public_key.len() > 2048 {
+    if req.password.chars().count() < 8 || req.password.len() > 256 {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "Некорректная длина пароля или параметров профиля" })),
+            Json(serde_json::json!({ "error": "Пароль должен содержать от 8 до 256 символов" })),
         ));
     }
-    if !state.antifraud.allow_rate("register:global", 600, 12) {
+    if req.display_name.chars().count() > 64 || req.e2ee_public_key.len() > 2048 || req.key_fingerprint.len() > 128 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "Некорректная длина параметров профиля" })),
+        ));
+    }
+    // Лимит по IP с запасом для класса за одним роутером
+    if !state.antifraud.allow_rate(&format!("register:ip:{ip}"), 3600, 20) {
+        state
+            .antifraud
+            .record_violation(
+                &format!("ip:{ip}"),
+                None,
+                Some(username.clone()),
+                Some(ip.to_string()),
+                "register_flood",
+                antifraud::IncidentSeverity::Medium,
+                25,
+                format!("Много регистраций с одного адреса ({ip})"),
+                600,
+            )
+            .await;
+        return Err(too_many("С вашего адреса уже зарегистрировано много аккаунтов. Повторите через час."));
+    }
+    let now_ts = chrono::Utc::now().timestamp();
+    let pow_result = match (req.pow_challenge.as_deref(), req.pow_solution.as_deref()) {
+        (Some(ch), Some(sol)) => state.pow.verify(ch, sol, now_ts),
+        _ => Err("missing"),
+    };
+    if let Err(reason) = pow_result {
+        let msg = match reason {
+            "missing" => "Обновите приложение: для регистрации нужна новая версия.",
+            "expired" => "Проверка устарела. Нажмите «Создать аккаунт» ещё раз.",
+            _ => "Не удалось пройти проверку на робота. Попробуйте ещё раз.",
+        };
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": msg, "code": "pow_failed" }))));
+    }
+    if !state.antifraud.allow_rate("register:global", 600, 300) {
         state
             .antifraud
             .record_violation(
                 &format!("username:{username}"),
                 None,
                 Some(username.clone()),
-                None,
+                Some(ip.to_string()),
                 "register_flood",
                 antifraud::IncidentSeverity::High,
                 50,
@@ -735,6 +851,7 @@ async fn register_handler(
             Json(serde_json::json!({"error":"Не удалось сохранить профиль в базе"})),
         )
     })?;
+    state.pow.note_registration(now_ts);
     state.user_id_by_username.insert(username, user_id);
     state.users_by_id.insert(user_id, stored.clone());
     state.save_users_to_disk();
@@ -757,8 +874,15 @@ async fn register_handler(
 
 async fn login_handler(
     State(state): State<Arc<ControlState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let ip = pow::client_ip(&headers, peer);
+    // Перебор паролей по многим никам с одного адреса
+    if !state.antifraud.allow_rate(&format!("login:ip:{ip}"), 600, 60) {
+        return Err(too_many("Слишком много попыток входа с вашего адреса. Подождите 10 минут."));
+    }
     let username = ControlState::normalize_username(&req.username);
     let subj_by_name = format!("username:{username}");
     if let Err(msg) = state.antifraud.check_quarantine(&subj_by_name) {
@@ -808,9 +932,11 @@ async fn login_handler(
                     300,
                 )
                 .await;
+            // Выравниваем время ответа, чтобы по нему нельзя было перебирать существующие ники
+            let _ = ControlState::verify_password(&req.password, "", DUMMY_ARGON2_HASH.as_str());
             return Err((
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "Пользователь с таким @ником не найден" })),
+                Json(serde_json::json!({ "error": INVALID_CREDENTIALS })),
             ));
         }
     };
@@ -833,8 +959,7 @@ async fn login_handler(
         }
     };
 
-    let computed_hash = ControlState::hash_password(&req.password, &user.salt_b64);
-    if computed_hash != user.password_hash {
+    if !ControlState::verify_password(&req.password, &user.salt_b64, &user.password_hash) {
         drop(user);
         state
             .antifraud
@@ -852,8 +977,13 @@ async fn login_handler(
             .await;
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "Неверный пароль" })),
+            Json(serde_json::json!({ "error": INVALID_CREDENTIALS })),
         ));
+    }
+
+    if ControlState::needs_rehash(&user.password_hash) {
+        user.password_hash = ControlState::hash_password(&req.password, "");
+        user.salt_b64 = String::new();
     }
 
     user.merge_public_key(
@@ -883,10 +1013,64 @@ async fn login_handler(
     }))
 }
 
+const INVALID_CREDENTIALS: &str = "Неверный @ник или пароль";
+
+static DUMMY_ARGON2_HASH: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| ControlState::hash_password("liaper-timing-equalizer", ""));
+
+async fn logout_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+) -> StatusCode {
+    if let Some(token) = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        state.revoke_session(token).await;
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// Короткоживущий допуск в медиа-комнату. Выдаётся только участникам комнаты.
+async fn sfu_ticket_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+    Path(room_id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, archives::ApiError> {
+    let user_id = archives::owner(&state, &headers)?;
+    let room = state
+        .rooms
+        .get(&room_id)
+        .map(|r| r.value().clone())
+        .ok_or_else(|| archives::error(StatusCode::NOT_FOUND, "Урок не найден или уже завершён"))?;
+    let participant = room
+        .participants
+        .iter()
+        .find(|p| p.user_id == user_id)
+        .ok_or_else(|| archives::error(StatusCode::FORBIDDEN, "Сначала войдите в урок"))?;
+    let Some(secret) = liaper_common::sfu_access::node_secret_from_env() else {
+        return Ok(Json(serde_json::json!({ "ticket": null })));
+    };
+    let ticket = liaper_common::sfu_access::SfuTicket::new(
+        room_id,
+        user_id,
+        participant.username.clone(),
+        room.assigned_node.node_id.clone(),
+    );
+    Ok(Json(serde_json::json!({
+        "ticket": ticket.sign(&secret),
+        "valid_until": ticket.valid_until,
+    })))
+}
+
+/// Каталог пользователей доступен только администратору.
 async fn list_users_handler(
     State(state): State<Arc<ControlState>>,
-) -> Json<Vec<UserPublicProfile>> {
-    Json(state.all_public_users())
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<UserPublicProfile>>, archives::ApiError> {
+    let _admin = require_admin_access(&state, &headers).await?;
+    Ok(Json(state.all_public_users()))
 }
 
 #[derive(Deserialize)]
@@ -896,44 +1080,65 @@ struct SearchQuery {
 
 async fn search_users_handler(
     State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
     Query(query): Query<SearchQuery>,
-) -> Json<Vec<UserPublicProfile>> {
+) -> Result<Json<Vec<UserPublicProfile>>, archives::ApiError> {
+    archives::owner(&state, &headers)?;
     let q = query
         .q
         .unwrap_or_default()
         .trim()
         .trim_start_matches('@')
         .to_lowercase();
-    let all = state.all_public_users();
-    if q.is_empty() {
-        return Json(all);
+    // Только по началу ника и не короче 3 символов: каталог целиком не раскрывается
+    if q.chars().count() < 3 {
+        return Ok(Json(Vec::new()));
     }
-    let filtered = all
+    let filtered = state
+        .all_public_users()
         .into_iter()
-        .filter(|u| {
-            u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q)
-        })
+        .filter(|u| u.username.starts_with(&q))
+        .take(10)
         .collect();
-    Json(filtered)
+    Ok(Json(filtered))
 }
 
 // ============================================================================
 // Пул Медиа-нод и Балансировка Нагрузки
 // ============================================================================
 
-async fn list_nodes_handler(State(state): State<Arc<ControlState>>) -> Json<Vec<MediaNodeInfo>> {
-    Json(state.list_nodes_sorted())
+async fn list_nodes_handler(
+    State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Vec<MediaNodeInfo>>, archives::ApiError> {
+    archives::owner(&state, &headers)?;
+    Ok(Json(state.list_nodes_sorted()))
 }
 
 async fn node_heartbeat_handler(
     State(state): State<Arc<ControlState>>,
+    headers: axum::http::HeaderMap,
     Json(hb): Json<MediaNodeHeartbeat>,
-) -> Json<MediaNodeInfo> {
+) -> Result<Json<MediaNodeInfo>, StatusCode> {
+    if let Some(secret) = liaper_common::sfu_access::node_secret_from_env() {
+        use subtle::ConstantTimeEq;
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !bool::from(provided.as_bytes().ct_eq(&secret)) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    if hb.node_id.len() > 64 || hb.ws_url.len() > 512 || hb.http_url.len() > 512 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let updated = state.upsert_node_heartbeat(hb);
     state.broadcast_all(&ControlToClientMsg::NodesUpdated {
         nodes: state.list_nodes_sorted(),
     });
-    Json(updated)
+    Ok(Json(updated))
 }
 
 // ============================================================================
@@ -1129,6 +1334,25 @@ mod tests {
         .await;
         assert!(result.is_ok());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn passwords_use_argon2id_and_legacy_hashes_still_verify() {
+        let hash = ControlState::hash_password("correct horse", "");
+        assert!(hash.starts_with("$argon2id$"));
+        assert!(ControlState::verify_password("correct horse", "", &hash));
+        assert!(!ControlState::verify_password("wrong horse", "", &hash));
+        assert!(!ControlState::needs_rehash(&hash));
+
+        // Хеш формата v1 (соль + SHA-256) из существующих баз
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"c2FsdA==:liaper-auth-v1:old-password");
+        let legacy = BASE64.encode(h.finalize());
+        assert!(ControlState::verify_password("old-password", "c2FsdA==", &legacy));
+        assert!(!ControlState::verify_password("other", "c2FsdA==", &legacy));
+        assert!(ControlState::needs_rehash(&legacy));
     }
 
     #[test]

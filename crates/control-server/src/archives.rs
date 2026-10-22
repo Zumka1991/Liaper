@@ -51,7 +51,7 @@ pub async fn unlock(
         .get(&id)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "Профиль не найден"))?;
     let uname = user.username.clone();
-    if ControlState::hash_password(&body.password, &user.salt_b64) != user.password_hash {
+    if !ControlState::verify_password(&body.password, &user.salt_b64, &user.password_hash) {
         drop(user);
         state
             .antifraud
@@ -115,7 +115,7 @@ pub async fn list(
         .ok_or_else(|| {
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "PostgreSQL недоступна. Архив сохранён только на устройстве",
+                "Сервер временно недоступен. Архив сохранён на устройстве",
             )
         })?;
     let rows = client.query(
@@ -161,7 +161,7 @@ pub async fn put(
         .ok_or_else(|| {
             error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "PostgreSQL недоступна. Повторите синхронизацию позже",
+                "Сервер временно недоступен. Повторите синхронизацию позже",
             )
         })?;
     let row = if body.expected_revision == 0 {

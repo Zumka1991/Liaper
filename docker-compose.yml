@@ -1,3 +1,16 @@
+# Локально:   docker compose up -d --build            (http://localhost:5173)
+# Продакшен:  docker compose --profile tls up -d --build   (https://$LIAPER_DOMAIN через Caddy)
+# Все секреты задаются в .env (см. .env.example).
+
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile.backend
+  restart: unless-stopped
+  read_only: true
+  tmpfs: [/tmp]
+  security_opt: ["no-new-privileges:true"]
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -5,10 +18,11 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-liaper}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-liaper_secret_2026}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: ${POSTGRES_DB:-liaper}
+    # Только для локального доступа администратора; наружу база не публикуется.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - liaper_pgdata:/var/lib/postgresql/data
       - ./docker/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
@@ -19,11 +33,8 @@ services:
       retries: 10
 
   liaper-control:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *backend
     container_name: liaper-control
-    restart: unless-stopped
     command: ["liaper-control"]
     depends_on:
       postgres:
@@ -31,22 +42,26 @@ services:
     environment:
       CONTROL_PORT: "4000"
       LIAPER_ADMIN_SECRET: "${LIAPER_ADMIN_SECRET:-}"
+      LIAPER_ADMIN_USERNAMES: "${LIAPER_ADMIN_USERNAMES:-}"
+      LIAPER_ADMIN_PASSWORD: "${LIAPER_ADMIN_PASSWORD:-}"
+      LIAPER_ALLOWED_ORIGINS: "${LIAPER_ALLOWED_ORIGINS:-}"
+      # Сколько своих прокси перед сервером: 2 — Caddy + nginx (--profile tls), 1 — только nginx
+      LIAPER_TRUSTED_PROXY_HOPS: "${LIAPER_TRUSTED_PROXY_HOPS:-1}"
       LIAPER_STORAGE_SECRET: "${LIAPER_STORAGE_SECRET:?Set LIAPER_STORAGE_SECRET in .env}"
+      LIAPER_NODE_SECRET: "${LIAPER_NODE_SECRET:?Set LIAPER_NODE_SECRET in .env}"
       FILE_NODE_INTERNAL_URL: "http://liaper-files:4201"
       FILE_NODE_PUBLIC_URL: "${FILE_NODE_PUBLIC_URL:-http://127.0.0.1:4201}"
-      DATABASE_URL: "postgres://${POSTGRES_USER:-liaper}:${POSTGRES_PASSWORD:-liaper_secret_2026}@postgres:5432/${POSTGRES_DB:-liaper}"
-      RUST_LOG: "liaper_control=info,tower_http=info"
+      DATABASE_URL: "postgres://${POSTGRES_USER:-liaper}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-liaper}"
+      RUST_LOG: "liaper_control=info,tower_http=warn"
     ports:
-      - "4000:4000"
+      - "127.0.0.1:4000:4000"
     volumes:
       - ./data:/app/data
       - ./releases:/app/releases
 
   liaper-files:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-    restart: unless-stopped
+    <<: *backend
+    container_name: liaper-files
     command: ["liaper-files"]
     depends_on:
       - liaper-control
@@ -57,49 +72,53 @@ services:
       LIAPER_STORAGE_SECRET: "${LIAPER_STORAGE_SECRET:?Set LIAPER_STORAGE_SECRET in .env}"
       CONTROL_URL: "http://liaper-control:4000"
     ports:
-      - "4201:4201"
+      - "${FILES_BIND:-127.0.0.1}:4201:4201"
     volumes:
       - ./data/files:/app/data/files
 
   liaper-node-1:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *backend
     container_name: liaper-node-1
-    restart: unless-stopped
     command: ["liaper-node"]
     depends_on:
       - liaper-control
     environment:
       NODE_PORT: "4101"
       NODE_ID: "node-ru-1"
-      NODE_NAME: "SFU-Node-1-Moscow"
+      NODE_NAME: "SFU-Node-1"
       NODE_REGION: "RU-Central"
       NODE_PUBLIC_HOST: "${PUBLIC_HOST:-127.0.0.1}"
+      NODE_WS_URL: "${NODE_1_WS_URL:-ws://127.0.0.1:4101/ws/sfu}"
       CONTROL_URL: "http://liaper-control:4000"
+      LIAPER_NODE_SECRET: "${LIAPER_NODE_SECRET:?Set LIAPER_NODE_SECRET in .env}"
+      LIAPER_TURN_URL: "${LIAPER_TURN_URL:-}"
+      LIAPER_TURN_USER: "${LIAPER_TURN_USER:-}"
+      LIAPER_TURN_PASS: "${LIAPER_TURN_PASS:-}"
       RUST_LOG: "liaper_node=info"
     ports:
-      - "4101:4101"
+      - "${NODES_BIND:-127.0.0.1}:4101:4101"
 
   liaper-node-2:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *backend
     container_name: liaper-node-2
-    restart: unless-stopped
     command: ["liaper-node"]
     depends_on:
       - liaper-control
     environment:
       NODE_PORT: "4102"
       NODE_ID: "node-ru-2"
-      NODE_NAME: "SFU-Node-2-Siberia"
+      NODE_NAME: "SFU-Node-2"
       NODE_REGION: "RU-East"
       NODE_PUBLIC_HOST: "${PUBLIC_HOST:-127.0.0.1}"
+      NODE_WS_URL: "${NODE_2_WS_URL:-ws://127.0.0.1:4102/ws/sfu}"
       CONTROL_URL: "http://liaper-control:4000"
+      LIAPER_NODE_SECRET: "${LIAPER_NODE_SECRET:?Set LIAPER_NODE_SECRET in .env}"
+      LIAPER_TURN_URL: "${LIAPER_TURN_URL:-}"
+      LIAPER_TURN_USER: "${LIAPER_TURN_USER:-}"
+      LIAPER_TURN_PASS: "${LIAPER_TURN_PASS:-}"
       RUST_LOG: "liaper_node=info"
     ports:
-      - "4102:4102"
+      - "${NODES_BIND:-127.0.0.1}:4102:4102"
 
   liaper-web:
     build:
@@ -112,7 +131,28 @@ services:
     depends_on:
       - liaper-control
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
+
+  # TLS-терминатор: https://$LIAPER_DOMAIN → web/api/ws, /sfu/1|2 → медиа-ноды, /files → файловая нода
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: liaper-caddy
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      - liaper-web
+    environment:
+      LIAPER_DOMAIN: "${LIAPER_DOMAIN:?Set LIAPER_DOMAIN in .env}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
 
 volumes:
   liaper_pgdata:
+  caddy_data:
+  caddy_config:

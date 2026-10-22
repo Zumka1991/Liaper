@@ -1,4 +1,4 @@
-import type { ChatAttachmentMeta, E2eeKeyEnvelope, RichChatPayload } from '../types/protocol';
+import type { ChatAttachmentMeta, E2eeKeyEnvelope, ForwardedFrom, RichChatPayload } from '../types/protocol';
 
 const STORAGE_PRIV_KEY = 'liaper_e2ee_x25519_priv_jwk_v2';
 const STORAGE_PUB_KEY = 'liaper_e2ee_x25519_pub_raw_v2';
@@ -417,36 +417,72 @@ export async function openEncryptedKeyEnvelope(
   return importRoomKeyFromRawB64(rawKeyB64);
 }
 
-export function serializeChatPayload(text: string, attachment?: ChatAttachmentMeta): string {
-  if (!attachment) {
+export function serializeChatPayload(text: string, attachment?: ChatAttachmentMeta, forwarded?: ForwardedFrom): string {
+  if (!attachment && !forwarded) {
     return text;
   }
   const payload: RichChatPayload = {
     _liaper_msg: 1,
     text,
-    attachment,
+    ...(attachment ? { attachment } : {}),
+    ...(forwarded ? { forwarded } : {}),
   };
   return JSON.stringify(payload);
+}
+
+// Сообщения, пересланные старыми версиями: «Переслано из архива «Тема» (Имя @ник, 17:05):» + перенос + текст
+const LEGACY_FORWARD_RE = /^Переслано из архива «([^»]*)» \(([^)]*)\)(?::\n([\s\S]*))?$/;
+
+function parseLegacyForward(text: string): { text: string; forwarded: ForwardedFrom } | null {
+  const m = LEGACY_FORWARD_RE.exec(text);
+  if (!m) return null;
+  const [who, time] = m[2].split(/,\s*(?=[^,]*$)/);
+  const nick = /\s@([^\s]+)$/.exec(who ?? '');
+  return {
+    text: m[3] ?? '',
+    forwarded: {
+      source: m[1],
+      sender: nick ? who.slice(0, nick.index).trim() : (who ?? '').trim(),
+      username: nick?.[1],
+      time: time?.trim(),
+    },
+  };
+}
+
+function cleanForwarded(value: unknown): ForwardedFrom | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const f = value as Record<string, unknown>;
+  const str = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : undefined);
+  const source = str(f.source, 120);
+  const sender = str(f.sender, 80);
+  if (!source || !sender) return undefined;
+  return { source, sender, username: str(f.username, 40), time: str(f.time, 40) };
 }
 
 export function parseChatPayload(
   rawPlaintext: string,
   allowAttachment: boolean
-): { text: string; attachment?: ChatAttachmentMeta } {
+): { text: string; attachment?: ChatAttachmentMeta; forwarded?: ForwardedFrom } {
   const trimmed = rawPlaintext.trim();
   if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
     try {
       const parsed = JSON.parse(trimmed) as Partial<RichChatPayload>;
       if (parsed && parsed._liaper_msg === 1) {
-        return {
-          text: typeof parsed.text === 'string' ? parsed.text : '',
-          attachment: allowAttachment && parsed.attachment ? parsed.attachment : undefined,
-        };
+        const text = typeof parsed.text === 'string' ? parsed.text : '';
+        const attachment = allowAttachment && parsed.attachment ? parsed.attachment : undefined;
+        const forwarded = cleanForwarded(parsed.forwarded);
+        if (!forwarded) {
+          const legacy = parseLegacyForward(text);
+          if (legacy) return { text: legacy.text, attachment, forwarded: legacy.forwarded };
+        }
+        return { text, attachment, forwarded };
       }
     } catch {
       // Plain text that happened to start with '{'
     }
   }
+  const legacy = parseLegacyForward(rawPlaintext);
+  if (legacy) return legacy;
   return { text: rawPlaintext };
 }
 
@@ -502,6 +538,7 @@ export async function decryptChatMessageWithKeyring(params: {
 }): Promise<{
   plaintext: string;
   attachment?: ChatAttachmentMeta;
+  forwarded?: ForwardedFrom;
   verifiedE2ee: boolean;
 }> {
   const candidateKeys: RoomSecretKeyBundle[] = [];
@@ -524,6 +561,7 @@ export async function decryptChatMessageWithKeyring(params: {
       return {
         plaintext: parsed.text,
         attachment: parsed.attachment,
+        forwarded: parsed.forwarded,
         verifiedE2ee: true,
       };
     } catch {
@@ -542,6 +580,7 @@ export async function decryptChatMessageWithKeyring(params: {
     return {
       plaintext: parsed.text,
       attachment: undefined,
+      forwarded: parsed.forwarded,
       verifiedE2ee: false,
     };
   }

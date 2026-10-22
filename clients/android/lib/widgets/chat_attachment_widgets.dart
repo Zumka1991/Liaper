@@ -50,7 +50,8 @@ class _ChatAttachmentCardState extends State<ChatAttachmentCard> {
   @override
   void initState() {
     super.initState();
-    final cached = AndroidAttachmentService.getCachedBytes(widget.attachment.id);
+    final cached =
+        AndroidAttachmentService.getCachedBytes(widget.attachment.id);
     if (cached != null) {
       _applyDecryptedBytes(cached);
     } else if (_isLocallyExpired) {
@@ -469,6 +470,8 @@ class _ChatAttachmentCardState extends State<ChatAttachmentCard> {
                   child: Image.memory(
                     _decryptedBytes!,
                     fit: BoxFit.cover,
+                    // Декодируем под размер превью, а не в полном разрешении фото
+                    cacheWidth: 600,
                     errorBuilder: (_, __, ___) => const Padding(
                       padding: EdgeInsets.all(12),
                       child: Text(

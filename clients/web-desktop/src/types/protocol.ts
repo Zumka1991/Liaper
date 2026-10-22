@@ -82,16 +82,26 @@ export interface ChatAttachmentMeta {
   height?: number;
 }
 
+/** Откуда переслано сообщение (из архива урока) */
+export interface ForwardedFrom {
+  source: string;
+  sender: string;
+  username?: string;
+  time?: string;
+}
+
 export interface RichChatPayload {
   _liaper_msg: 1;
   text: string;
   attachment?: ChatAttachmentMeta;
+  forwarded?: ForwardedFrom;
 }
 
 export interface DecryptedChatMessage extends EncryptedChatMessage {
   plaintext: string;
   verified_e2ee: boolean;
   attachment?: ChatAttachmentMeta;
+  forwarded?: ForwardedFrom;
 }
 
 export interface RoomParticipantState {
@@ -211,6 +221,13 @@ export type ClientToControlMsg =
       };
     }
   | {
+      type: 'rename_room';
+      payload: {
+        room_id: string;
+        title: string;
+      };
+    }
+  | {
       type: 'update_media_state';
       payload: {
         room_id: string;
@@ -307,6 +324,14 @@ export type ControlToClientMsg =
       };
     }
   | {
+      /** Урок этого аккаунта идёт на другом устройстве; room = null — там он закончился */
+      type: 'call_on_other_device';
+      payload: {
+        room_id: string;
+        room: RoomInfo | null;
+      };
+    }
+  | {
       type: 'call_declined';
       payload: {
         room_id: string;
@@ -381,6 +406,7 @@ export type ClientToNodeMsg =
         display_name: string;
         e2ee_enabled: boolean;
         room_key_id: string;
+        ticket?: string | null;
       };
     }
   | {

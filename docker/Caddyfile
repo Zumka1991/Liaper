@@ -1,0 +1,24 @@
+{$LIAPER_DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	handle_path /sfu/1/* {
+		reverse_proxy liaper-node-1:4101
+	}
+	handle_path /sfu/2/* {
+		reverse_proxy liaper-node-2:4102
+	}
+	handle_path /files/* {
+		request_body {
+			max_size 130MB
+		}
+		reverse_proxy liaper-files:4201
+	}
+	handle {
+		reverse_proxy liaper-web:80
+	}
+}

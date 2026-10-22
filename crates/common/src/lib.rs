@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 pub mod file_storage;
+pub mod sfu_access;
 
 // ============================================================================
 // 1. Пользователи, Профили и Публичные Ключи E2EE
@@ -36,6 +37,11 @@ pub struct RegisterRequest {
     pub role: UserRole,
     pub e2ee_public_key: String,
     pub key_fingerprint: String,
+    /// Задача proof-of-work из `GET /api/auth/challenge` и найденное решение
+    #[serde(default)]
+    pub pow_challenge: Option<String>,
+    #[serde(default)]
+    pub pow_solution: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,6 +252,11 @@ pub enum ClientToControlMsg {
     LeaveRoom {
         room_id: Uuid,
     },
+    /// Задать тему идущего урока (репетитор-участник или организатор)
+    RenameRoom {
+        room_id: Uuid,
+        title: String,
+    },
     /// Обновить статус микрофона / камеры / демонстрации экрана
     UpdateMediaState {
         room_id: Uuid,
@@ -321,6 +332,12 @@ pub enum ControlToClientMsg {
         caller: UserPublicProfile,
         with_video: bool,
     },
+    /// Урок этого аккаунта идёт на другом устройстве. `room: None` — там звонок закончился
+    /// или входящий вызов уже отклонён, плашку и звонок на этом устройстве нужно убрать.
+    CallOnOtherDevice {
+        room_id: Uuid,
+        room: Option<RoomInfo>,
+    },
     /// Абонент отклонил вызов
     CallDeclined {
         room_id: Uuid,
@@ -371,6 +388,9 @@ pub enum ClientToNodeMsg {
         /// Индикатор активного E2EE фреймов (WebRTC Encoded Transform / SFrame)
         e2ee_enabled: bool,
         room_key_id: String,
+        /// Подписанный допуск от сервера управления (`POST /api/rooms/:id/sfu-ticket`)
+        #[serde(default)]
+        ticket: Option<String>,
     },
     /// Прямая или SFU-маршрутизируемая SDP Offer
     SignalSdpOffer {

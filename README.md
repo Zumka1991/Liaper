@@ -25,6 +25,14 @@
 
 ---
 
+## Продакшн
+
+Боевой запуск с TLS (Caddy), обязательные секреты, изменения безопасности и оставшиеся задачи — в [docs/PRODUCTION.md](docs/PRODUCTION.md). Шаблон переменных — `.env.example`.
+
+```bash
+docker compose --profile tls up -d --build
+```
+
 ## Развёртывание в Docker (PostgreSQL + Кластер + Web)
 
 Весь стек (`postgres:16-alpine`, `liaper-control`, `liaper-node-1`, `liaper-node-2`, `liaper-web`) поднимается одной командой:
@@ -32,6 +40,8 @@
 ```bash
 docker compose up -d --build
 ```
+
+Перед запуском заполните `.env` по образцу `.env.example` (`POSTGRES_PASSWORD`, `LIAPER_STORAGE_SECRET`, `LIAPER_NODE_SECRET` обязательны). Порты сервисов открыты только на `127.0.0.1`.
 
 * **Веб-интерфейс**: `http://localhost:5173`
 * **Control Server API & WS**: `http://localhost:4000`

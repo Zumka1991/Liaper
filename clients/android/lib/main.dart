@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' show ImageFilter;
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
@@ -19,15 +20,23 @@ import 'widgets/storage_usage.dart';
 import 'widgets/chat_attachment_widgets.dart';
 import 'services/lesson_archive.dart';
 import 'services/e2ee_attachments.dart';
+import 'services/pow.dart';
+import 'widgets/liaper_logo.dart';
 
 const SystemUiOverlayStyle kLiaperSystemUiStyle = SystemUiOverlayStyle(
   statusBarColor: Colors.transparent,
   statusBarIconBrightness: Brightness.dark,
   statusBarBrightness: Brightness.light,
-  systemNavigationBarColor: Color(0xFF0F172A),
-  systemNavigationBarDividerColor: Color(0xFF0F172A),
-  systemNavigationBarIconBrightness: Brightness.light,
+  systemNavigationBarColor: Colors.white,
+  systemNavigationBarDividerColor: Colors.white,
+  systemNavigationBarIconBrightness: Brightness.dark,
   systemNavigationBarContrastEnforced: false,
+);
+
+/// Адрес сервера по умолчанию: `flutter build apk --dart-define=LIAPER_SERVER_URL=https://lessons.example.com`
+const String _defaultServerUrl = String.fromEnvironment(
+  'LIAPER_SERVER_URL',
+  defaultValue: 'http://127.0.0.1:4000',
 );
 
 void main() {
@@ -50,42 +59,123 @@ class LiaperMobileApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.light,
-        scaffoldBackgroundColor: const Color(0xFFF8FAFC),
+        scaffoldBackgroundColor: const Color(0xFFF6F7FB),
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF0F172A),
+          seedColor: const Color(0xFF4F46E5),
           brightness: Brightness.light,
-          primary: const Color(0xFF0F172A),
+          primary: const Color(0xFF4F46E5),
+          onPrimary: Colors.white,
+          secondary: const Color(0xFF7C3AED),
           surface: Colors.white,
+          onSurface: const Color(0xFF0F172A),
+          outline: const Color(0xFFCBD5E1),
+          outlineVariant: const Color(0xFFE5E7EB),
         ),
         useMaterial3: true,
         visualDensity: VisualDensity.standard,
         appBarTheme: const AppBarTheme(
           systemOverlayStyle: kLiaperSystemUiStyle,
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          foregroundColor: Color(0xFF0F172A),
+          elevation: 0,
+          scrolledUnderElevation: 0.5,
+          centerTitle: false,
+          titleTextStyle: TextStyle(
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+              color: Color(0xFF0F172A)),
         ),
+        cardTheme: CardThemeData(
+          color: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+          margin: EdgeInsets.zero,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+            side: const BorderSide(color: Color(0xFFE5E7EB)),
+          ),
+        ),
+        dividerTheme:
+            const DividerThemeData(color: Color(0xFFE5E7EB), space: 1),
         inputDecorationTheme: InputDecorationTheme(
           filled: true,
-          fillColor: const Color(0xFFF8FAFC),
+          fillColor: Colors.white,
           contentPadding:
               const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-          border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: Color(0xFFCBD5E1)),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: Color(0xFFCBD5E1)),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+            borderSide: const BorderSide(color: Color(0xFF4F46E5), width: 2),
+          ),
         ),
         filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(minimumSize: const Size(48, 48)),
+          style: FilledButton.styleFrom(
+            minimumSize: const Size(48, 50),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            textStyle:
+                const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          ),
         ),
         outlinedButtonTheme: OutlinedButtonThemeData(
-          style: OutlinedButton.styleFrom(minimumSize: const Size(48, 48)),
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size(48, 50),
+            shape:
+                RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            side: const BorderSide(color: Color(0xFFCBD5E1)),
+            textStyle:
+                const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+          ),
+        ),
+        segmentedButtonTheme: SegmentedButtonThemeData(
+          style: SegmentedButton.styleFrom(
+            selectedBackgroundColor: const Color(0xFFEEF2FF),
+            selectedForegroundColor: const Color(0xFF3730A3),
+          ),
+        ),
+        navigationBarTheme: NavigationBarThemeData(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          indicatorColor: const Color(0xFFEEF2FF),
+          labelTextStyle: WidgetStateProperty.resolveWith((states) => TextStyle(
+                fontSize: 12,
+                fontWeight: states.contains(WidgetState.selected)
+                    ? FontWeight.w600
+                    : FontWeight.w500,
+              )),
+        ),
+        snackBarTheme: SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xFF1E1B4B),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        ),
+        dialogTheme: DialogThemeData(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         ),
       ),
       builder: (context, child) {
         final mq = MediaQuery.of(context);
         final bottomSystemInset = mq.viewPadding.bottom;
         final adjustedKeyboardBottom =
-            (mq.viewInsets.bottom - bottomSystemInset).clamp(0.0, double.infinity);
+            (mq.viewInsets.bottom - bottomSystemInset)
+                .clamp(0.0, double.infinity);
 
         return AnnotatedRegion<SystemUiOverlayStyle>(
           value: kLiaperSystemUiStyle,
           child: ColoredBox(
-            color: const Color(0xFF0F172A),
+            color: Colors.white,
             child: Column(
               children: [
                 Expanded(
@@ -104,7 +194,7 @@ class LiaperMobileApp extends StatelessWidget {
                   Container(
                     width: double.infinity,
                     height: bottomSystemInset,
-                    color: const Color(0xFF0F172A),
+                    color: Colors.white,
                   ),
               ],
             ),
@@ -129,6 +219,7 @@ class ChatMessageItem {
   final String ivB64;
   final String roomKeyId;
   final ChatAttachmentMeta? attachment;
+  final ForwardedFrom? forwarded;
   final bool locked;
   final bool verifiedE2ee;
 
@@ -145,6 +236,7 @@ class ChatMessageItem {
     this.ivB64 = '',
     this.roomKeyId = '',
     this.attachment,
+    this.forwarded,
     this.locked = false,
     this.verifiedE2ee = true,
   });
@@ -160,9 +252,9 @@ class LiaperHomeScreen extends StatefulWidget {
 class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   static const MethodChannel _mediaChannel = MethodChannel('com.liaper.audio');
 
-  String _serverUrl = 'http://127.0.0.1:4000';
+  String _serverUrl = _defaultServerUrl;
   final TextEditingController _serverUrlCtrl =
-      TextEditingController(text: 'http://127.0.0.1:4000');
+      TextEditingController(text: _defaultServerUrl);
 
   // Авторизация
   bool _isRegister = false;
@@ -175,6 +267,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   final TextEditingController _displayNameCtrl = TextEditingController();
   final TextEditingController _passwordCtrl = TextEditingController();
   bool _authLoading = false;
+  bool _authCheckingRobot = false;
   String? _authError;
   bool _showServerConfig = false;
 
@@ -204,6 +297,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   List<dynamic> _outgoingRequests = [];
   Map<String, dynamic>? _currentRoom;
   Map<String, dynamic>? _incomingCall;
+  // Урок этого аккаунта, который сейчас идёт на другом устройстве
+  Map<String, dynamic>? _otherDeviceCall;
+  // true — это не другое устройство, а урок, из которого выбило перезапуском приложения
+  bool _otherDeviceIsResume = false;
 
   // Поля контактов и комнат
   final TextEditingController _addContactCtrl = TextEditingController();
@@ -229,33 +326,186 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     {
       'label': '😀 Эмоции',
       'items': [
-        '😀', '😃', '😄', '😁', '😆', '😅', '😂', '🤣', '😊', '😇',
-        '🙂', '🙃', '😉', '😌', '😍', '🥰', '😘', '😋', '😛', '😜',
-        '🤪', '🤨', '🧐', '🤓', '😎', '🥳', '😏', '😒', '😞', '😔',
-        '😟', '😕', '🙁', '😣', '😖', '😫', '🥺', '😢', '😭', '😤',
-        '😠', '😡', '🤯', '😳', '😱', '🤗', '🤔', '🤭', '🤫', '😶',
-        '😐', '🙄', '😯', '😮', '😲', '🥱', '😴', '🤤', '😷', '🤒',
+        '😀',
+        '😃',
+        '😄',
+        '😁',
+        '😆',
+        '😅',
+        '😂',
+        '🤣',
+        '😊',
+        '😇',
+        '🙂',
+        '🙃',
+        '😉',
+        '😌',
+        '😍',
+        '🥰',
+        '😘',
+        '😋',
+        '😛',
+        '😜',
+        '🤪',
+        '🤨',
+        '🧐',
+        '🤓',
+        '😎',
+        '🥳',
+        '😏',
+        '😒',
+        '😞',
+        '😔',
+        '😟',
+        '😕',
+        '🙁',
+        '😣',
+        '😖',
+        '😫',
+        '🥺',
+        '😢',
+        '😭',
+        '😤',
+        '😠',
+        '😡',
+        '🤯',
+        '😳',
+        '😱',
+        '🤗',
+        '🤔',
+        '🤭',
+        '🤫',
+        '😶',
+        '😐',
+        '🙄',
+        '😯',
+        '😮',
+        '😲',
+        '🥱',
+        '😴',
+        '🤤',
+        '😷',
+        '🤒',
       ],
     },
     {
       'label': '🎓 Учёба и жесты',
       'items': [
-        '👍', '👎', '👌', '✌️', '🤞', '🤟', '🤘', '🤙', '👈', '👉',
-        '👆', '👇', '☝️', '✋', '👋', '🤝', '🙏', '✍️', '💪', '🧠',
-        '👀', '💡', '📚', '📖', '📝', '✏️', '🖊️', '📐', '📏', '📊',
-        '📈', '📌', '📎', '🔍', '🎓', '🏫', '🏆', '🥇', '🥈', '🥉',
-        '🎯', '✅', '❌', '❓', '❗', '💯', '🔥', '⭐', '🌟', '✨',
-        '🎉', '🎊', '👏', '🙌', '🫶', '🫡', '💻', '🖥️', '📱', '🎧',
+        '👍',
+        '👎',
+        '👌',
+        '✌️',
+        '🤞',
+        '🤟',
+        '🤘',
+        '🤙',
+        '👈',
+        '👉',
+        '👆',
+        '👇',
+        '☝️',
+        '✋',
+        '👋',
+        '🤝',
+        '🙏',
+        '✍️',
+        '💪',
+        '🧠',
+        '👀',
+        '💡',
+        '📚',
+        '📖',
+        '📝',
+        '✏️',
+        '🖊️',
+        '📐',
+        '📏',
+        '📊',
+        '📈',
+        '📌',
+        '📎',
+        '🔍',
+        '🎓',
+        '🏫',
+        '🏆',
+        '🥇',
+        '🥈',
+        '🥉',
+        '🎯',
+        '✅',
+        '❌',
+        '❓',
+        '❗',
+        '💯',
+        '🔥',
+        '⭐',
+        '🌟',
+        '✨',
+        '🎉',
+        '🎊',
+        '👏',
+        '🙌',
+        '🫶',
+        '🫡',
+        '💻',
+        '🖥️',
+        '📱',
+        '🎧',
       ],
     },
     {
       'label': '❤️ Сердца и разное',
       'items': [
-        '❤️', '🧡', '💛', '💚', '💙', '💜', '🖤', '🤍', '🤎', '💔',
-        '❣️', '💕', '💞', '💓', '💗', '💖', '💘', '💝', '💟', '☀️',
-        '🌈', '☁️', '❄️', '⚡', '🌸', '🌺', '🌻', '🍀', '🍎', '🍓',
-        '🍕', '☕', '🍵', '🍰', '🍫', '🚀', '✈️', '⏰', '⏳', '🔔',
-        '💬', '💭', '🎵', '🎶', '🎨', '🧩', '🎲', '🐱', '🐶', '🦊',
+        '❤️',
+        '🧡',
+        '💛',
+        '💚',
+        '💙',
+        '💜',
+        '🖤',
+        '🤍',
+        '🤎',
+        '💔',
+        '❣️',
+        '💕',
+        '💞',
+        '💓',
+        '💗',
+        '💖',
+        '💘',
+        '💝',
+        '💟',
+        '☀️',
+        '🌈',
+        '☁️',
+        '❄️',
+        '⚡',
+        '🌸',
+        '🌺',
+        '🌻',
+        '🍀',
+        '🍎',
+        '🍓',
+        '🍕',
+        '☕',
+        '🍵',
+        '🍰',
+        '🍫',
+        '🚀',
+        '✈️',
+        '⏰',
+        '⏳',
+        '🔔',
+        '💬',
+        '💭',
+        '🎵',
+        '🎶',
+        '🎨',
+        '🧩',
+        '🎲',
+        '🐱',
+        '🐶',
+        '🦊',
       ],
     },
   ];
@@ -551,6 +801,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             ivB64: m.ivB64,
             roomKeyId: m.roomKeyId,
             attachment: dec.attachment,
+            forwarded: dec.forwarded,
             locked: false,
             verifiedE2ee: dec.verifiedE2ee,
           );
@@ -645,8 +896,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     final sentAt = (rawMsg['created_at'] ?? rawMsg['sent_at'] ?? '').toString();
     final editedAt = rawMsg['edited_at']?.toString();
 
-    String decryptedText = '🔒 Ожидание ключа шифрования чата…';
+    String decryptedText = 'Ожидание ключа шифрования…';
     ChatAttachmentMeta? attachment;
+    ForwardedFrom? forwarded;
     bool locked = true;
     bool verifiedE2ee = false;
 
@@ -660,6 +912,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       );
       decryptedText = res.plaintext;
       attachment = res.attachment;
+      forwarded = res.forwarded;
       locked = false;
       verifiedE2ee = res.verifiedE2ee;
     } catch (_) {}
@@ -681,6 +934,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           ivB64: ivB64,
           roomKeyId: roomKeyId,
           attachment: attachment,
+          forwarded: forwarded,
           locked: locked,
           verifiedE2ee: verifiedE2ee,
         ),
@@ -732,8 +986,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         (rawMsg['edited_at'] ?? DateTime.now().toUtc().toIso8601String())
             .toString();
 
-    String decryptedText = '🔒 Ожидание ключа шифрования чата…';
+    String decryptedText = 'Ожидание ключа шифрования…';
     ChatAttachmentMeta? attachment;
+    ForwardedFrom? forwarded;
     bool locked = true;
     bool verifiedE2ee = false;
 
@@ -747,6 +1002,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       );
       decryptedText = res.plaintext;
       attachment = res.attachment;
+      forwarded = res.forwarded;
       locked = false;
       verifiedE2ee = res.verifiedE2ee;
     } catch (_) {}
@@ -769,6 +1025,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           ivB64: ivB64,
           roomKeyId: roomKeyId,
           attachment: attachment ?? _chatMessages[idx].attachment,
+          forwarded: forwarded ?? _chatMessages[idx].forwarded,
           locked: locked,
           verifiedE2ee: verifiedE2ee,
         );
@@ -1070,9 +1327,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           : transfer.kind == 'video_note'
               ? 'Видеокружок (${AndroidAttachmentService.formatDurationMmSs(transfer.durationMs ?? 0)})'
               : 'Вложение: ${meta.name}';
-      final textBody = transfer.captionText.isNotEmpty
-          ? transfer.captionText
-          : defaultLabel;
+      final textBody =
+          transfer.captionText.isNotEmpty ? transfer.captionText : defaultLabel;
       final serialized =
           AndroidE2eeService.serializeChatPayload(textBody, meta);
       final encrypted =
@@ -1251,8 +1507,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     } catch (_) {
       await _cancelNoteRecording();
       if (mounted) {
-        setState(
-            () => _statusMessage = 'Не удалось запустить запись медиасообщения.');
+        setState(() =>
+            _statusMessage = 'Не удалось запустить запись медиасообщения.');
       }
     }
   }
@@ -1274,7 +1530,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       if (squareJpeg != null && squareJpeg.isNotEmpty) {
         final ts = DateTime.now().millisecondsSinceEpoch - startedAtMs;
         _recordedNoteFrames.add(
-          LpvnVideoFrame(timestampMs: ts.clamp(0, 60000), jpegBytes: squareJpeg),
+          LpvnVideoFrame(
+              timestampMs: ts.clamp(0, 60000), jpegBytes: squareJpeg),
         );
       }
     } catch (_) {
@@ -1316,8 +1573,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     Uint8List wavBytes = Uint8List(0);
     int durationMs = _noteElapsedMs;
     try {
-      final res =
-          await _mediaChannel.invokeMethod<Map<dynamic, dynamic>>('stopNoteAudio');
+      final res = await _mediaChannel
+          .invokeMethod<Map<dynamic, dynamic>>('stopNoteAudio');
       if (res != null) {
         final b = res['wavBytes'];
         if (b is Uint8List) wavBytes = b;
@@ -1625,13 +1882,37 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     return rawWsUrl;
   }
 
-  void _connectToSfuNode(Map<String, dynamic> room) {
+  /// Подписанный сервером допуск в медиа-комнату; null, если сервер в режиме разработки.
+  Future<String?> _fetchSfuTicket(String roomId) async {
+    final token = _token;
+    if (token == null) return null;
+    final response = await http
+        .post(Uri.parse('$_serverUrl/api/rooms/$roomId/sfu-ticket'), headers: {
+      'Authorization': 'Bearer $token'
+    }).timeout(const Duration(seconds: 10));
+    if (response.statusCode != 200) {
+      throw Exception('SFU ticket: HTTP ${response.statusCode}');
+    }
+    return (jsonDecode(response.body) as Map)['ticket'] as String?;
+  }
+
+  Future<void> _connectToSfuNode(Map<String, dynamic> room) async {
     final assignedNode = room['assigned_node'] as Map<String, dynamic>?;
     if (assignedNode == null || _currentUser == null) return;
 
     final rawWsUrl = assignedNode['ws_url'] as String;
     final wsUrl = _resolveSfuWsUrl(rawWsUrl);
     final roomId = room['id'] as String;
+
+    String? ticket;
+    try {
+      ticket = await _fetchSfuTicket(roomId);
+    } catch (_) {
+      // Нода отклонит вход без допуска; повторное подключение сработает в onDone
+    }
+    if (!mounted || _currentRoom?['id'] != roomId || _currentUser == null) {
+      return;
+    }
 
     try {
       _sfuChannel?.sink.close();
@@ -1648,6 +1929,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             'display_name': _currentUser!['display_name'],
             'e2ee_enabled': false,
             'room_key_id': 'NONE',
+            'ticket': ticket,
           },
         }),
       );
@@ -1959,6 +2241,28 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           _outgoingRequests =
               (payload?['outgoing_requests'] as List<dynamic>?) ?? [];
         });
+        // Урок ждёт возвращения после обрыва связи или перезапуска приложения
+        final activeRooms = (payload?['active_rooms'] as List<dynamic>?) ?? [];
+        if (activeRooms.isNotEmpty &&
+            activeRooms.first is Map<String, dynamic>) {
+          final active = activeRooms.first as Map<String, dynamic>;
+          if (_currentRoom != null &&
+              _currentRoom!['id']?.toString() == active['id']?.toString()) {
+            _sendWs({
+              'type': 'join_room',
+              'payload': {
+                'room_id': active['id'],
+                'audio_enabled': _micEnabled,
+                'video_enabled': _camEnabled,
+              },
+            });
+          } else if (_currentRoom == null) {
+            setState(() {
+              _otherDeviceCall = active;
+              _otherDeviceIsResume = true;
+            });
+          }
+        }
         if (_publicKeyB64.isNotEmpty) {
           _sendWs({
             'type': 'update_public_key',
@@ -1990,11 +2294,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         final room = payload?['room'] as Map<String, dynamic>?;
         final wasInRoom =
             _currentRoom != null && _currentRoom!['id'] == room?['id'];
-        final newParticipantIds = ((room?['participants'] as List<dynamic>?) ??
-                [])
-            .map((p) => (p as Map<String, dynamic>)['user_id']?.toString())
-            .whereType<String>()
-            .toList();
+        final newParticipantIds =
+            ((room?['participants'] as List<dynamic>?) ?? [])
+                .map((p) => (p as Map<String, dynamic>)['user_id']?.toString())
+                .whereType<String>()
+                .toList();
         final someoneLeft = wasInRoom &&
             room != null &&
             _prevRoomParticipantIds
@@ -2004,6 +2308,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         setState(() {
           _currentRoom = room;
           _incomingCall = null;
+          if (room != null) _otherDeviceCall = null;
           if (!wasInRoom && room != null) {
             _chatMode = 'lesson';
             _selectedTabIndex =
@@ -2037,6 +2342,34 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       case 'incoming_call':
         setState(() {
           _incomingCall = payload;
+        });
+        break;
+
+      case 'call_on_other_device':
+        final roomId = payload?['room_id']?.toString();
+        final otherRoom = payload?['room'] as Map<String, dynamic>?;
+        final movedAway = otherRoom != null &&
+            _currentRoom != null &&
+            _currentRoom!['id']?.toString() == roomId;
+        if (movedAway) {
+          // Звонок перенесли на другое устройство: отключаемся, не выходя из урока
+          _stopLocalMediaAndSfu();
+        }
+        setState(() {
+          if (_incomingCall?['room']?['id']?.toString() == roomId) {
+            _incomingCall = null;
+          }
+          if (otherRoom != null) {
+            _otherDeviceCall = otherRoom;
+            _otherDeviceIsResume = false;
+          } else if (_otherDeviceCall?['id']?.toString() == roomId) {
+            _otherDeviceCall = null;
+          }
+          if (movedAway) {
+            _currentRoom = null;
+            _prevRoomParticipantIds = [];
+            _statusMessage = 'Урок продолжается на другом устройстве.';
+          }
         });
         break;
 
@@ -2102,8 +2435,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     String? error;
     if (username.isEmpty || _passwordCtrl.text.isEmpty) {
       error = 'Введите никнейм и пароль.';
-    } else if (_isRegister && _passwordCtrl.text.length < 4) {
-      error = 'Пароль должен содержать не менее 4 символов.';
+    } else if (_isRegister && _passwordCtrl.text.length < 8) {
+      error = 'Пароль должен содержать не менее 8 символов.';
     } else if (uri == null ||
         !['http', 'https'].contains(uri.scheme) ||
         uri.host.isEmpty ||
@@ -2126,6 +2459,31 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     await prefs.setString('liaper_server_url', _serverUrl);
 
     try {
+      // Проверка на робота: сервер выдаёт задачу, телефон решает её за секунду-другую
+      String? powChallenge;
+      String? powSolution;
+      if (_isRegister) {
+        setState(() => _authCheckingRobot = true);
+        final chRes = await http
+            .get(Uri.parse('$_serverUrl/api/auth/challenge'))
+            .timeout(const Duration(seconds: 8));
+        final ch = jsonDecode(chRes.body) as Map<String, dynamic>;
+        if (chRes.statusCode >= 400) {
+          if (!mounted) return;
+          setState(() {
+            _authError =
+                (ch['error'] ?? 'Не удалось начать проверку').toString();
+            _authLoading = false;
+            _authCheckingRobot = false;
+          });
+          return;
+        }
+        powChallenge = ch['challenge'].toString();
+        powSolution = await PowSolver.solve(
+            powChallenge, (ch['difficulty'] as num).toInt());
+        if (!mounted) return;
+        setState(() => _authCheckingRobot = false);
+      }
       final endpoint = _isRegister ? '/api/auth/register' : '/api/auth/login';
       final body = _isRegister
           ? {
@@ -2137,6 +2495,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               'role': _selectedRole,
               'e2ee_public_key': _publicKeyB64,
               'key_fingerprint': _fingerprint,
+              'pow_challenge': powChallenge,
+              'pow_solution': powSolution,
             }
           : {
               'username': username,
@@ -2189,6 +2549,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         _authError =
             'Нет связи с сервером ($_serverUrl). Проверьте подключение.';
         _authLoading = false;
+        _authCheckingRobot = false;
       });
     }
   }
@@ -2204,6 +2565,15 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         'Для синхронизации разблокируйте архив паролем аккаунта';
     _reconnectTimer?.cancel();
     _archiveSaveTimer?.cancel();
+    final revokedToken = _token;
+    if (revokedToken != null) {
+      // Отзываем сессию на сервере; выход не ждёт сети
+      http
+          .post(Uri.parse('$_serverUrl/api/auth/logout'),
+              headers: {'Authorization': 'Bearer $revokedToken'})
+          .timeout(const Duration(seconds: 5))
+          .catchError((_) => http.Response('', 0));
+    }
     _token = null;
     _wsConnected = false;
     await _stopLocalMediaAndSfu();
@@ -2221,6 +2591,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       _selectedArchiveMsgIds.clear();
       _forwardingFromArchive = false;
       _incomingCall = null;
+      _otherDeviceCall = null;
       _contacts = [];
       _incomingRequests = [];
       _outgoingRequests = [];
@@ -2332,7 +2703,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     if (!_wsConnected || _currentRoom != null) return;
     final titleCtrl = TextEditingController();
     final selectedNicks = <String>{};
-    final parentBottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final parentBottomInset = MediaQuery.viewPaddingOf(context).bottom;
 
     showModalBottomSheet(
       context: context,
@@ -2345,10 +2716,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setModalState) {
-            final modalBottomSafe = MediaQuery.of(ctx).viewPadding.bottom >
-                    parentBottomInset
-                ? MediaQuery.of(ctx).viewPadding.bottom
-                : parentBottomInset;
+            final modalBottomSafe =
+                MediaQuery.viewPaddingOf(ctx).bottom > parentBottomInset
+                    ? MediaQuery.viewPaddingOf(ctx).bottom
+                    : parentBottomInset;
             return SafeArea(
               top: false,
               child: Padding(
@@ -2356,8 +2727,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   left: 20,
                   right: 20,
                   top: 20,
-                  bottom:
-                      MediaQuery.of(ctx).viewInsets.bottom + modalBottomSafe + 44,
+                  bottom: MediaQuery.viewInsetsOf(ctx).bottom +
+                      modalBottomSafe +
+                      44,
                 ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -2424,7 +2796,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                               value: checked,
                               dense: true,
                               contentPadding: EdgeInsets.zero,
-                              activeColor: const Color(0xFF0F172A),
+                              activeColor: const Color(0xFF4F46E5),
                               title: Text(
                                 '${u['display_name']} (@$nick)',
                                 style: const TextStyle(
@@ -2466,7 +2838,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                         Navigator.pop(ctx);
                       },
                       style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF0F172A),
+                        backgroundColor: const Color(0xFF4F46E5),
                         padding: const EdgeInsets.symmetric(vertical: 14),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(12),
@@ -2638,207 +3010,252 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   backgroundColor: Colors.white,
                   surfaceTintColor: Colors.white,
                   elevation: 0,
-                titleSpacing: 16,
-                title: Row(
-                  children: [
-                    Container(
-                      width: 32,
-                      height: 32,
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF0F172A),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      alignment: Alignment.center,
-                      child: const Text(
-                        'L',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.w700,
-                          fontSize: 15,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          const Text(
-                            'Liaper',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.w700,
-                              color: Color(0xFF0F172A),
-                            ),
-                          ),
-                          Row(
-                            children: [
-                              Container(
-                                width: 7,
-                                height: 7,
-                                decoration: BoxDecoration(
-                                  shape: BoxShape.circle,
-                                  color: _wsConnected
-                                      ? const Color(0xFF10B981)
-                                      : const Color(0xFFF43F5E),
-                                ),
+                  titleSpacing: 16,
+                  title: Row(
+                    children: [
+                      const LiaperLogoMark(size: 36),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Liaper',
+                              style: TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.w700,
+                                color: Color(0xFF0F172A),
                               ),
-                              const SizedBox(width: 5),
-                              Flexible(
-                                child: Text(
-                                  '@${_currentUser!['username']} · ${_currentUser!['role'] == 'tutor' ? 'Репетитор' : 'Ученик'}',
-                                  overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(
-                                    fontSize: 11,
-                                    color: Color(0xFF64748B),
+                            ),
+                            Row(
+                              children: [
+                                Container(
+                                  width: 7,
+                                  height: 7,
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: _wsConnected
+                                        ? const Color(0xFF10B981)
+                                        : const Color(0xFFF43F5E),
                                   ),
                                 ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                actions: [
-                  if (_currentRoom != null)
-                    Padding(
-                      padding: const EdgeInsets.only(right: 12),
-                      child: FilledButton.tonalIcon(
-                        onPressed: () {
-                          setState(() {
-                            _selectedTabIndex = 1;
-                          });
-                        },
-                        style: FilledButton.styleFrom(
-                          backgroundColor: const Color(0xFFDCFCE7),
-                          foregroundColor: const Color(0xFF047857),
-                          visualDensity: VisualDensity.compact,
+                                const SizedBox(width: 5),
+                                Flexible(
+                                  child: Text(
+                                    '@${_currentUser!['username']} · ${_currentUser!['role'] == 'tutor' ? 'Репетитор' : 'Ученик'}',
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      color: Color(0xFF64748B),
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
                         ),
-                        icon: const Icon(Icons.call, size: 16),
-                        label: Text(_formatCallDuration(_callSeconds)),
-                      ),
-                    ),
-                ],
-                bottom: PreferredSize(
-                  preferredSize: const Size.fromHeight(1),
-                  child: Container(height: 1, color: const Color(0xFFE2E8F0)),
-                ),
-              ),
-        body: SafeArea(
-          child: Column(
-            children: [
-              if (!_wsConnected)
-                MaterialBanner(
-                  content: const Text('Нет связи. Переподключаемся…'),
-                  leading: const Icon(Icons.wifi_off, size: 20),
-                  actions: [
-                    TextButton(
-                        onPressed: _connectWebSocket,
-                        child: const Text('Повторить')),
-                    TextButton(
-                        onPressed: _logout, child: const Text('Войти заново')),
-                  ],
-                ),
-              // Уведомление или статус
-              if (_statusMessage != null)
-                Container(
-                  margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFF1E293B),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          _statusMessage!,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 12),
-                        ),
-                      ),
-                      IconButton(
-                        tooltip: 'Закрыть уведомление',
-                        onPressed: () => setState(() => _statusMessage = null),
-                        icon: const Icon(Icons.close,
-                            size: 20, color: Colors.white70),
                       ),
                     ],
                   ),
+                  actions: [
+                    if (_currentRoom != null)
+                      Padding(
+                        padding: const EdgeInsets.only(right: 12),
+                        child: FilledButton.tonalIcon(
+                          onPressed: () {
+                            setState(() {
+                              _selectedTabIndex = 1;
+                            });
+                          },
+                          style: FilledButton.styleFrom(
+                            backgroundColor: const Color(0xFFDCFCE7),
+                            foregroundColor: const Color(0xFF047857),
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          icon: const Icon(Icons.call, size: 16),
+                          label: Text(_formatCallDuration(_callSeconds)),
+                        ),
+                      ),
+                  ],
+                  bottom: PreferredSize(
+                    preferredSize: const Size.fromHeight(1),
+                    child: Container(height: 1, color: const Color(0xFFE2E8F0)),
+                  ),
                 ),
+          body: SafeArea(
+            child: Column(
+              children: [
+                if (!_wsConnected)
+                  MaterialBanner(
+                    content: const Text('Нет связи. Переподключаемся…'),
+                    leading: const Icon(Icons.wifi_off, size: 20),
+                    actions: [
+                      TextButton(
+                          onPressed: _connectWebSocket,
+                          child: const Text('Повторить')),
+                      TextButton(
+                          onPressed: _logout,
+                          child: const Text('Войти заново')),
+                    ],
+                  ),
+                // Уведомление или статус
+                if (_statusMessage != null)
+                  Container(
+                    margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 14, vertical: 10),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF1E293B),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            _statusMessage!,
+                            style: const TextStyle(
+                                color: Colors.white, fontSize: 12),
+                          ),
+                        ),
+                        IconButton(
+                          tooltip: 'Закрыть уведомление',
+                          onPressed: () =>
+                              setState(() => _statusMessage = null),
+                          icon: const Icon(Icons.close,
+                              size: 20, color: Colors.white70),
+                        ),
+                      ],
+                    ),
+                  ),
 
-              // Глобальное окно входящего звонка
-              if (_incomingCall != null) _buildIncomingCallBanner(),
+                // Глобальное окно входящего звонка
+                if (_incomingCall != null) _buildIncomingCallBanner(),
+                if (_otherDeviceCall != null &&
+                    _currentRoom == null &&
+                    _incomingCall == null)
+                  _buildOtherDeviceCallBanner(),
 
-              // Основное содержимое выбранной вкладки (без пересчёта неактивных вкладок при открытии клавиатуры)
-              Expanded(
-                child: _buildActiveTabBody(),
-              ),
-            ],
+                // Основное содержимое выбранной вкладки (без пересчёта неактивных вкладок при открытии клавиатуры)
+                Expanded(
+                  child: _buildActiveTabBody(),
+                ),
+              ],
+            ),
+          ),
+          bottomNavigationBar: isInCallTab ? null : _buildBottomNavigation(),
+        ),
+      ),
+    );
+  }
+
+  /// Нижняя навигация: фирменная подсветка активной вкладки, бейджи и тактильный отклик.
+  Widget _buildBottomNavigation() {
+    const accent = Color(0xFF4F46E5);
+    const muted = Color(0xFF64748B);
+    Widget badge(Widget icon,
+        {int count = 0, bool dot = false, Color color = accent}) {
+      return Badge(
+        isLabelVisible: count > 0 || dot,
+        backgroundColor: color,
+        smallSize: 9,
+        label: count > 0 ? Text(count > 99 ? '99+' : '$count') : null,
+        child: icon,
+      );
+    }
+
+    final isTutor = _currentUser?['role'] == 'tutor';
+    return DecoratedBox(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        border: Border(top: BorderSide(color: Color(0xFFEEF0F4))),
+        boxShadow: [
+          BoxShadow(
+            color: Color(0x0F0F172A),
+            blurRadius: 16,
+            offset: Offset(0, -4),
+          ),
+        ],
+      ),
+      child: NavigationBarTheme(
+        data: NavigationBarThemeData(
+          height: 70,
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          indicatorColor: const Color(0xFFEEF2FF),
+          indicatorShape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+          labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+          iconTheme: WidgetStateProperty.resolveWith(
+            (states) => IconThemeData(
+              size: 25,
+              color: states.contains(WidgetState.selected) ? accent : muted,
+            ),
+          ),
+          labelTextStyle: WidgetStateProperty.resolveWith(
+            (states) => TextStyle(
+              fontSize: 12,
+              letterSpacing: -0.1,
+              fontWeight: states.contains(WidgetState.selected)
+                  ? FontWeight.w700
+                  : FontWeight.w500,
+              color: states.contains(WidgetState.selected)
+                  ? const Color(0xFF312E81)
+                  : muted,
+            ),
           ),
         ),
-        bottomNavigationBar: isInCallTab
-            ? null
-            : NavigationBar(
-                selectedIndex: _selectedTabIndex,
-                onDestinationSelected: (idx) {
-                  setState(() {
-                    _selectedTabIndex = idx;
-                    if (idx == 2) {
-                      _unreadChatCount = 0;
-                    }
-                  });
-                },
-                backgroundColor: Colors.white,
-                surfaceTintColor: Colors.white,
-                indicatorColor: const Color(0xFFE2E8F0),
-                destinations: [
-                  NavigationDestination(
-                    icon: Badge(
-                      isLabelVisible: _incomingRequests.isNotEmpty,
-                      label: Text('${_incomingRequests.length}'),
-                      child: const Icon(Icons.people_outline),
-                    ),
-                    selectedIcon: Badge(
-                      isLabelVisible: _incomingRequests.isNotEmpty,
-                      label: Text('${_incomingRequests.length}'),
-                      child: const Icon(Icons.people),
-                    ),
-                    label: 'Контакты',
-                  ),
-                  NavigationDestination(
-                    icon: Badge(
-                      isLabelVisible: _currentRoom != null,
-                      backgroundColor: const Color(0xFF10B981),
-                      smallSize: 8,
-                      child: const Icon(Icons.videocam_outlined),
-                    ),
-                    selectedIcon: const Icon(Icons.videocam),
-                    label: 'Урок',
-                  ),
-                  NavigationDestination(
-                    icon: Badge(
-                      isLabelVisible: _unreadChatCount > 0,
-                      label: Text('$_unreadChatCount'),
-                      child: const Icon(Icons.chat_bubble_outline),
-                    ),
-                    selectedIcon: const Icon(Icons.chat_bubble),
-                    label: 'Сообщения',
-                  ),
-                  NavigationDestination(
-                    icon: Badge(
-                      isLabelVisible: _updateAvailable,
-                      smallSize: 8,
-                      child: const Icon(Icons.person_outline),
-                    ),
-                    selectedIcon: const Icon(Icons.person),
-                    label: 'Профиль',
-                  ),
-                ],
-              ),
+        child: NavigationBar(
+          selectedIndex: _selectedTabIndex,
+          elevation: 0,
+          animationDuration: const Duration(milliseconds: 260),
+          onDestinationSelected: (idx) {
+            if (idx != _selectedTabIndex) HapticFeedback.selectionClick();
+            setState(() {
+              _selectedTabIndex = idx;
+              if (idx == 2) {
+                _unreadChatCount = 0;
+              }
+            });
+          },
+          destinations: [
+            NavigationDestination(
+              icon: badge(
+                  Icon(isTutor ? Icons.groups_outlined : Icons.school_outlined),
+                  count: _incomingRequests.length,
+                  color: const Color(0xFFF59E0B)),
+              selectedIcon: badge(
+                  Icon(isTutor ? Icons.groups_rounded : Icons.school_rounded),
+                  count: _incomingRequests.length,
+                  color: const Color(0xFFF59E0B)),
+              label: isTutor ? 'Ученики' : 'Преподаватели',
+              tooltip: isTutor ? 'Ученики' : 'Преподаватели',
+            ),
+            NavigationDestination(
+              icon: badge(const Icon(Icons.videocam_outlined),
+                  dot: _currentRoom != null, color: const Color(0xFF10B981)),
+              selectedIcon: badge(const Icon(Icons.videocam_rounded),
+                  dot: _currentRoom != null, color: const Color(0xFF10B981)),
+              label: _currentRoom != null ? 'Идёт урок' : 'Урок',
+              tooltip: 'Урок',
+            ),
+            NavigationDestination(
+              icon: badge(const Icon(Icons.chat_bubble_outline_rounded),
+                  count: _unreadChatCount),
+              selectedIcon: badge(const Icon(Icons.chat_bubble_rounded),
+                  count: _unreadChatCount),
+              label: 'Сообщения',
+              tooltip: 'Сообщения',
+            ),
+            NavigationDestination(
+              icon: badge(const Icon(Icons.account_circle_outlined),
+                  dot: _updateAvailable),
+              selectedIcon: badge(const Icon(Icons.account_circle_rounded),
+                  dot: _updateAvailable),
+              label: 'Профиль',
+              tooltip: 'Профиль',
+            ),
+          ],
         ),
       ),
     );
@@ -2847,6 +3264,172 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // ===========================================================================
   // Баннер входящего звонка
   // ===========================================================================
+  bool get _canRenameLesson =>
+      _currentRoom != null &&
+      (_currentUser?['role'] == 'tutor' ||
+          _currentRoom!['host_id']?.toString() ==
+              _currentUser?['id']?.toString());
+
+  /// Тему урока можно задать уже во время звонка.
+  Future<void> _showRenameTopicDialog() async {
+    final room = _currentRoom;
+    if (room == null) return;
+    final ctrl = TextEditingController(text: (room['title'] ?? '').toString());
+    final title = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Тема урока'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          maxLength: 80,
+          textCapitalization: TextCapitalization.sentences,
+          decoration:
+              const InputDecoration(hintText: 'Например: Квадратные уравнения'),
+          onSubmitted: (v) => Navigator.pop(ctx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text),
+            child: const Text('Сохранить'),
+          ),
+        ],
+      ),
+    );
+    ctrl.dispose();
+    final clean = title?.trim() ?? '';
+    if (clean.isEmpty || _currentRoom == null || clean == room['title']) return;
+    _sendWs({
+      'type': 'rename_room',
+      'payload': {'room_id': _currentRoom!['id'], 'title': clean},
+    });
+  }
+
+  /// Компактная пометка «Переслано · Имя»; подробности — по долгому нажатию.
+  Widget _forwardedLabel(ForwardedFrom f, bool onAccent) {
+    final color = onAccent ? const Color(0xFFC7D2FE) : const Color(0xFF4F46E5);
+    final details =
+        'Из урока «${f.source}»${f.username != null ? ', @${f.username}' : ''}${f.time != null ? ', ${f.time}' : ''}';
+    return Tooltip(
+      message: details,
+      triggerMode: TooltipTriggerMode.longPress,
+      child: Padding(
+        padding: const EdgeInsets.only(bottom: 4),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.shortcut_rounded, size: 14, color: color),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(
+                'Переслано · ${f.sender}',
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Плашка «урок идёт на другом устройстве» с переносом звонка на телефон.
+  Widget _buildOtherDeviceCallBanner() {
+    final room = _otherDeviceCall!;
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+      padding: const EdgeInsets.fromLTRB(14, 10, 10, 10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFECFDF5),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: const Color(0xFFA7F3D0)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 10,
+            height: 10,
+            decoration: const BoxDecoration(
+              color: Color(0xFF10B981),
+              shape: BoxShape.circle,
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  _otherDeviceIsResume
+                      ? 'Урок продолжается'
+                      : 'Урок идёт на другом устройстве',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13.5,
+                    color: Color(0xFF064E3B),
+                  ),
+                ),
+                Text(
+                  (room['title'] ?? '').toString(),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style:
+                      const TextStyle(fontSize: 12, color: Color(0xFF047857)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          FilledButton.icon(
+            onPressed: _wsConnected ? _takeOverCall : null,
+            style: FilledButton.styleFrom(
+              backgroundColor: const Color(0xFF059669),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              visualDensity: VisualDensity.compact,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+              ),
+            ),
+            icon: Icon(
+                _otherDeviceIsResume
+                    ? Icons.videocam_rounded
+                    : Icons.phone_android_rounded,
+                size: 18),
+            label: Text(_otherDeviceIsResume ? 'Вернуться' : 'Сюда'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Забрать идущий урок с другого устройства на телефон.
+  void _takeOverCall() {
+    final room = _otherDeviceCall;
+    if (room == null) return;
+    setState(() {
+      _otherDeviceCall = null;
+      _selectedTabIndex = 1;
+    });
+    _sendWs({
+      'type': 'join_room',
+      'payload': {
+        'room_id': room['id'],
+        'audio_enabled': _micEnabled,
+        'video_enabled': _camEnabled,
+      },
+    });
+  }
+
   Widget _buildIncomingCallBanner() {
     final caller = _incomingCall!['caller'] as Map<String, dynamic>;
     final room = _incomingCall!['room'] as Map<String, dynamic>;
@@ -3023,25 +3606,26 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       ),
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  OutlinedButton.icon(
-                    onPressed: _wsConnected && _currentRoom == null
-                        ? _showCreateGroupDialog
-                        : null,
-                    style: OutlinedButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      foregroundColor: const Color(0xFF0F172A),
-                      side: const BorderSide(color: Color(0xFFCBD5E1)),
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 10, vertical: 6),
+                  if (isTutorAccount) const SizedBox(width: 8),
+                  if (isTutorAccount)
+                    OutlinedButton.icon(
+                      onPressed: _wsConnected && _currentRoom == null
+                          ? _showCreateGroupDialog
+                          : null,
+                      style: OutlinedButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        foregroundColor: const Color(0xFF0F172A),
+                        side: const BorderSide(color: Color(0xFFCBD5E1)),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 6),
+                      ),
+                      icon: const Icon(Icons.group_add_outlined, size: 16),
+                      label: const Text(
+                        'Группа',
+                        style: TextStyle(
+                            fontSize: 12, fontWeight: FontWeight.w600),
+                      ),
                     ),
-                    icon: const Icon(Icons.group_add_outlined, size: 16),
-                    label: const Text(
-                      'Группа',
-                      style:
-                          TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-                    ),
-                  ),
                 ],
               ),
               const SizedBox(height: 4),
@@ -3090,7 +3674,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                           ? _sendContactRequest
                           : null,
                       style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF0F172A),
+                        backgroundColor: const Color(0xFF4F46E5),
                         padding: const EdgeInsets.symmetric(
                             horizontal: 14, vertical: 12),
                         shape: RoundedRectangleBorder(
@@ -3119,7 +3703,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Входящие заявки в контакты (${_incomingRequests.length})',
+                  'Приглашения (${_incomingRequests.length})',
                   style: const TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w700,
@@ -3167,7 +3751,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                 onPressed: () => _respondContactRequest(
                                     r['id'] as String, true),
                                 style: FilledButton.styleFrom(
-                                  backgroundColor: const Color(0xFF0F172A),
+                                  backgroundColor: const Color(0xFF4F46E5),
                                   visualDensity: VisualDensity.compact,
                                 ),
                                 child: const Text(
@@ -3251,7 +3835,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           children: [
             Expanded(
               child: Text(
-                'Мои контакты (${_contacts.length})',
+                '${_currentUser?['role'] == 'tutor' ? 'Мои ученики' : 'Мои преподаватели'} (${_contacts.length})',
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   fontSize: 15,
@@ -3271,7 +3855,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               onChanged: (_) => setState(() {}),
               decoration: InputDecoration(
                 prefixIcon: const Icon(Icons.search, size: 18),
-                hintText: 'Фильтр по контактам...',
+                hintText: 'Поиск по имени или @нику',
                 isDense: true,
                 filled: true,
                 fillColor: Colors.white,
@@ -3495,16 +4079,18 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 ),
               ),
               const SizedBox(height: 8),
-              const Text(
-                'Выберите собеседника во вкладке «Контакты» или создайте групповой урок.',
+              Text(
+                _currentUser?['role'] == 'tutor'
+                    ? 'Выберите ученика во вкладке «Ученики» или создайте групповой урок.'
+                    : 'Выберите преподавателя во вкладке «Преподаватели», чтобы написать ему.',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 13, color: Color(0xFF64748B)),
+                style: const TextStyle(fontSize: 13, color: Color(0xFF64748B)),
               ),
               const SizedBox(height: 20),
               FilledButton.icon(
                 onPressed: () => setState(() => _selectedTabIndex = 0),
                 style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF0F172A),
+                  backgroundColor: const Color(0xFF4F46E5),
                   padding:
                       const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                   shape: RoundedRectangleBorder(
@@ -3512,7 +4098,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   ),
                 ),
                 icon: const Icon(Icons.people_outline, size: 18),
-                label: const Text('Перейти к контактам'),
+                label: Text(_currentUser?['role'] == 'tutor'
+                    ? 'Перейти к ученикам'
+                    : 'Перейти к преподавателям'),
               ),
             ],
           ),
@@ -3556,20 +4144,39 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               child: primaryPeer == null
                   ? _buildWaitingForPeerStage()
                   : primaryRemoteFrame != null
-                      ? InteractiveViewer(
-                          minScale: 1.0,
-                          maxScale: 4.5,
-                          child: Center(
-                            child: Image.memory(
-                              primaryRemoteFrame,
-                              gaplessPlayback: true,
-                              fit: (_fitContain || isPrimaryScreenShare)
-                                  ? BoxFit.contain
-                                  : BoxFit.cover,
-                              width: double.infinity,
-                              height: double.infinity,
+                      ? Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            // Размытая копия кадра заполняет поля вокруг вертикального/горизонтального видео
+                            if (_fitContain && !isPrimaryScreenShare)
+                              ImageFiltered(
+                                imageFilter:
+                                    ImageFilter.blur(sigmaX: 28, sigmaY: 28),
+                                child: Opacity(
+                                  opacity: 0.55,
+                                  child: Image.memory(
+                                    primaryRemoteFrame,
+                                    gaplessPlayback: true,
+                                    fit: BoxFit.cover,
+                                  ),
+                                ),
+                              ),
+                            InteractiveViewer(
+                              minScale: 1.0,
+                              maxScale: 4.5,
+                              child: Center(
+                                child: Image.memory(
+                                  primaryRemoteFrame,
+                                  gaplessPlayback: true,
+                                  fit: (_fitContain || isPrimaryScreenShare)
+                                      ? BoxFit.contain
+                                      : BoxFit.cover,
+                                  width: double.infinity,
+                                  height: double.infinity,
+                                ),
+                              ),
                             ),
-                          ),
+                          ],
                         )
                       : _buildAudioOnlyPeerStage(primaryPeer),
             ),
@@ -3608,13 +4215,32 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(
-                            (_currentRoom!['title'] ?? 'Урок').toString(),
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.w700,
-                              fontSize: 14,
+                          InkWell(
+                            onTap: _canRenameLesson
+                                ? _showRenameTopicDialog
+                                : null,
+                            borderRadius: BorderRadius.circular(6),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    (_currentRoom!['title'] ?? 'Урок')
+                                        .toString(),
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 14,
+                                    ),
+                                  ),
+                                ),
+                                if (_canRenameLesson) ...[
+                                  const SizedBox(width: 4),
+                                  const Icon(Icons.edit_rounded,
+                                      size: 14, color: Colors.white70),
+                                ],
+                              ],
                             ),
                           ),
                           Text(
@@ -3774,7 +4400,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                             child: Padding(
                                 padding: EdgeInsets.symmetric(
                                     horizontal: 6, vertical: 3),
-                                child: Text('Вы · ↔',
+                                child: Text('Вы',
                                     style: TextStyle(
                                         fontSize: 11, color: Colors.white))),
                           ),
@@ -3790,7 +4416,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             Positioned(
               left: 16,
               right: 16,
-              bottom: 38 + MediaQuery.of(context).viewPadding.bottom * 0.5,
+              bottom: 38 + MediaQuery.viewPaddingOf(context).bottom * 0.5,
               child: Container(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -4022,7 +4648,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
   void _showInviteParticipantSheet() {
     if (_currentRoom == null) return;
-    final parentBottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final parentBottomInset = MediaQuery.viewPaddingOf(context).bottom;
     showModalBottomSheet(
       context: context,
       useSafeArea: true,
@@ -4031,10 +4657,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) {
-        final modalBottomSafe = MediaQuery.of(ctx).viewPadding.bottom >
-                parentBottomInset
-            ? MediaQuery.of(ctx).viewPadding.bottom
-            : parentBottomInset;
+        final modalBottomSafe =
+            MediaQuery.viewPaddingOf(ctx).bottom > parentBottomInset
+                ? MediaQuery.viewPaddingOf(ctx).bottom
+                : parentBottomInset;
         return SafeArea(
           top: false,
           child: Padding(
@@ -4088,7 +4714,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                               });
                             },
                             style: FilledButton.styleFrom(
-                              backgroundColor: const Color(0xFF0F172A),
+                              backgroundColor: const Color(0xFF4F46E5),
                             ),
                             child: const Text('Позвать'),
                           ),
@@ -4131,9 +4757,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         final time = (msgMap['time'] ?? '').toString();
         final origText = (msgMap['text'] ?? '').toString();
 
-        final header =
-            '↪ Переслано из архива «$archiveTitle» ($sender${username.isNotEmpty ? ' @$username' : ''}${time.isNotEmpty ? ', $time' : ''})';
-        final bodyText = origText.isNotEmpty ? '$header:\n$origText' : header;
+        final forwarded = ForwardedFrom(
+          source: archiveTitle,
+          sender: sender,
+          username: username.isEmpty ? null : username,
+          time: time.isEmpty ? null : time,
+        );
 
         ChatAttachmentMeta? finalAttMeta;
         if (msgMap['attachment'] is Map) {
@@ -4167,8 +4796,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           }
         }
 
-        final serialized =
-            AndroidE2eeService.serializeChatPayload(bodyText, finalAttMeta);
+        final serialized = AndroidE2eeService.serializeChatPayload(
+            origText, finalAttMeta, forwarded);
         final encrypted =
             await AndroidE2eeService.encryptChatWithBundle(serialized, roomKey);
         final ok = _sendWs({
@@ -4217,7 +4846,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     }
 
     final archiveTitle = (archive['title'] ?? 'Урок').toString();
-    final parentBottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final parentBottomInset = MediaQuery.viewPaddingOf(context).bottom;
 
     showModalBottomSheet(
       context: context,
@@ -4227,10 +4856,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) {
-        final modalBottomSafe = MediaQuery.of(ctx).viewPadding.bottom >
-                parentBottomInset
-            ? MediaQuery.of(ctx).viewPadding.bottom
-            : parentBottomInset;
+        final modalBottomSafe =
+            MediaQuery.viewPaddingOf(ctx).bottom > parentBottomInset
+                ? MediaQuery.viewPaddingOf(ctx).bottom
+                : parentBottomInset;
         return SafeArea(
           top: false,
           child: Padding(
@@ -4282,7 +4911,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                           ListTile(
                             contentPadding: EdgeInsets.zero,
                             leading: const CircleAvatar(
-                              backgroundColor: Color(0xFF0F172A),
+                              backgroundColor: Color(0xFF4F46E5),
                               child: Icon(Icons.videocam,
                                   color: Colors.white, size: 18),
                             ),
@@ -4305,7 +4934,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                 );
                               },
                               style: FilledButton.styleFrom(
-                                backgroundColor: const Color(0xFF0F172A),
+                                backgroundColor: const Color(0xFF4F46E5),
                                 visualDensity: VisualDensity.compact,
                               ),
                               icon: const Icon(Icons.forward_rounded, size: 16),
@@ -4357,7 +4986,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                 );
                               },
                               style: FilledButton.styleFrom(
-                                backgroundColor: const Color(0xFF0F172A),
+                                backgroundColor: const Color(0xFF4F46E5),
                                 visualDensity: VisualDensity.compact,
                               ),
                               icon: const Icon(Icons.forward_rounded, size: 16),
@@ -4585,7 +5214,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               FilledButton.icon(
                 onPressed: _sendRecordedNote,
                 style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF0F172A),
+                  backgroundColor: const Color(0xFF4F46E5),
                 ),
                 icon: const Icon(Icons.send_rounded, size: 16),
                 label: const Text('Отправить'),
@@ -4937,8 +5566,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                       itemCount: indexedMsgs.length,
                                       itemBuilder: (_, mIdx) {
                                         final map = indexedMsgs[mIdx];
-                                        final selKey =
-                                            map['_selKey'] as String;
+                                        final selKey = map['_selKey'] as String;
                                         final isSelected =
                                             _selectedArchiveMsgIds
                                                 .contains(selKey);
@@ -4983,7 +5611,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                         }
                                         final hideDefaultAttachmentCaption =
                                             attMeta != null &&
-                                                (text.startsWith('Вложение: ') ||
+                                                (text.startsWith(
+                                                        'Вложение: ') ||
                                                     text.startsWith(
                                                         'Голосовое сообщение') ||
                                                     text.startsWith(
@@ -5110,8 +5739,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                                           ),
                                                         ),
                                                         if ((!hideDefaultAttachmentCaption &&
-                                                                text
-                                                                    .isNotEmpty) ||
+                                                                text.isNotEmpty) ||
                                                             attMeta == null)
                                                           Container(
                                                             padding:
@@ -5376,10 +6004,31 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   )
                 : (visibleMessages.isEmpty && visibleTransfers.isEmpty)
                     ? const Center(
-                        child: Text(
-                          'Сообщений пока нет. Напишите первым или отправьте файл!',
-                          style:
-                              TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
+                        child: Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 32),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(Icons.chat_bubble_outline_rounded,
+                                  size: 36, color: Color(0xFFCBD5E1)),
+                              SizedBox(height: 10),
+                              Text(
+                                'Сообщений пока нет',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                    color: Color(0xFF334155),
+                                    fontSize: 15,
+                                    fontWeight: FontWeight.w600),
+                              ),
+                              SizedBox(height: 4),
+                              Text(
+                                'Напишите первым или отправьте файл',
+                                textAlign: TextAlign.center,
+                                style: TextStyle(
+                                    color: Color(0xFF94A3B8), fontSize: 13),
+                              ),
+                            ],
+                          ),
                         ),
                       )
                     : RepaintBoundary(
@@ -5415,12 +6064,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                   '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
                             } catch (_) {}
 
-                            final hideDefaultAttachmentCaption =
-                                m.attachment != null &&
-                                    (m.text.startsWith('Вложение: ') ||
-                                        m.text.startsWith(
-                                            'Голосовое сообщение') ||
-                                        m.text.startsWith('Видеокружок'));
+                            final hideDefaultAttachmentCaption = m.attachment !=
+                                    null &&
+                                (m.text.startsWith('Вложение: ') ||
+                                    m.text.startsWith('Голосовое сообщение') ||
+                                    m.text.startsWith('Видеокружок'));
                             final hasTextBubble =
                                 (!hideDefaultAttachmentCaption &&
                                         m.text.trim().isNotEmpty) ||
@@ -5519,7 +6167,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                           ),
                                           decoration: BoxDecoration(
                                             color: isMe
-                                                ? const Color(0xFF0F172A)
+                                                ? const Color(0xFF4F46E5)
                                                 : Colors.white,
                                             borderRadius:
                                                 BorderRadius.circular(16),
@@ -5529,16 +6177,28 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                                     color: const Color(
                                                         0xFFE2E8F0)),
                                           ),
-                                          child: Text(
-                                            m.text,
-                                            style: TextStyle(
-                                              fontSize: 14,
-                                              color: isMe
-                                                  ? Colors.white
-                                                  : const Color(0xFF0F172A),
-                                            ),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              if (m.forwarded != null)
+                                                _forwardedLabel(
+                                                    m.forwarded!, isMe),
+                                              Text(
+                                                m.text,
+                                                style: TextStyle(
+                                                  fontSize: 14,
+                                                  color: isMe
+                                                      ? Colors.white
+                                                      : const Color(0xFF0F172A),
+                                                ),
+                                              ),
+                                            ],
                                           ),
                                         ),
+                                      if (m.forwarded != null && !hasTextBubble)
+                                        _forwardedLabel(m.forwarded!, false),
                                       if (m.attachment != null &&
                                           _token != null)
                                         ChatAttachmentCard(
@@ -5560,7 +6220,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
           ),
 
           if (_noteRecordMode != 'idle') _buildNoteRecorderPanel(),
-          if (_showEmojiPicker && targetRoomId != null && _noteRecordMode == 'idle')
+          if (_showEmojiPicker &&
+              targetRoomId != null &&
+              _noteRecordMode == 'idle')
             _buildEmojiPickerPanel(),
           if (_editingMessage != null)
             Container(
@@ -5621,7 +6283,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               ),
             ),
 
-          // Поле ввода сообщения + компактное дропбокс-меню справа от поля
+          // Кнопка вложений слева, поле ввода и отправка справа
           Container(
             padding: const EdgeInsets.fromLTRB(10, 8, 8, 10),
             decoration: const BoxDecoration(
@@ -5630,6 +6292,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             ),
             child: Row(
               children: [
+                _buildAttachButton(
+                    enabled: targetRoomId != null && _wsConnected),
+                const SizedBox(width: 8),
                 Expanded(
                   child: TextField(
                     controller: _chatInputCtrl,
@@ -5662,247 +6327,6 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   ),
                 ),
                 const SizedBox(width: 6),
-                PopupMenuButton<String>(
-                  tooltip: 'Вложения и эмодзи',
-                  enabled: targetRoomId != null && _wsConnected,
-                  offset: const Offset(0, -210),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
-                    side: const BorderSide(color: Color(0xFFE2E8F0)),
-                  ),
-                  color: Colors.white,
-                  surfaceTintColor: Colors.white,
-                  elevation: 8,
-                  onSelected: (action) {
-                    switch (action) {
-                      case 'emoji':
-                        setState(() => _showEmojiPicker = !_showEmojiPicker);
-                        break;
-                      case 'file':
-                        if (_noteRecordMode == 'idle') {
-                          _pickAndSendAttachmentFile();
-                        }
-                        break;
-                      case 'voice':
-                        if (_noteRecordMode == 'idle') {
-                          _startVoiceOrVideoNoteRecording(isVideo: false);
-                        }
-                        break;
-                      case 'video':
-                        if (_noteRecordMode == 'idle') {
-                          _startVoiceOrVideoNoteRecording(isVideo: true);
-                        }
-                        break;
-                    }
-                  },
-                  itemBuilder: (context) => [
-                    PopupMenuItem<String>(
-                      value: 'emoji',
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 34,
-                            height: 34,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFFEF3C7),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            alignment: Alignment.center,
-                            child: const Text('😊', style: TextStyle(fontSize: 17)),
-                          ),
-                          const SizedBox(width: 10),
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  _showEmojiPicker
-                                      ? 'Скрыть панель эмодзи'
-                                      : 'Набор эмодзи',
-                                  style: const TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                    color: Color(0xFF0F172A),
-                                  ),
-                                ),
-                                const Text(
-                                  'Смайлы, жесты и реакции',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: Color(0xFF64748B),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    PopupMenuItem<String>(
-                      value: 'file',
-                      enabled: _noteRecordMode == 'idle',
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 34,
-                            height: 34,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFF1F5F9),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            alignment: Alignment.center,
-                            child: const Icon(
-                              Icons.attach_file_rounded,
-                              size: 18,
-                              color: Color(0xFF334155),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          const Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  'Прикрепить файл',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                    color: Color(0xFF0F172A),
-                                  ),
-                                ),
-                                Text(
-                                  'PDF, Word или фото (до 128 МиБ)',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: Color(0xFF64748B),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    PopupMenuItem<String>(
-                      value: 'voice',
-                      enabled: _noteRecordMode == 'idle',
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 34,
-                            height: 34,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFECFDF5),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            alignment: Alignment.center,
-                            child: const Icon(
-                              Icons.mic_none_rounded,
-                              size: 18,
-                              color: Color(0xFF047857),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          const Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  'Голосовое сообщение',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                    color: Color(0xFF0F172A),
-                                  ),
-                                ),
-                                Text(
-                                  'Записать аудиосообщение (E2EE)',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: Color(0xFF64748B),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    PopupMenuItem<String>(
-                      value: 'video',
-                      enabled: _noteRecordMode == 'idle',
-                      child: Row(
-                        children: [
-                          Container(
-                            width: 34,
-                            height: 34,
-                            decoration: BoxDecoration(
-                              color: const Color(0xFFEEF2FF),
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            alignment: Alignment.center,
-                            child: const Icon(
-                              Icons.videocam_outlined,
-                              size: 18,
-                              color: Color(0xFF4338CA),
-                            ),
-                          ),
-                          const SizedBox(width: 10),
-                          const Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  'Видеокружок',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                    color: Color(0xFF0F172A),
-                                  ),
-                                ),
-                                Text(
-                                  'Записать круглое видео (E2EE)',
-                                  style: TextStyle(
-                                    fontSize: 11,
-                                    color: Color(0xFF64748B),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                  child: Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: _showEmojiPicker
-                          ? const Color(0xFF0F172A)
-                          : const Color(0xFFF1F5F9),
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(
-                        color: _showEmojiPicker
-                            ? const Color(0xFF0F172A)
-                            : const Color(0xFFE2E8F0),
-                      ),
-                    ),
-                    alignment: Alignment.center,
-                    child: Icon(
-                      Icons.add_rounded,
-                      size: 22,
-                      color: _showEmojiPicker
-                          ? Colors.white
-                          : const Color(0xFF334155),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
                 ValueListenableBuilder<TextEditingValue>(
                   valueListenable: _chatInputCtrl,
                   builder: (context, textVal, _) {
@@ -5923,7 +6347,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                               }
                             },
                       style: IconButton.styleFrom(
-                        backgroundColor: const Color(0xFF0F172A),
+                        backgroundColor: const Color(0xFF4F46E5),
                         foregroundColor: Colors.white,
                       ),
                       icon: const Icon(Icons.send_rounded, size: 19),
@@ -5936,6 +6360,188 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         ],
       ],
     );
+  }
+
+  bool _attachMenuOpen = false;
+
+  /// Круглая кнопка «+» слева от поля ввода: поворачивается в «×» и открывает шторку вложений.
+  Widget _buildAttachButton({required bool enabled}) {
+    final active = _attachMenuOpen || _showEmojiPicker;
+    return Semantics(
+      button: true,
+      label: 'Открыть меню вложений',
+      child: Tooltip(
+        message: 'Файл, голосовое, видеокружок, эмодзи',
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: !enabled
+                ? const Color(0xFFF1F5F9)
+                : active
+                    ? const Color(0xFF4F46E5)
+                    : const Color(0xFFEEF2FF),
+            boxShadow: active && enabled
+                ? const [
+                    BoxShadow(
+                      color: Color(0x554F46E5),
+                      blurRadius: 14,
+                      offset: Offset(0, 6),
+                    ),
+                  ]
+                : null,
+          ),
+          child: Material(
+            type: MaterialType.transparency,
+            child: InkWell(
+              customBorder: const CircleBorder(),
+              onTap: enabled ? _openAttachSheet : null,
+              child: Center(
+                child: AnimatedRotation(
+                  turns: _attachMenuOpen ? 0.125 : 0,
+                  duration: const Duration(milliseconds: 220),
+                  curve: Curves.easeOutBack,
+                  child: Icon(
+                    Icons.add_rounded,
+                    size: 26,
+                    color: !enabled
+                        ? const Color(0xFF94A3B8)
+                        : active
+                            ? Colors.white
+                            : const Color(0xFF4F46E5),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _openAttachSheet() async {
+    setState(() => _attachMenuOpen = true);
+    final idle = _noteRecordMode == 'idle';
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      backgroundColor: Colors.white,
+      showDragHandle: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (ctx) {
+        Widget tile(
+            String value, IconData icon, String title, Color bg, Color fg,
+            {bool enabled = true}) {
+          return Expanded(
+            child: Opacity(
+              opacity: enabled ? 1 : 0.4,
+              child: InkWell(
+                borderRadius: BorderRadius.circular(16),
+                onTap: enabled ? () => Navigator.pop(ctx, value) : null,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 56,
+                        height: 56,
+                        decoration:
+                            BoxDecoration(color: bg, shape: BoxShape.circle),
+                        child: Icon(icon, color: fg, size: 26),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        title,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF0F172A),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.only(left: 4, bottom: 12),
+                  child: Text(
+                    'Прикрепить',
+                    style: TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF0F172A),
+                    ),
+                  ),
+                ),
+                Row(
+                  children: [
+                    tile('file', Icons.description_rounded, 'Файл',
+                        const Color(0xFFEEF2FF), const Color(0xFF4F46E5),
+                        enabled: idle),
+                    tile('voice', Icons.mic_rounded, 'Голосовое',
+                        const Color(0xFFECFDF5), const Color(0xFF059669),
+                        enabled: idle),
+                    tile('video', Icons.videocam_rounded, 'Кружок',
+                        const Color(0xFFFFF1F2), const Color(0xFFE11D48),
+                        enabled: idle),
+                    tile(
+                        'emoji',
+                        Icons.emoji_emotions_rounded,
+                        _showEmojiPicker ? 'Скрыть эмодзи' : 'Эмодзи',
+                        const Color(0xFFFFFBEB),
+                        const Color(0xFFD97706)),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 4),
+                  child: Text(
+                    'PDF, Word и фото до 128 МБ. Файлы шифруются на телефоне перед отправкой.',
+                    style: TextStyle(fontSize: 12, color: Color(0xFF64748B)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    if (!mounted) return;
+    setState(() => _attachMenuOpen = false);
+    switch (action) {
+      case 'emoji':
+        setState(() => _showEmojiPicker = !_showEmojiPicker);
+        break;
+      case 'file':
+        if (_noteRecordMode == 'idle') _pickAndSendAttachmentFile();
+        break;
+      case 'voice':
+        if (_noteRecordMode == 'idle') {
+          _startVoiceOrVideoNoteRecording(isVideo: false);
+        }
+        break;
+      case 'video':
+        if (_noteRecordMode == 'idle') {
+          _startVoiceOrVideoNoteRecording(isVideo: true);
+        }
+        break;
+    }
   }
 
   // ===========================================================================
@@ -5968,7 +6574,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             children: [
               CircleAvatar(
                 radius: 28,
-                backgroundColor: const Color(0xFF0F172A),
+                backgroundColor: const Color(0xFF4F46E5),
                 child: Text(
                   (displayName.isEmpty
                           ? '?'
@@ -6048,7 +6654,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               FilledButton.icon(
                 onPressed: _showAdminMonitoringSheet,
                 style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF0F172A),
+                  backgroundColor: const Color(0xFF4F46E5),
                 ),
                 icon: const Icon(Icons.dns_outlined, size: 18),
                 label: const Text('Открыть админку мониторинга'),
@@ -6105,7 +6711,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                   FilledButton.icon(
                     onPressed: _downloadAndInstallApk,
                     style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF0F172A),
+                      backgroundColor: const Color(0xFF4F46E5),
                     ),
                     icon: const Icon(Icons.system_update_alt, size: 18),
                     label: const Text('Скачать и установить APK'),
@@ -6142,7 +6748,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
 
   void _showReportChatSheet(String roomId, String roomTitle) {
     if (_token == null) return;
-    final parentBottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final parentBottomInset = MediaQuery.viewPaddingOf(context).bottom;
     final reasonCtrl = TextEditingController(
       text: 'Оскорбления / нарушение правил занятия',
     );
@@ -6159,11 +6765,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setModalState) {
-            final modalBottomSafe = MediaQuery.of(ctx).viewPadding.bottom >
-                    parentBottomInset
-                ? MediaQuery.of(ctx).viewPadding.bottom
-                : parentBottomInset;
-            final keyboardInset = MediaQuery.of(ctx).viewInsets.bottom;
+            final modalBottomSafe =
+                MediaQuery.viewPaddingOf(ctx).bottom > parentBottomInset
+                    ? MediaQuery.viewPaddingOf(ctx).bottom
+                    : parentBottomInset;
+            final keyboardInset = MediaQuery.viewInsetsOf(ctx).bottom;
             return SafeArea(
               top: false,
               child: Padding(
@@ -6299,12 +6905,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   }
 
   void _showAdminMonitoringSheet() {
-    final parentBottomInset = MediaQuery.of(context).viewPadding.bottom;
+    final parentBottomInset = MediaQuery.viewPaddingOf(context).bottom;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       useSafeArea: true,
-      backgroundColor: const Color(0xFF0F172A),
+      backgroundColor: const Color(0xFF4F46E5),
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
@@ -6345,10 +6951,10 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               requestedInitial = true;
               Future.microtask(() => load(setModalState));
             }
-            final modalBottomSafe = MediaQuery.of(ctx).viewPadding.bottom >
-                    parentBottomInset
-                ? MediaQuery.of(ctx).viewPadding.bottom
-                : parentBottomInset;
+            final modalBottomSafe =
+                MediaQuery.viewPaddingOf(ctx).bottom > parentBottomInset
+                    ? MediaQuery.viewPaddingOf(ctx).bottom
+                    : parentBottomInset;
             final summary =
                 (overview?['summary'] as Map<String, dynamic>?) ?? const {};
             final nodes = (overview?['media_nodes'] as List<dynamic>?) ?? [];
@@ -6362,8 +6968,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 (antifraud['counters'] as Map<String, dynamic>?) ?? const {};
             final afIncidents =
                 (antifraud['incidents'] as List<dynamic>?) ?? [];
-            final fnOnline =
-                fileNodes.isNotEmpty && (fileNodes.first as Map)['online'] == true;
+            final fnOnline = fileNodes.isNotEmpty &&
+                (fileNodes.first as Map)['online'] == true;
 
             return SafeArea(
               top: false,
@@ -6374,8 +6980,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 maxChildSize: 0.96,
                 builder: (_, scrollCtrl) {
                   return Padding(
-                    padding: EdgeInsets.fromLTRB(
-                        16, 16, 16, modalBottomSafe + 28),
+                    padding:
+                        EdgeInsets.fromLTRB(16, 16, 16, modalBottomSafe + 28),
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
@@ -6585,8 +7191,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                                           )
                                         else
                                           ...reports.map((rawRep) {
-                                            final r = rawRep
-                                                as Map<String, dynamic>;
+                                            final r =
+                                                rawRep as Map<String, dynamic>;
                                             final keys = (r['disclosed_keys']
                                                     as List<dynamic>?) ??
                                                 [];
@@ -6784,27 +7390,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    Row(
+                    const Row(
                       children: [
-                        Container(
-                          width: 40,
-                          height: 40,
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF0F172A),
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          alignment: Alignment.center,
-                          child: const Text(
-                            'L',
-                            style: TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 20,
-                              color: Colors.white,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        const Expanded(
+                        LiaperLogoMark(size: 44),
+                        SizedBox(width: 12),
+                        Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
@@ -6912,7 +7502,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       onSubmitted: (_) => _submitAuth(),
                       decoration: InputDecoration(
                         labelText: 'Пароль',
-                        helperText: _isRegister ? 'Не менее 4 символов' : null,
+                        helperText: _isRegister ? 'Не менее 8 символов' : null,
                         suffixIcon: IconButton(
                           tooltip: _showPassword
                               ? 'Скрыть пароль'
@@ -6982,7 +7572,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                       onPressed:
                           _authLoading || !_identityReady ? null : _submitAuth,
                       style: FilledButton.styleFrom(
-                        backgroundColor: const Color(0xFF0F172A),
+                        backgroundColor: const Color(0xFF4F46E5),
                         foregroundColor: Colors.white,
                         padding: const EdgeInsets.symmetric(vertical: 15),
                         shape: RoundedRectangleBorder(
@@ -6990,11 +7580,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
                         ),
                       ),
                       child: Text(
-                        _authLoading
-                            ? 'Подключение...'
-                            : _isRegister
-                                ? 'Создать аккаунт'
-                                : 'Войти',
+                        _authCheckingRobot
+                            ? 'Проверяем, что вы не робот…'
+                            : _authLoading
+                                ? 'Подключение...'
+                                : _isRegister
+                                    ? 'Создать аккаунт'
+                                    : 'Войти',
                       ),
                     ),
                   ],

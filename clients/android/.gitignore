@@ -46,3 +46,8 @@ app.*.map.json
 
 # Widget Preview related
 .widget_preview/
+
+# Ключи подписи релиза
+android/key.properties
+*.jks
+*.keystore

@@ -18,7 +18,11 @@ COPY --from=builder /build/target/release/liaper-control /usr/local/bin/liaper-c
 COPY --from=builder /build/target/release/liaper-node /usr/local/bin/liaper-node
 COPY --from=builder /build/target/release/liaper-files /usr/local/bin/liaper-files
 
-RUN mkdir -p /app/data /app/releases
+# Сервисы работают без root. Для bind-mount на Linux: sudo chown -R 10001:10001 data releases
+RUN useradd --system --uid 10001 --home /app liaper \
+    && mkdir -p /app/data /app/releases \
+    && chown -R liaper:liaper /app
+USER liaper
 
 EXPOSE 4000 4101 4102 4201
 

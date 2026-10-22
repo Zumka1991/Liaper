@@ -28,6 +28,7 @@ export class SfuMediaNodeClient {
   private username: string;
   private displayName: string;
   private getRoomKey: () => RoomSecretKeyBundle | null;
+  private getJoinTicket: () => Promise<string | null>;
   private localStream: MediaStream | null = null;
   private callbacks: SfuConnectionCallbacks;
   private encryptedCount = 0;
@@ -55,8 +56,11 @@ export class SfuMediaNodeClient {
     username: string;
     displayName: string;
     getRoomKey: () => RoomSecretKeyBundle | null;
+    /** Подписанный сервером управления допуск в медиа-комнату (null в режиме разработки) */
+    getJoinTicket: () => Promise<string | null>;
     callbacks: SfuConnectionCallbacks;
   }) {
+    this.getJoinTicket = params.getJoinTicket;
     this.roomId = params.roomId;
     this.userId = params.userId;
     this.username = params.username;
@@ -93,8 +97,15 @@ export class SfuMediaNodeClient {
     const ws = new WebSocket(this.nodeWsUrl);
     this.ws = ws;
 
-    ws.onopen = () => {
+    ws.onopen = async () => {
       const key = this.getRoomKey();
+      let ticket: string | null = null;
+      try {
+        ticket = await this.getJoinTicket();
+      } catch {
+        // Без допуска нода закроет соединение, сработает повторное подключение
+      }
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
       this.send({
         type: 'join_sfu_room',
         payload: {
@@ -104,6 +115,7 @@ export class SfuMediaNodeClient {
           display_name: this.displayName,
           e2ee_enabled: false,
           room_key_id: key?.roomKeyId ?? 'AES256',
+          ticket,
         },
       });
     };

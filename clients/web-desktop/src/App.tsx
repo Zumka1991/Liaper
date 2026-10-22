@@ -1,6 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  BookOpen,
+  Lock,
+  Clock3,
   Check,
+  ChevronLeft,
+  Copy,
+  Loader2,
+  ShieldCheck,
   CheckCircle2,
   Flag,
   Settings,
@@ -16,7 +23,9 @@ import {
   Minimize2,
   Monitor,
   MonitorOff,
+  MoreHorizontal,
   Pencil,
+  Forward,
   Phone,
   PhoneIncoming,
   PhoneOff,
@@ -58,10 +67,15 @@ import {
 } from './components/MediaRecorderBar';
 import { AdminDashboard } from './components/AdminDashboard';
 import { Modal } from './components/Modal';
+import { MessageMenu, type MessageMenuState } from './components/MessageMenu';
+import { Avatar } from './components/Avatar';
+import { Landing } from './components/Landing';
+import { LogoMark } from './components/Logo';
 import { StorageUsage } from './components/StorageUsage';
 import { downloadAndDecryptAttachment, uploadEncryptedAttachment } from './services/attachments';
 import { deriveArchiveKey, syncLessonArchives, mergeArchiveLists, type LessonArchive } from './services/lessonArchive';
 import { SfuMediaNodeClient } from './services/webrtcSfu';
+import { solvePow } from './services/pow';
 import type {
   AppPlatform,
   AppReleaseManifest,
@@ -87,6 +101,23 @@ const DEFAULT_CONTROL_HTTP = (runtimeEnv?.VITE_CONTROL_URL ||
 
 export type ArchivedLessonChat = LessonArchive;
 
+const PANEL_LIMITS = { left: [260, 480], right: [300, 560] } as const;
+function clampPanelWidth(side: 'left' | 'right', width: number): number {
+  const [min, max] = PANEL_LIMITS[side];
+  return Math.round(Math.min(max, Math.max(min, width)));
+}
+
+/** Компактная пометка «Переслано · Имя»; откуда и когда — во всплывающей подсказке. */
+function ForwardedLabel({ forwarded, onAccent = false }: { forwarded: NonNullable<DecryptedChatMessage['forwarded']>; onAccent?: boolean }) {
+  const details = `Из урока «${forwarded.source}»${forwarded.username ? `, @${forwarded.username}` : ''}${forwarded.time ? `, ${forwarded.time}` : ''}`;
+  return (
+    <span title={details} className={`mb-1 flex items-center gap-1 text-xs font-medium ${onAccent ? 'text-indigo-100' : 'text-indigo-600'}`}>
+      <Forward className="h-3 w-3 shrink-0" />
+      <span className="truncate">Переслано · {forwarded.sender}</span>
+    </span>
+  );
+}
+
 function computeDmRoomId(u1: string, u2: string): string {
   const s1 = u1.toLowerCase();
   const s2 = u2.toLowerCase();
@@ -100,6 +131,7 @@ const VideoTile: React.FC<{
   muted?: boolean;
   label: string;
   username: string;
+  userId: string;
   role: UserRole;
   audioEnabled: boolean;
   videoEnabled: boolean;
@@ -113,6 +145,7 @@ const VideoTile: React.FC<{
   muted,
   label,
   username,
+  userId,
   role,
   audioEnabled,
   videoEnabled,
@@ -133,29 +166,35 @@ const VideoTile: React.FC<{
   const showLocalVideo = Boolean(isSelf && stream && (videoEnabled || screenShareEnabled));
   const showRemoteVideo = Boolean(!isSelf && remoteFrameUrl && (videoEnabled || screenShareEnabled));
   const showVideo = showLocalVideo || showRemoteVideo;
-  const fitMode = screenShareEnabled ? 'object-contain' : 'object-cover';
+  // Кадр показывается целиком (вертикальные телефоны не обрезаются), пустые поля заполняет размытая копия
 
   return (
     <div
-      className={`relative flex flex-col justify-between rounded-2xl border border-slate-200 bg-white p-5 shadow-xs transition-all overflow-hidden ${
-        isExpanded ? 'col-span-full min-h-[520px]' : 'min-h-[260px]'
+      className={`relative flex flex-col justify-between rounded-2xl border border-slate-200 bg-white p-4 shadow-xs transition-all overflow-hidden ${
+        isExpanded ? 'col-span-full min-h-[min(70dvh,640px)]' : 'min-h-[300px]'
       }`}
     >
+      {showVideo && <div className="absolute inset-0 bg-slate-950" />}
       {showLocalVideo && (
         <video
           ref={videoRef}
           autoPlay
           playsInline
           muted={muted}
-          className={`absolute inset-0 h-full w-full ${fitMode} bg-slate-950`}
+          className={`absolute inset-0 h-full w-full object-contain ${screenShareEnabled ? '' : '-scale-x-100'}`}
         />
       )}
       {showRemoteVideo && remoteFrameUrl && (
-        <img
-          src={remoteFrameUrl}
-          alt={label}
-          className={`absolute inset-0 h-full w-full ${fitMode} bg-slate-950`}
-        />
+        <>
+          {!screenShareEnabled && (
+            <img src={remoteFrameUrl} alt="" aria-hidden="true" className="absolute inset-0 h-full w-full scale-110 object-cover opacity-50 blur-2xl" />
+          )}
+          <img
+            src={remoteFrameUrl}
+            alt={label}
+            className="absolute inset-0 h-full w-full object-contain"
+          />
+        </>
       )}
 
       {/* Верхняя строка карточки */}
@@ -164,7 +203,7 @@ const VideoTile: React.FC<{
           <span
             className={`inline-flex items-center rounded-md px-2.5 py-1 text-xs font-medium ${
               role === 'tutor'
-                ? 'bg-slate-900 text-white'
+                ? 'bg-indigo-600 text-white'
                 : 'bg-slate-100 text-slate-700 border border-slate-200'
             }`}
           >
@@ -203,9 +242,7 @@ const VideoTile: React.FC<{
       {/* Центральный аватар при выключенной камере */}
       {!showVideo && (
         <div className="my-auto flex flex-col items-center justify-center py-6">
-          <div className="flex h-16 w-16 items-center justify-center rounded-full border border-slate-200 bg-slate-100 text-xl font-semibold text-slate-800">
-            {label.slice(0, 2).toUpperCase()}
-          </div>
+          <Avatar name={label} seed={userId} size={72} />
           <div className="mt-3 text-sm font-medium text-slate-900">
             {label} {isSelf ? '(Вы)' : ''}
           </div>
@@ -255,17 +292,61 @@ const VideoTile: React.FC<{
   );
 };
 
+
+// Где находился пользователь (раздел, вкладка чата, открытый диалог) — восстанавливается после обновления страницы
+type SavedView = {
+  userId: string;
+  panel: 'contacts' | 'lesson' | 'chat' | 'settings';
+  chatMode: 'lesson' | 'direct' | 'archive';
+  contactId: string | null;
+  archiveId: string | null;
+};
+const VIEW_STORAGE_KEY = 'liaper_view';
+function readSavedView(): SavedView | null {
+  try {
+    const raw = JSON.parse(localStorage.getItem(VIEW_STORAGE_KEY) || 'null');
+    if (!raw || typeof raw.userId !== 'string') return null;
+    const panels = ['contacts', 'lesson', 'chat', 'settings'];
+    const modes = ['lesson', 'direct', 'archive'];
+    return {
+      userId: raw.userId,
+      panel: panels.includes(raw.panel) ? raw.panel : 'lesson',
+      chatMode: modes.includes(raw.chatMode) ? raw.chatMode : 'direct',
+      contactId: typeof raw.contactId === 'string' ? raw.contactId : null,
+      archiveId: typeof raw.archiveId === 'string' ? raw.archiveId : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function App() {
   const [identityKeys, setIdentityKeys] = useState<IdentityCryptoBundle | null>(null);
 
   // Авторизация
-  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [authMode, setAuthMode] = useState<'login' | 'register'>(() => (window.location.hash === '#register' ? 'register' : 'login'));
+  // Лендинг показывается только в браузере и только тем, кто ещё не открывал форму входа
+  const [showLanding, setShowLanding] = useState(
+    () => !('__TAURI_INTERNALS__' in window) && !['#login', '#register'].includes(window.location.hash),
+  );
+  useEffect(() => {
+    const onHash = () => {
+      const h = window.location.hash;
+      if (h === '#login' || h === '#register') { setAuthMode(h === '#register' ? 'register' : 'login'); setShowLanding(false); }
+      else if (!('__TAURI_INTERNALS__' in window) && (h === '' || h === '#top')) setShowLanding(true);
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
   const [usernameInput, setUsernameInput] = useState('');
   const [displayNameInput, setDisplayNameInput] = useState('');
   const [passwordInput, setPasswordInput] = useState('');
   const [roleInput, setRoleInput] = useState<UserRole>('tutor');
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
+  const [authCheckingRobot, setAuthCheckingRobot] = useState(false);
+  // Задача proof-of-work решается заранее, пока человек заполняет форму регистрации
+  const powRef = useRef<{ promise: Promise<{ challenge: string; solution: string }>; expiresAt: number } | null>(null);
 
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('liaper_token'));
   const [currentUser, setCurrentUser] = useState<UserPublicProfile | null>(() => {
@@ -299,6 +380,12 @@ export function App() {
 
   // Медиа-потоки
   const [audioEnabled, setAudioEnabled] = useState(true);
+  // Урок, который этот аккаунт сейчас проводит на другом устройстве
+  const [otherDeviceCall, setOtherDeviceCall] = useState<RoomInfo | null>(null);
+  // Урок, который продолжается после обновления страницы и ждёт возвращения
+  const [resumeCall, setResumeCall] = useState<RoomInfo | null>(null);
+  // Редактирование темы идущего урока (null — не редактируем)
+  const [topicDraft, setTopicDraft] = useState<string | null>(null);
   const [videoEnabled, setVideoEnabled] = useState(false);
   const [screenShareEnabled, setScreenShareEnabled] = useState(false);
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
@@ -318,10 +405,21 @@ export function App() {
   const [decryptedMessages, setDecryptedMessages] = useState<DecryptedChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [selectedChatContact, setSelectedChatContact] = useState<UserPublicProfile | null>(null);
-  const [chatMode, setChatMode] = useState<'lesson' | 'direct' | 'archive'>('lesson');
-  const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(null);
+  const savedViewRef = useRef<SavedView | null>(null);
+  if (savedViewRef.current === null) {
+    const saved = readSavedView();
+    // Чужой сохранённый вид (другой аккаунт на этом устройстве) не применяем
+    savedViewRef.current = saved && saved.userId === currentUser?.id ? saved : { userId: '', panel: 'lesson', chatMode: 'direct', contactId: null, archiveId: null };
+  }
+  // Урок после перезагрузки не продолжается сам — открываем личные чаты
+  const [chatMode, setChatMode] = useState<'lesson' | 'direct' | 'archive'>(() => (savedViewRef.current?.chatMode === 'archive' ? 'archive' : 'direct'));
+  const [selectedArchiveId, setSelectedArchiveId] = useState<string | null>(() => savedViewRef.current?.archiveId ?? null);
   const [selectedArchiveMsgKeys, setSelectedArchiveMsgKeys] = useState<string[]>([]);
+  // Окно пересылки из архива: выбранные сообщения, выбранный чат, комментарий и поиск
+  const [forwardDialog, setForwardDialog] = useState<{ archive: ArchivedLessonChat; messages: ArchivedLessonChat['messages'] } | null>(null);
   const [forwardTargetValue, setForwardTargetValue] = useState<string>('');
+  const [forwardComment, setForwardComment] = useState('');
+  const [forwardSearch, setForwardSearch] = useState('');
   const [forwardingArchiveMsgs, setForwardingArchiveMsgs] = useState(false);
   const [showReportModal, setShowReportModal] = useState(false);
   const [reportReason, setReportReason] = useState('Оскорбления / нарушение правил занятия');
@@ -329,6 +427,9 @@ export function App() {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [emojiCategoryIdx, setEmojiCategoryIdx] = useState(0);
   const [editingMessage, setEditingMessage] = useState<DecryptedChatMessage | null>(null);
+  const [messageMenu, setMessageMenu] = useState<(MessageMenuState & { message: DecryptedChatMessage }) | null>(null);
+  const [deletingMessage, setDeletingMessage] = useState<DecryptedChatMessage | null>(null);
+  const closeMessageMenu = React.useCallback(() => setMessageMenu(null), []);
   const chatInputRef = useRef<HTMLInputElement>(null);
 
   const EMOJI_CATEGORIES = [
@@ -387,7 +488,80 @@ export function App() {
   const [archivePassword, setArchivePassword] = useState('');
   const [archiveUnlocking, setArchiveUnlocking] = useState(false);
   const [archiveUnlockError, setArchiveUnlockError] = useState<string | null>(null);
-  const [panel, setPanel] = useState<'contacts' | 'lesson' | 'chat' | 'settings'>('lesson');
+  const [panel, setPanel] = useState<'contacts' | 'lesson' | 'chat' | 'settings'>(() => savedViewRef.current?.panel ?? 'lesson');
+  // Открытый диалог восстанавливаем, когда сервер прислал список контактов
+  const pendingContactIdRef = useRef<string | null>(savedViewRef.current?.contactId ?? null);
+  useEffect(() => {
+    const id = pendingContactIdRef.current;
+    if (!id || contacts.length === 0) return;
+    pendingContactIdRef.current = null;
+    const contact = contacts.find((c) => c.id === id);
+    if (contact) setSelectedChatContact((cur) => cur ?? contact);
+  }, [contacts]);
+  useEffect(() => {
+    if (!currentUser) return;
+    const view: SavedView = {
+      userId: currentUser.id,
+      panel,
+      chatMode,
+      contactId: selectedChatContact?.id ?? pendingContactIdRef.current,
+      archiveId: selectedArchiveId,
+    };
+    try { localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view)); } catch { /* не критично */ }
+  }, [currentUser, panel, chatMode, selectedChatContact, selectedArchiveId]);
+  // Ширина боковых панелей (перетаскиванием), запоминается на устройстве
+  const [panelWidths, setPanelWidths] = useState<{ left: number; right: number }>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('liaper_panel_widths') || 'null');
+      if (saved && typeof saved.left === 'number' && typeof saved.right === 'number') return saved;
+    } catch {
+      // хранилище недоступно — используем значения по умолчанию
+    }
+    return { left: 320, right: 360 };
+  });
+  useEffect(() => {
+    try { localStorage.setItem('liaper_panel_widths', JSON.stringify(panelWidths)); } catch { /* не критично */ }
+  }, [panelWidths]);
+  const startPanelResize = (side: 'left' | 'right') => (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = panelWidths[side];
+    const handle = e.currentTarget;
+    handle.setPointerCapture(e.pointerId);
+    document.body.classList.add('is-resizing');
+    const onMove = (ev: PointerEvent) => {
+      const delta = side === 'left' ? ev.clientX - startX : startX - ev.clientX;
+      setPanelWidths((prev) => ({ ...prev, [side]: clampPanelWidth(side, startW + delta) }));
+    };
+    const onUp = () => {
+      document.body.classList.remove('is-resizing');
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+      handle.removeEventListener('pointercancel', onUp);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+    handle.addEventListener('pointercancel', onUp);
+  };
+  const resizeHandleProps = (side: 'left' | 'right') => ({
+    role: 'separator' as const,
+    'aria-orientation': 'vertical' as const,
+    'aria-label': side === 'left' ? 'Ширина панели контактов' : 'Ширина панели сообщений',
+    'aria-valuenow': panelWidths[side],
+    'aria-valuemin': PANEL_LIMITS[side][0],
+    'aria-valuemax': PANEL_LIMITS[side][1],
+    title: 'Потяните, чтобы изменить ширину. Двойной щелчок — по умолчанию',
+    tabIndex: 0,
+    className: `panel-resizer is-${side}`,
+    onPointerDown: startPanelResize(side),
+    onDoubleClick: () => setPanelWidths((prev) => ({ ...prev, [side]: side === 'left' ? 320 : 360 })),
+    onKeyDown: (e: React.KeyboardEvent) => {
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      const grow = (e.key === 'ArrowRight') === (side === 'left');
+      setPanelWidths((prev) => ({ ...prev, [side]: clampPanelWidth(side, prev[side] + (grow ? 24 : -24)) }));
+    },
+  });
   const isAdminAccount = Boolean(
     currentUser &&
       ['napsy', 'admin'].includes(currentUser.username.trim().toLowerCase())
@@ -616,6 +790,11 @@ export function App() {
       setUnreadChats((prev) => { const next = { ...prev }; delete next[activeChatRoomId]; return next; });
     }
   }, [activeChatRoomId, panel]);
+  // Во время урока по умолчанию показываем его чат; после завершения возвращаемся к личным диалогам
+  const currentRoomId = currentRoom?.id ?? null;
+  useEffect(() => {
+    setChatMode((mode) => (currentRoomId ? (mode === 'archive' ? mode : 'lesson') : mode === 'lesson' ? 'direct' : mode));
+  }, [currentRoomId]);
   useEffect(() => {
     if (selectedChatContact && !contacts.some((c) => c.id === selectedChatContact.id)) setSelectedChatContact(null);
   }, [contacts]);
@@ -650,6 +829,7 @@ export function App() {
             ...msg,
             plaintext: dec.plaintext,
             attachment: dec.attachment,
+            forwarded: dec.forwarded,
             verified_e2ee: dec.verifiedE2ee,
           });
         } catch {
@@ -836,6 +1016,14 @@ export function App() {
       username: me.username,
       displayName: me.display_name,
       getRoomKey: () => roomKeyringsRef.current.get(room.id)?.activeKey ?? keyBundle,
+      getJoinTicket: async () => {
+        const res = await fetch(`${DEFAULT_CONTROL_HTTP}/api/rooms/${room.id}/sfu-ticket`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${localStorage.getItem('liaper_token') ?? ''}` },
+        });
+        if (!res.ok) throw new Error(`SFU ticket: HTTP ${res.status}`);
+        return ((await res.json()) as { ticket: string | null }).ticket;
+      },
       callbacks: {
         onNodeConnected: (nodeId, nodeName) => {
           setConnectedNodeLabel(`${nodeName} (${nodeId})`);
@@ -868,6 +1056,15 @@ export function App() {
         setContacts(msg.payload.contacts);
         setIncomingRequests(msg.payload.incoming_requests);
         setOutgoingRequests(msg.payload.outgoing_requests);
+
+        // Урок, из которого нас «выбило» обновлением страницы или обрывом сети, ещё ждёт возвращения
+        const activeRoom = msg.payload.active_rooms[0];
+        if (activeRoom && currentRoomRef.current?.id === activeRoom.id) {
+          // Переподключились без перезагрузки: звонок здесь же, просто подтверждаем устройство
+          sendControl({ type: 'join_room', payload: { room_id: activeRoom.id, audio_enabled: mediaFlagsRef.current.audio, video_enabled: mediaFlagsRef.current.video } });
+        } else if (activeRoom && !currentRoomRef.current) {
+          setResumeCall(activeRoom);
+        }
 
         const idKeys = identityKeysRef.current;
         if (idKeys && controlWsRef.current?.readyState === WebSocket.OPEN) {
@@ -930,6 +1127,8 @@ export function App() {
         currentRoomRef.current = room;
         setCurrentRoom(room);
         setIncomingCall(null);
+        setOtherDeviceCall(null);
+        setResumeCall(null);
 
         const me = currentUserRef.current;
         if (wasInRoom && room.participants.length < prevCount && me) {
@@ -955,6 +1154,34 @@ export function App() {
           caller: msg.payload.caller,
           withVideo: msg.payload.with_video,
         });
+        break;
+      }
+
+      case 'call_on_other_device': {
+        const { room_id: roomId, room } = msg.payload;
+        setIncomingCall((cur) => (cur?.room.id === roomId ? null : cur));
+        if (!room) {
+          setOtherDeviceCall((cur) => (cur?.id === roomId ? null : cur));
+          setResumeCall((cur) => (cur?.id === roomId ? null : cur));
+          break;
+        }
+        setResumeCall(null);
+        setOtherDeviceCall(room);
+        if (currentRoomRef.current?.id === roomId) {
+          // Звонок перенесли на другое устройство: отключаемся здесь, не выходя из урока
+          sfuClientRef.current?.disconnect();
+          sfuClientRef.current = null;
+          localStreamRef.current?.getTracks().forEach((t) => t.stop());
+          localStreamRef.current = null;
+          setLocalStream(null);
+          setRemoteVideoFrames({});
+          setCurrentRoom(null);
+          currentRoomRef.current = null;
+          setConnectedNodeLabel(null);
+          setScreenShareEnabled(false);
+          setExpandedUserId(null);
+          setSystemBanner('Урок продолжается на другом устройстве.');
+        }
         break;
       }
 
@@ -1007,6 +1234,28 @@ export function App() {
     }
   };
 
+  const preparePow = () => {
+    const cur = powRef.current;
+    if (cur && cur.expiresAt - 30 > Date.now() / 1000) return cur.promise;
+    const entry = { expiresAt: Date.now() / 1000 + 240, promise: null as unknown as Promise<{ challenge: string; solution: string }> };
+    entry.promise = (async () => {
+      const res = await fetch(`${DEFAULT_CONTROL_HTTP}/api/auth/challenge`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Не удалось начать проверку на робота');
+      entry.expiresAt = data.expires_at;
+      const solution = await solvePow({ challenge: data.challenge, difficulty: data.difficulty });
+      return { challenge: data.challenge as string, solution };
+    })();
+    entry.promise.catch(() => { if (powRef.current === entry) powRef.current = null; });
+    powRef.current = entry;
+    return entry.promise;
+  };
+  useEffect(() => {
+    if (!token && authMode === 'register') void preparePow().catch(() => undefined);
+    // preparePow сам кеширует задачу, зависимости — только смена экрана
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, authMode]);
+
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!identityKeys) return;
@@ -1014,6 +1263,20 @@ export function App() {
     setAuthLoading(true);
 
     try {
+      let pow: { challenge: string; solution: string } | null = null;
+      if (authMode === 'register') {
+        setAuthCheckingRobot(true);
+        try {
+          pow = await preparePow();
+        } catch (err) {
+          setAuthError(err instanceof Error && err.message ? err.message : 'Не удалось пройти проверку на робота');
+          setAuthLoading(false);
+          return;
+        } finally {
+          setAuthCheckingRobot(false);
+          powRef.current = null; // задача одноразовая
+        }
+      }
       const endpoint =
         authMode === 'register' ? '/api/auth/register' : '/api/auth/login';
       const body =
@@ -1025,6 +1288,8 @@ export function App() {
               role: roleInput,
               e2ee_public_key: identityKeys.publicKeySpkiB64,
               key_fingerprint: identityKeys.fingerprint,
+              pow_challenge: pow?.challenge,
+              pow_solution: pow?.solution,
             }
           : {
               username: usernameInput.trim().replace(/^@/, ''),
@@ -1043,6 +1308,7 @@ export function App() {
       if (!res.ok) {
         setAuthError(data.error || 'Ошибка авторизации');
         setAuthLoading(false);
+        if (authMode === 'register') void preparePow().catch(() => undefined);
         return;
       }
 
@@ -1075,6 +1341,8 @@ export function App() {
     setConnected(false);
     setIncomingCall(null);
     setContacts([]);
+    setOtherDeviceCall(null);
+    setResumeCall(null);
     setIncomingRequests([]);
     setOutgoingRequests([]);
     setRawMessages([]);
@@ -1092,6 +1360,13 @@ export function App() {
     setOutgoingTransfers([]);
     setPanel('lesson');
     controlWsRef.current?.close();
+    const revokedToken = localStorage.getItem('liaper_token');
+    if (revokedToken) {
+      void fetch(`${DEFAULT_CONTROL_HTTP}/api/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${revokedToken}` },
+      }).catch(() => {});
+    }
     localStorage.removeItem('liaper_token');
     localStorage.removeItem('liaper_user');
     setToken(null);
@@ -1179,6 +1454,33 @@ export function App() {
         video_enabled: withVideo,
       },
     });
+  };
+
+  // Забрать идущий урок с другого устройства на это
+  const takeOverCall = () => {
+    if (!otherDeviceCall) return;
+    setChatMode('lesson');
+    setPanel('lesson');
+    sendControl({
+      type: 'join_room',
+      payload: {
+        room_id: otherDeviceCall.id,
+        audio_enabled: mediaFlagsRef.current.audio,
+        video_enabled: mediaFlagsRef.current.video,
+      },
+    });
+    setOtherDeviceCall(null);
+  };
+
+  const resumeLesson = () => {
+    if (!resumeCall) return;
+    setChatMode('lesson');
+    setPanel('lesson');
+    sendControl({
+      type: 'join_room',
+      payload: { room_id: resumeCall.id, audio_enabled: mediaFlagsRef.current.audio, video_enabled: mediaFlagsRef.current.video },
+    });
+    setResumeCall(null);
   };
 
   const declineIncomingCall = () => {
@@ -1282,21 +1584,12 @@ export function App() {
 
   const forwardArchiveMessages = async (
     archive: ArchivedLessonChat,
-    messagesToForward: ArchivedLessonChat['messages']
+    messagesToForward: ArchivedLessonChat['messages'],
+    resolvedTarget: string,
+    comment: string,
   ) => {
     if (!currentUser || !token || !connected || messagesToForward.length === 0 || forwardingArchiveMsgs) {
       return;
-    }
-
-    let resolvedTarget = forwardTargetValue;
-    if (!resolvedTarget) {
-      if (currentRoom) {
-        resolvedTarget = `lesson:${currentRoom.id}`;
-      } else if (selectedChatContact) {
-        resolvedTarget = `dm:${selectedChatContact.id}`;
-      } else if (contacts.length > 0) {
-        resolvedTarget = `dm:${contacts[0].id}`;
-      }
     }
 
     if (!resolvedTarget) {
@@ -1329,10 +1622,22 @@ export function App() {
     try {
       const roomKey = await ensureAndDistributeRoomKey(targetRoomId, false);
       let sentCount = 0;
+      const sendPlain = async (serialized: string) => {
+        const encrypted = await encryptChatText(serialized, roomKey);
+        return sendControl({
+          type: 'send_encrypted_chat',
+          payload: {
+            room_id: targetRoomId,
+            ciphertext_b64: encrypted.ciphertextB64,
+            iv_b64: encrypted.ivB64,
+            room_key_id: encrypted.roomKeyId,
+          },
+        });
+      };
+      if (comment.trim()) await sendPlain(comment.trim());
 
       for (const m of messagesToForward) {
-        const header = `↪ Переслано из архива «${archive.title}» (${m.sender}${m.username ? ` @${m.username}` : ''}${m.time ? `, ${m.time}` : ''})`;
-        const bodyText = m.text ? `${header}:\n${m.text}` : header;
+        const forwarded = { source: archive.title, sender: m.sender, username: m.username || undefined, time: m.time || undefined };
 
         let finalAttachment: ChatAttachmentMeta | undefined = m.attachment;
         if (m.attachment) {
@@ -1359,27 +1664,21 @@ export function App() {
           }
         }
 
-        const serialized = serializeChatPayload(bodyText, finalAttachment);
-        const encrypted = await encryptChatText(serialized, roomKey);
-        const ok = sendControl({
-          type: 'send_encrypted_chat',
-          payload: {
-            room_id: targetRoomId,
-            ciphertext_b64: encrypted.ciphertextB64,
-            iv_b64: encrypted.ivB64,
-            room_key_id: encrypted.roomKeyId,
-          },
-        });
+        const ok = await sendPlain(serializeChatPayload(m.text, finalAttachment, forwarded));
         if (ok) sentCount++;
       }
 
       setSelectedArchiveMsgKeys([]);
       setSelectedArchiveId(null);
+      setForwardDialog(null);
+      setForwardComment('');
+      setForwardSearch('');
       if (targetMode === 'direct' && targetContact) {
         setSelectedChatContact(targetContact);
       }
       setChatMode(targetMode);
-      setSystemBanner(`Переслано сообщений в чат: ${sentCount}`);
+      const where = targetContact ? `в чат с ${targetContact.display_name}` : 'в чат урока';
+      setSystemBanner(sentCount === messagesToForward.length ? `Переслано ${where}: ${sentCount}` : `Переслано ${sentCount} из ${messagesToForward.length}. Проверьте соединение.`);
     } catch {
       setSystemBanner('Не удалось переслать выбранные сообщения.');
     } finally {
@@ -1405,6 +1704,7 @@ export function App() {
     setConnectedNodeLabel(null);
     setScreenShareEnabled(false);
     setExpandedUserId(null);
+    setTopicDraft(null);
   };
 
   const toggleMicrophone = async () => {
@@ -1730,64 +2030,111 @@ export function App() {
   // ============================================================================
   // Экран Авторизации (Чистый минималистичный корпоративный стиль)
   // ============================================================================
-  if (!token || !currentUser) {
+  if (!token && showLanding) {
     return (
-      <div className="flex min-h-screen flex-col justify-center bg-slate-50 px-6 py-12">
-        <div className="mx-auto w-full max-w-md">
-          <div className="flex items-center justify-between border-b border-slate-200 pb-6">
-            <div>
-              <div className="flex items-center gap-2.5">
-                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900 text-sm font-bold text-white">
-                  L
-                </div>
-                <span className="text-xl font-semibold tracking-tight text-slate-900">
-                  Liaper
-                </span>
+      <Landing
+        onRegister={(role) => { if (role) setRoleInput(role); window.location.hash = 'register'; }}
+        onLogin={() => { window.location.hash = 'login'; }}
+      />
+    );
+  }
+
+  if (!token || !currentUser) {
+    const isRegister = authMode === 'register';
+    const passwordTooShort = isRegister && passwordInput.length > 0 && passwordInput.length < 8;
+    return (
+      <div className="auth-shell">
+        <aside className="auth-hero" aria-hidden="true">
+          <div className="relative z-10 flex items-center gap-3">
+            <LogoMark size={40} />
+            <span className="text-xl font-semibold tracking-tight">Liaper</span>
+          </div>
+          <div className="relative z-10 max-w-md">
+            <h2 className="text-4xl font-semibold leading-tight tracking-tight">
+              Занятия, переписка и материалы — в одном месте
+            </h2>
+            <p className="mt-4 text-base leading-relaxed text-indigo-100">
+              Видеоуроки один на один и в группе, личные чаты с учениками и архив каждого занятия.
+            </p>
+            <div className="mt-10 space-y-6">
+              <div className="auth-feature">
+                <span><Video className="h-5 w-5" /></span>
+                <div><p className="font-semibold">Уроки по видеосвязи</p><p className="text-sm text-indigo-100">Камера, микрофон и демонстрация экрана в один клик.</p></div>
               </div>
-              <p className="mt-1.5 text-sm text-slate-500">
-                Платформа для индивидуальных и групповых занятий
-              </p>
+              <div className="auth-feature">
+                <span><MessageSquare className="h-5 w-5" /></span>
+                <div><p className="font-semibold">Чаты и вложения</p><p className="text-sm text-indigo-100">Файлы, голосовые и видеокружки прямо в переписке.</p></div>
+              </div>
+              <div className="auth-feature">
+                <span><ShieldCheck className="h-5 w-5" /></span>
+                <div><p className="font-semibold">Шифрование переписки</p><p className="text-sm text-indigo-100">Сообщения и файлы шифруются на вашем устройстве.</p></div>
+              </div>
             </div>
           </div>
+          <p className="relative z-10 text-xs text-indigo-200">Версия {APP_VERSION}</p>
+        </aside>
 
-          <div className="mt-8 rounded-2xl border border-slate-200 bg-white p-8 shadow-xs">
-            <div className="mb-6 grid grid-cols-2 gap-2 rounded-lg bg-slate-100 p-1">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('register');
-                  setAuthError(null);
-                }}
-                className={`rounded-md py-2 text-sm font-medium transition ${
-                  authMode === 'register'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Регистрация
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('login');
-                  setAuthError(null);
-                }}
-                className={`rounded-md py-2 text-sm font-medium transition ${
-                  authMode === 'login'
-                    ? 'bg-white text-slate-900 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
-              >
-                Вход
-              </button>
+        <main className="flex flex-col justify-center px-5 py-10 sm:px-10">
+          <div className="mx-auto w-full max-w-[420px]">
+            <div className="mb-8 flex items-center gap-3 min-[960px]:hidden">
+              <LogoMark size={44} />
+              <div>
+                <div className="text-xl font-semibold tracking-tight text-slate-900">Liaper</div>
+                <div className="text-sm text-slate-500">Платформа для занятий с репетитором</div>
+              </div>
             </div>
 
-            <form onSubmit={handleAuthSubmit} className="space-y-5">
+            {!('__TAURI_INTERNALS__' in window) && (
+              <button type="button" onClick={() => { window.history.replaceState(null, '', window.location.pathname); setShowLanding(true); }} className="mb-6 inline-flex items-center gap-1 text-sm font-medium text-slate-500 hover:text-slate-900">
+                <ChevronLeft className="h-4 w-4" />На главную
+              </button>
+            )}
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              {isRegister ? 'Создайте аккаунт' : 'С возвращением!'}
+            </h1>
+            <p className="mt-1.5 text-sm text-slate-500">
+              {isRegister ? 'Пара полей — и можно начинать занятия.' : 'Войдите, чтобы продолжить занятия.'}
+            </p>
+
+            <div className="mt-6 grid grid-cols-2 gap-1 rounded-xl bg-slate-200/60 p-1" role="tablist" aria-label="Режим">
+              {(['login', 'register'] as const).map((mode) => (
+                <button
+                  key={mode}
+                  type="button"
+                  role="tab"
+                  aria-selected={authMode === mode}
+                  onClick={() => { setAuthMode(mode); setAuthError(null); window.history.replaceState(null, '', `#${mode}`); }}
+                  className={`rounded-lg py-2 text-sm font-medium transition ${
+                    authMode === mode ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  {mode === 'login' ? 'Вход' : 'Регистрация'}
+                </button>
+              ))}
+            </div>
+
+            <form onSubmit={handleAuthSubmit} className="mt-6 space-y-5" noValidate={false}>
+              {isRegister && (
+                <fieldset>
+                  <legend className="text-sm font-medium text-slate-700">Я —</legend>
+                  <div className="mt-2 grid grid-cols-2 gap-3">
+                    <button type="button" className="role-card" aria-pressed={roleInput === 'tutor'} onClick={() => setRoleInput('tutor')}>
+                      <GraduationCap className="h-5 w-5" />
+                      <span className="text-sm font-semibold text-slate-900">Репетитор</span>
+                      <span className="text-xs leading-snug text-slate-500">Приглашаю учеников и веду уроки</span>
+                    </button>
+                    <button type="button" className="role-card" aria-pressed={roleInput === 'student'} onClick={() => setRoleInput('student')}>
+                      <BookOpen className="h-5 w-5" />
+                      <span className="text-sm font-semibold text-slate-900">Ученик</span>
+                      <span className="text-xs leading-snug text-slate-500">Занимаюсь с преподавателем</span>
+                    </button>
+                  </div>
+                </fieldset>
+              )}
+
               <div>
-                <label htmlFor="username" className="block text-sm font-medium text-slate-700">
-                  Никнейм
-                </label>
-                <div className="mt-2 flex items-center rounded-lg border border-slate-300 bg-white px-3.5 py-2.5 focus-within:border-slate-900">
+                <label htmlFor="username" className="block text-sm font-medium text-slate-700">Никнейм</label>
+                <div className="mt-2 flex items-center rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 transition focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-100">
                   <span className="text-sm font-medium text-slate-400">@</span>
                   <input
                     type="text"
@@ -1797,101 +2144,79 @@ export function App() {
                     placeholder="elena_math"
                     value={usernameInput}
                     onChange={(e) => setUsernameInput(e.target.value)}
+                    aria-describedby={isRegister ? 'username-hint' : undefined}
                     className="ml-1.5 w-full bg-transparent text-sm text-slate-900 focus:outline-none"
                   />
                 </div>
+                {isRegister && <p id="username-hint" className="mt-1.5 text-xs text-slate-500">Латиница, цифры и «_», от 3 символов. По нику вас найдёт преподаватель.</p>}
               </div>
 
-              {authMode === 'register' && (
-                <>
-                  <div>
-                    <label htmlFor="display-name" className="block text-sm font-medium text-slate-700">
-                      Ваше имя
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      id="display-name" autoComplete="name"
-                      placeholder="Елена Сергеевна"
-                      value={displayNameInput}
-                      onChange={(e) => setDisplayNameInput(e.target.value)}
-                      className="mt-2 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm text-slate-900 focus:border-slate-900 focus:outline-none"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold uppercase tracking-wider text-slate-600">
-                      Роль
-                    </label>
-                    <div className="mt-2 grid grid-cols-2 gap-3">
-                      <button
-                        type="button"
-                        aria-pressed={roleInput === 'tutor'}
-                        onClick={() => setRoleInput('tutor')}
-                        className={`flex items-center justify-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium transition ${
-                          roleInput === 'tutor'
-                            ? 'border-slate-900 bg-slate-900 text-white'
-                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                        }`}
-                      >
-                        Репетитор
-                      </button>
-                      <button
-                        type="button"
-                        aria-pressed={roleInput === 'student'}
-                        onClick={() => setRoleInput('student')}
-                        className={`flex items-center justify-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-medium transition ${
-                          roleInput === 'student'
-                            ? 'border-slate-900 bg-slate-900 text-white'
-                            : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
-                        }`}
-                      >
-                        Ученик
-                      </button>
-                    </div>
-                  </div>
-                </>
+              {isRegister && (
+                <div>
+                  <label htmlFor="display-name" className="block text-sm font-medium text-slate-700">Как вас зовут</label>
+                  <input
+                    type="text"
+                    required
+                    id="display-name" autoComplete="name"
+                    placeholder={roleInput === 'tutor' ? 'Елена Сергеевна' : 'Иван Петров'}
+                    value={displayNameInput}
+                    onChange={(e) => setDisplayNameInput(e.target.value)}
+                    className="mt-2 w-full rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm text-slate-900 transition focus:border-indigo-500 focus:outline-none focus:ring-4 focus:ring-indigo-100"
+                  />
+                </div>
               )}
 
               <div>
-                <label htmlFor="password" className="block text-sm font-medium text-slate-700">
-                  Пароль
-                </label>
+                <div className="flex items-center justify-between">
+                  <label htmlFor="password" className="block text-sm font-medium text-slate-700">Пароль</label>
+                  <button type="button" className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-900" aria-pressed={showPassword} onClick={() => setShowPassword(!showPassword)}>
+                    {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}{showPassword ? 'Скрыть' : 'Показать'}
+                  </button>
+                </div>
                 <input
                   id="password" type={showPassword ? 'text' : 'password'}
-                  minLength={authMode === 'register' ? 4 : undefined}
-                  autoComplete={authMode === 'register' ? 'new-password' : 'current-password'}
+                  minLength={isRegister ? 8 : undefined}
+                  autoComplete={isRegister ? 'new-password' : 'current-password'}
                   required
-                  placeholder="••••••••"
+                  placeholder={isRegister ? 'Не меньше 8 символов' : '••••••••'}
                   value={passwordInput}
                   onChange={(e) => setPasswordInput(e.target.value)}
-                  className="mt-2 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm text-slate-900 focus:border-slate-900 focus:outline-none"
+                  aria-invalid={passwordTooShort || undefined}
+                  aria-describedby={isRegister ? 'password-hint' : undefined}
+                  className={`mt-2 w-full rounded-xl border px-3.5 py-2.5 text-sm text-slate-900 transition focus:outline-none focus:ring-4 ${
+                    passwordTooShort ? 'border-amber-400 focus:border-amber-500 focus:ring-amber-100' : 'border-slate-300 focus:border-indigo-500 focus:ring-indigo-100'
+                  }`}
                 />
+                {isRegister && (
+                  <p id="password-hint" className={`mt-1.5 text-xs ${passwordTooShort ? 'text-amber-700' : 'text-slate-500'}`}>
+                    {passwordTooShort ? `Ещё ${8 - passwordInput.length} — минимум 8 символов.` : 'Этим же паролем открывается архив уроков на других устройствах.'}
+                  </p>
+                )}
               </div>
 
-              <button type="button" className="inline-flex items-center gap-2 text-xs text-slate-600" aria-pressed={showPassword} onClick={() => setShowPassword(!showPassword)}>
-                {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}{showPassword ? 'Скрыть пароль' : 'Показать пароль'}
-              </button>
               {authError && (
-                <div role="alert" className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
                   {authError}
                 </div>
               )}
 
               <button
                 type="submit"
-                disabled={authLoading || !identityKeys}
-                className="w-full rounded-lg bg-slate-900 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:opacity-50"
+                disabled={authLoading || !identityKeys || passwordTooShort}
+                className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm shadow-indigo-600/20 transition hover:bg-indigo-500 disabled:opacity-50"
               >
-                {authLoading
-                  ? 'Подключение...'
-                  : authMode === 'register'
-                    ? 'Зарегистрироваться'
-                    : 'Войти'}
+                {authLoading && <Loader2 className="h-4 w-4 animate-spin" />}
+                {authCheckingRobot ? 'Проверяем, что вы не робот…' : authLoading ? 'Подключаемся…' : isRegister ? 'Создать аккаунт' : 'Войти'}
               </button>
+              <p className="text-center text-sm text-slate-500">
+                {isRegister ? 'Уже есть аккаунт? ' : 'Впервые здесь? '}
+                <button type="button" className="font-semibold text-indigo-600 hover:text-indigo-500" onClick={() => { setAuthMode(isRegister ? 'login' : 'register'); setAuthError(null); }}>
+                  {isRegister ? 'Войти' : 'Зарегистрироваться'}
+                </button>
+              </p>
             </form>
           </div>
-        </div>
+        </main>
       </div>
     );
   }
@@ -1907,8 +2232,39 @@ export function App() {
   // ============================================================================
   // Основное Рабочее Пространство
   // ============================================================================
+  const directUnreadTotal = contacts.reduce(
+    (sum, c) => sum + (unreadChats[computeDmRoomId(currentUser.id, c.id)] ?? 0),
+    0,
+  );
+
+  const openMessageMenu = (m: DecryptedChatMessage, x: number, y: number, captionHidden: boolean) => {
+    const isMine = m.sender_id === currentUser.id;
+    const canCopy = !captionHidden && Boolean(m.plaintext.trim());
+    if (!canCopy && !isMine) return;
+    setMessageMenu({ message: m, x, y, canCopy, canEdit: isMine, canDelete: isMine });
+  };
+
+  const copyMessageText = (m: DecryptedChatMessage) => {
+    void navigator.clipboard?.writeText(m.plaintext).then(
+      () => setSystemBanner('Текст сообщения скопирован.'),
+      () => setSystemBanner('Не удалось скопировать текст.'),
+    );
+  };
+
+  const copyOwnNick = () => {
+    const nick = `@${currentUser.username}`;
+    void navigator.clipboard?.writeText(nick).then(
+      () => setSystemBanner(`Ник ${nick} скопирован — отправьте его преподавателю.`),
+      () => setSystemBanner(`Ваш ник: ${nick}`),
+    );
+  };
+
   return (
-    <div className="app-shell" data-panel={panel}>
+    <div
+      className="app-shell"
+      data-panel={panel}
+      style={{ '--left-w': `${panelWidths.left}px`, '--right-w': `${panelWidths.right}px` } as React.CSSProperties}
+    >
       {showAdminDashboard && (
         <AdminDashboard
           controlBase={DEFAULT_CONTROL_HTTP}
@@ -1924,11 +2280,11 @@ export function App() {
       )}
       <header className="app-topbar">
         <a className="app-brand" href="#" onClick={(e) => { e.preventDefault(); setPanel('lesson'); }} aria-label="Liaper — рабочее пространство">
-          <span className="brand-mark">L</span><span>Liaper<small>Учебное пространство</small></span>
+          <LogoMark size={38} /><span>Liaper<small>Учебное пространство</small></span>
         </a>
         <nav className="workspace-nav" aria-label="Основная навигация">
           {([
-            ['contacts', 'Контакты', Users], ['lesson', 'Урок', GraduationCap],
+            ['contacts', currentUser.role === 'tutor' ? 'Ученики' : 'Преподаватели', Users], ['lesson', 'Урок', GraduationCap],
             ['chat', 'Сообщения', MessageSquare], ['settings', 'Настройки', Settings],
           ] as const).map(([id, title, Icon]) => (
             <button key={id} type="button" aria-current={panel === id ? 'page' : undefined}
@@ -1964,6 +2320,36 @@ export function App() {
       {systemBanner && <div className="notification-banner" role="status"><span>{systemBanner}</span>
         <button type="button" aria-label="Закрыть уведомление" onClick={() => setSystemBanner(null)}><X size={18} /></button>
       </div>}
+      {resumeCall && !currentRoom && !otherDeviceCall && (
+        <div className="other-device-banner" role="status">
+          <span className="other-device-dot" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">
+            <strong>Урок продолжается</strong>
+            <span className="hidden sm:inline"> · {resumeCall.title}</span>
+          </span>
+          <button type="button" onClick={() => {
+            sendControl({ type: 'leave_room', payload: { room_id: resumeCall.id } });
+            setResumeCall(null);
+          }} className="rounded-lg px-2.5 py-1.5 text-sm font-medium text-emerald-800 hover:bg-emerald-100">
+            Выйти
+          </button>
+          <button type="button" onClick={resumeLesson} className="other-device-btn">
+            <Video className="h-4 w-4" /> Вернуться в урок
+          </button>
+        </div>
+      )}
+      {otherDeviceCall && !currentRoom && (
+        <div className="other-device-banner" role="status">
+          <span className="other-device-dot" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">
+            <strong>Урок идёт на другом устройстве</strong>
+            <span className="hidden sm:inline"> · {otherDeviceCall.title}</span>
+          </span>
+          <button type="button" onClick={takeOverCall} className="other-device-btn">
+            <Monitor className="h-4 w-4" /> Перенести сюда
+          </button>
+        </div>
+      )}
       <div className="workspace-layout">
       {/* Модальное окно входящего звонка */}
       {incomingCall && (
@@ -2026,7 +2412,7 @@ export function App() {
                   placeholder="Алгебра — разбор вариантов"
                   value={groupTitle}
                   onChange={(e) => setGroupTitle(e.target.value)}
-                  className="mt-2 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:border-slate-900 focus:outline-none"
+                  className="mt-2 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:outline-none"
                 />
               </div>
 
@@ -2089,7 +2475,7 @@ export function App() {
                 </button>
                 <button
                   type="submit"
-                  className="rounded-lg bg-slate-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-slate-800"
+                  className="rounded-lg bg-indigo-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-indigo-500"
                 >
                   Начать занятие
                 </button>
@@ -2106,9 +2492,7 @@ export function App() {
         <div className="border-b border-slate-200 p-5">
           <div className="flex items-center justify-between">
             <div className="flex min-w-0 flex-1 items-center gap-3">
-              <div className="flex shrink-0 h-10 w-10 items-center justify-center rounded-lg bg-slate-900 text-sm font-semibold text-white">
-                {currentUser.display_name.slice(0, 2).toUpperCase()}
-              </div>
+              <Avatar name={currentUser.display_name} seed={currentUser.id} size={42} />
               <div className="min-w-0">
                 <div className="truncate text-sm font-semibold text-slate-900" title={currentUser.display_name}>
                   {currentUser.display_name}
@@ -2140,7 +2524,7 @@ export function App() {
           <p className="mt-2 text-xs text-slate-500">{studentCount >= 10 ? 'Достигнут лимит. Удалите ученика, чтобы пригласить нового.' : 'Пригласите ученика по его @нику.'}</p>
 
           <form onSubmit={handleSendContactRequest} className="mt-2.5 flex gap-2">
-            <div className="flex flex-1 items-center rounded-lg border border-slate-300 bg-slate-50/60 px-3 py-2 focus-within:border-slate-900 focus-within:bg-white">
+            <div className="flex flex-1 items-center rounded-lg border border-slate-300 bg-slate-50/60 px-3 py-2 focus-within:border-indigo-500 focus-within:bg-white">
               <span className="text-xs font-medium text-slate-400">@</span>
               <input
                 type="text"
@@ -2157,7 +2541,7 @@ export function App() {
               type="submit"
               disabled={!connected || studentCount >= 10 || !addContactNick.trim()}
               aria-label="Отправить заявку в контакты" title="Отправить заявку в контакты"
-              className="flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-medium text-white hover:bg-slate-800"
+              className="flex items-center justify-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-500"
             >
               <UserPlus className="h-4 w-4" />
               Добавить
@@ -2165,6 +2549,7 @@ export function App() {
           </form>
           </> : <div className="text-sm text-slate-700"><p className="font-semibold">Приглашения от преподавателей</p><p className="mt-2 text-xs text-slate-500">Сообщите преподавателю свой @{currentUser.username} и примите его заявку ниже.</p></div>}
 
+          {currentUser.role === 'tutor' && (
           <button
             type="button"
             onClick={() => setShowGroupModal(true)}
@@ -2174,13 +2559,14 @@ export function App() {
             <Plus className="h-4 w-4" />
             Создать групповой урок
           </button>
+          )}
         </div>
 
         {/* Входящие заявки в контакты */}
         {incomingRequests.length > 0 && (
           <div className="border-b border-slate-200 bg-amber-50/50 p-4">
             <div className="text-xs font-semibold text-slate-800">
-              Заявки в контакты ({incomingRequests.length})
+              Приглашения ({incomingRequests.length})
             </div>
             <div className="mt-2.5 space-y-2">
               {incomingRequests.map((req) => (
@@ -2188,12 +2574,15 @@ export function App() {
                   key={req.id}
                   className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-3"
                 >
-                  <div className="min-w-0 pr-2">
-                    <div className="truncate text-xs font-semibold text-slate-900">
-                      {req.from_user.display_name}
-                    </div>
-                    <div className="text-[11px] text-slate-500">
-                      @{req.from_user.username}
+                  <div className="flex min-w-0 items-center gap-2.5 pr-2">
+                    <Avatar name={req.from_user.display_name} seed={req.from_user.id} size={34} />
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold text-slate-900">
+                        {req.from_user.display_name}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        @{req.from_user.username} • {req.from_user.role === 'tutor' ? 'преподаватель' : 'ученик'}
+                      </div>
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -2224,7 +2613,7 @@ export function App() {
         <div className="flex flex-1 flex-col overflow-hidden p-5">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-              Мои контакты ({filteredContacts.length})
+              {currentUser.role === 'tutor' ? 'Мои ученики' : 'Мои преподаватели'} ({filteredContacts.length})
             </span>
           </div>
 
@@ -2247,7 +2636,7 @@ export function App() {
                 <p className="mt-2 text-xs font-medium text-slate-600">
                   {searchNick.trim() ? 'Ничего не найдено' : currentUser.role === 'tutor' ? 'Пригласите первого ученика' : 'Пока нет преподавателей'}
                 </p>
-                <p className="mt-1 text-[11px] text-slate-400">
+                <p className="mt-1 text-xs text-slate-400">
                   {searchNick.trim() ? 'Попробуйте другое имя или никнейм.' : currentUser.role === 'tutor' ? 'Введите @ник ученика выше. После подтверждения заявки можно начать урок.' : 'Преподаватель появится здесь после того, как вы примете его заявку.'}
                 </p>
               </div>
@@ -2255,23 +2644,17 @@ export function App() {
               filteredContacts.map((u) => (
                 <div
                   key={u.id}
-                  className="contact-card rounded-xl border border-slate-200/90 bg-white p-3.5 transition hover:border-slate-300"
+                  className="contact-card rounded-2xl border border-slate-200/80 bg-white p-3 transition hover:border-indigo-200 hover:shadow-sm"
                 >
-                  <div className="min-w-0 flex-1 pr-2">
-                    <div className="flex items-center gap-2">
-                      <span
-                        className={`h-2 w-2 shrink-0 rounded-full ${
-                          u.online ? 'bg-emerald-500' : 'bg-slate-300'
-                        }`}
-                      />
-                      <span className="truncate text-sm font-medium text-slate-900">
+                  <div className="flex min-w-0 flex-1 items-center gap-3 pr-2">
+                    <Avatar name={u.display_name} seed={u.id} size={38} online={u.online} />
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-semibold text-slate-900">
                         {u.display_name}
-                      </span>
-                    </div>
-                    <div className="mt-0.5 flex items-center gap-2 text-xs text-slate-500">
-                      <span>@{u.username}</span>
-                      <span>•</span>
-                      <span>{u.role === 'tutor' ? 'Репетитор' : 'Ученик'}</span>
+                      </div>
+                      <div className="mt-0.5 truncate text-xs text-slate-500">
+                        @{u.username} • {u.online ? <span className="text-emerald-600">в сети</span> : u.role === 'tutor' ? 'репетитор' : 'ученик'}
+                      </div>
                     </div>
                   </div>
 
@@ -2284,9 +2667,9 @@ export function App() {
                         setPanel('chat');
                       }}
                       aria-label={`Написать сообщение @${u.username}`} title={`Написать сообщение @${u.username}`}
-                      className={`rounded-lg border p-2 transition ${
+                      className={`rounded-lg p-2 transition ${
                         selectedChatContact?.id === u.id && chatMode === 'direct'
-                          ? 'border-slate-900 bg-slate-900 text-white'
+                          ? 'border-indigo-600 bg-indigo-600 text-white'
                           : 'border-slate-200 text-slate-700 hover:bg-slate-900 hover:text-white'
                       }`}
                     >
@@ -2297,7 +2680,7 @@ export function App() {
                       onClick={() => startCallByNick(u.username, false)}
                       disabled={!connected || Boolean(currentRoom)}
                       aria-label={`Позвонить @${u.username}`} title={`Позвонить @${u.username}`}
-                      className="rounded-lg border border-slate-200 p-2 text-slate-700 hover:bg-slate-900 hover:text-white"
+                      className="rounded-lg bg-slate-50 p-2 text-slate-600 hover:bg-indigo-50 hover:text-indigo-600"
                     >
                       <Phone className="h-3.5 w-3.5" />
                     </button>
@@ -2306,7 +2689,7 @@ export function App() {
                       onClick={() => startCallByNick(u.username, true)}
                       disabled={!connected || Boolean(currentRoom)}
                       aria-label={`Видеозвонок @${u.username}`} title={`Видеозвонок @${u.username}`}
-                      className="rounded-lg border border-slate-200 p-2 text-slate-700 hover:bg-slate-900 hover:text-white"
+                      className="rounded-lg bg-slate-50 p-2 text-slate-600 hover:bg-indigo-50 hover:text-indigo-600"
                     >
                       <Video className="h-3.5 w-3.5" />
                     </button>
@@ -2314,7 +2697,7 @@ export function App() {
                       type="button"
                       onClick={() => setRemovingContact(u)}
                       aria-label="Удалить из контактов" title="Удалить из контактов"
-                      className="rounded-lg border border-slate-100 p-2 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                      className="rounded-lg p-2 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -2325,7 +2708,7 @@ export function App() {
 
             {outgoingRequests.length > 0 && (
               <div className="pt-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                   Ожидают подтверждения ({outgoingRequests.length})
                 </div>
                 <div className="mt-2 space-y-1.5">
@@ -2337,7 +2720,7 @@ export function App() {
                       <span>
                         {req.to_user.display_name} (@{req.to_user.username})
                       </span>
-                      <span className="text-[11px] text-slate-400">Заявка отправлена</span>
+                      <span className="text-xs text-slate-400">Заявка отправлена</span>
                     </div>
                   ))}
                 </div>
@@ -2350,12 +2733,208 @@ export function App() {
       {/* ==================================================================== */}
       {/* ЦЕНТРАЛЬНАЯ КОЛОНКА: Зона Урока / Звонка */}
       {/* ==================================================================== */}
+      <div {...resizeHandleProps('left')} />
+
+      {/* Отдельная страница контактов для широких экранов */}
+      <section className="contacts-page" aria-label="Контакты">
+        <div className="mx-auto w-full max-w-5xl px-6 py-7 lg:px-10">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+                {currentUser.role === 'tutor' ? 'Мои ученики' : 'Мои преподаватели'}
+              </h1>
+              <p className="mt-1 text-sm text-slate-500">
+                {currentUser.role === 'tutor'
+                  ? `${studentCount} из 10 учеников · ${contacts.filter((c) => c.online).length} в сети`
+                  : `${contacts.length} ${contacts.length === 1 ? 'преподаватель' : 'преподавателей'} · ${contacts.filter((c) => c.online).length} в сети`}
+              </p>
+            </div>
+            {currentUser.role === 'tutor' ? (
+              <form onSubmit={handleSendContactRequest} className="flex w-full max-w-sm gap-2">
+                <div className="flex flex-1 items-center rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 transition focus-within:border-indigo-500 focus-within:ring-4 focus-within:ring-indigo-100">
+                  <span className="text-sm text-slate-400">@</span>
+                  <input
+                    type="text"
+                    placeholder="ник ученика"
+                    aria-label="Ник ученика для приглашения"
+                    value={addContactNick}
+                    disabled={!connected || studentCount >= 10}
+                    onChange={(e) => setAddContactNick(e.target.value)}
+                    className="ml-1 w-full bg-transparent text-sm text-slate-900 focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="submit"
+                  disabled={!connected || studentCount >= 10 || !addContactNick.trim()}
+                  className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-4 text-sm font-semibold text-white hover:bg-indigo-500"
+                >
+                  <UserPlus className="h-4 w-4" />Пригласить
+                </button>
+              </form>
+            ) : (
+              <button type="button" onClick={copyOwnNick} className="inline-flex items-center gap-2 rounded-xl bg-indigo-50 px-4 py-2.5 text-sm font-semibold text-indigo-700 hover:bg-indigo-100">
+                <Copy className="h-4 w-4" />Мой ник: @{currentUser.username}
+              </button>
+            )}
+          </div>
+
+          {currentUser.role === 'tutor' && (
+            <div className="mt-5 h-2 w-full overflow-hidden rounded-full bg-slate-200" role="progressbar" aria-label="Заполнение лимита учеников" aria-valuenow={studentCount} aria-valuemin={0} aria-valuemax={10}>
+              <div className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-violet-500 transition-all" style={{ width: `${studentCount * 10}%` }} />
+            </div>
+          )}
+
+          {incomingRequests.length > 0 && (
+            <div className="mt-7">
+              <h2 className="text-sm font-semibold text-slate-900">Приглашения · {incomingRequests.length}</h2>
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                {incomingRequests.map((req) => (
+                  <div key={req.id} className="flex items-center gap-3 rounded-2xl border border-amber-200 bg-amber-50/60 p-4">
+                    <Avatar name={req.from_user.display_name} seed={req.from_user.id} size={44} />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-semibold text-slate-900">{req.from_user.display_name}</div>
+                      <div className="truncate text-xs text-slate-500">@{req.from_user.username} приглашает вас заниматься</div>
+                    </div>
+                    <button type="button" onClick={() => handleRespondContactRequest(req.id, false)} className="rounded-xl px-3 py-2 text-sm font-medium text-slate-600 hover:bg-white">Отклонить</button>
+                    <button type="button" onClick={() => handleRespondContactRequest(req.id, true)} className="rounded-xl bg-indigo-600 px-3.5 py-2 text-sm font-semibold text-white hover:bg-indigo-500">Принять</button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {contacts.length === 0 ? (
+              <div className="col-span-full rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center">
+                <Users className="mx-auto h-8 w-8 text-slate-300" />
+                <p className="mt-3 font-semibold text-slate-800">{currentUser.role === 'tutor' ? 'Пока нет учеников' : 'Пока нет преподавателей'}</p>
+                <p className="mx-auto mt-1 max-w-sm text-sm text-slate-500">
+                  {currentUser.role === 'tutor' ? 'Попросите ученика зарегистрироваться и прислать свой @ник, затем пригласите его выше.' : 'Отправьте преподавателю свой @ник — его приглашение появится здесь.'}
+                </p>
+              </div>
+            ) : (
+              [...contacts]
+                .sort((a, b) => Number(b.online) - Number(a.online) || a.display_name.localeCompare(b.display_name, 'ru'))
+                .map((u) => {
+                  const unread = unreadChats[computeDmRoomId(currentUser.id, u.id)] ?? 0;
+                  return (
+                    <article key={u.id} className="group flex flex-col rounded-2xl border border-slate-200 bg-white p-5 transition hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-900/5">
+                      <div className="flex items-start gap-3.5">
+                        <Avatar name={u.display_name} seed={u.id} size={52} online={u.online} />
+                        <div className="min-w-0 flex-1">
+                          <h3 className="truncate text-base font-semibold text-slate-900">{u.display_name}</h3>
+                          <p className="truncate text-sm text-slate-500">@{u.username}</p>
+                          <p className={`mt-1 text-xs font-medium ${u.online ? 'text-emerald-600' : 'text-slate-400'}`}>{u.online ? 'В сети' : 'Не в сети'}</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setRemovingContact(u)}
+                          aria-label={`Удалить @${u.username} из контактов`}
+                          title="Удалить из контактов"
+                          className="rounded-lg p-1.5 text-slate-300 opacity-0 transition hover:bg-rose-50 hover:text-rose-600 focus:opacity-100 group-hover:opacity-100"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                      <div className="mt-5 grid grid-cols-[1fr_auto_auto] gap-2">
+                        <button
+                          type="button"
+                          onClick={() => startCallByNick(u.username, true)}
+                          disabled={!connected || Boolean(currentRoom)}
+                          className="inline-flex items-center justify-center gap-2 rounded-xl bg-indigo-600 px-3 py-2.5 text-sm font-semibold text-white hover:bg-indigo-500"
+                        >
+                          <Video className="h-4 w-4" />{currentUser.role === 'tutor' ? 'Начать урок' : 'Видеозвонок'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => startCallByNick(u.username, false)}
+                          disabled={!connected || Boolean(currentRoom)}
+                          aria-label={`Аудиозвонок @${u.username}`}
+                          title="Аудиозвонок"
+                          className="grid h-10 w-10 place-items-center rounded-xl bg-slate-100 text-slate-700 hover:bg-indigo-50 hover:text-indigo-600"
+                        >
+                          <Phone className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => { setSelectedChatContact(u); setChatMode('direct'); setPanel('chat'); }}
+                          aria-label={`Написать @${u.username}`}
+                          title="Написать"
+                          className="relative grid h-10 w-10 place-items-center rounded-xl bg-slate-100 text-slate-700 hover:bg-indigo-50 hover:text-indigo-600"
+                        >
+                          <MessageSquare className="h-4 w-4" />
+                          {unread > 0 && <span className="nav-badge absolute -right-1.5 -top-1.5">{unread}</span>}
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })
+            )}
+          </div>
+
+          {outgoingRequests.length > 0 && (
+            <div className="mt-8">
+              <h2 className="text-sm font-semibold text-slate-900">Ожидают подтверждения · {outgoingRequests.length}</h2>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {outgoingRequests.map((req) => (
+                  <span key={req.id} className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white py-1 pl-1 pr-3 text-sm text-slate-600">
+                    <Avatar name={req.to_user.display_name} seed={req.to_user.id} size={26} />
+                    {req.to_user.display_name}
+                    <Clock3 className="h-3.5 w-3.5 text-slate-400" />
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+
       <main className="lesson-panel" aria-label="Урок">
         <header className="flex items-center justify-between border-b border-slate-200 bg-white px-7 py-4">
           <div>
-            <h1 className="text-base font-semibold text-slate-900">
-              {currentRoom ? currentRoom.title : 'Ваше учебное пространство'}
-            </h1>
+            {currentRoom && topicDraft !== null ? (
+              <form
+                className="flex items-center gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const title = topicDraft.trim();
+                  if (title && title !== currentRoom.title) {
+                    sendControl({ type: 'rename_room', payload: { room_id: currentRoom.id, title } });
+                  }
+                  setTopicDraft(null);
+                }}
+              >
+                <input
+                  autoFocus
+                  value={topicDraft}
+                  maxLength={80}
+                  onChange={(e) => setTopicDraft(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Escape') setTopicDraft(null); }}
+                  placeholder="Например: Квадратные уравнения"
+                  aria-label="Тема урока"
+                  className="w-72 max-w-full rounded-lg border border-indigo-300 px-2.5 py-1 text-base font-semibold text-slate-900 focus:border-indigo-500 focus:outline-none"
+                />
+                <button type="submit" className="rounded-lg bg-indigo-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-indigo-500">Сохранить</button>
+                <button type="button" onClick={() => setTopicDraft(null)} className="rounded-lg px-2 py-1.5 text-sm text-slate-500 hover:bg-slate-100">Отмена</button>
+              </form>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <h1 className="text-base font-semibold text-slate-900">
+                  {currentRoom ? currentRoom.title : 'Ваше учебное пространство'}
+                </h1>
+                {currentRoom && (currentUser.role === 'tutor' || currentRoom.host_id === currentUser.id) && (
+                  <button
+                    type="button"
+                    onClick={() => setTopicDraft(currentRoom.title)}
+                    title="Изменить тему урока"
+                    aria-label="Изменить тему урока"
+                    className="inline-flex items-center gap-1 rounded-lg px-1.5 py-1 text-xs font-medium text-slate-400 hover:bg-indigo-50 hover:text-indigo-700"
+                  >
+                    <Pencil className="h-3.5 w-3.5" /> Тема
+                  </button>
+                )}
+              </div>
+            )}
             <div className="mt-1 flex items-center gap-3 text-xs text-slate-500">
               {currentRoom ? (
                 <span className="flex items-center gap-1.5">
@@ -2387,7 +2966,7 @@ export function App() {
               </div>
               <button
                 type="submit"
-                className="rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-medium text-white hover:bg-slate-800"
+                className="rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-500"
               >
                 Позвать
               </button>
@@ -2397,22 +2976,45 @@ export function App() {
 
         <div className="flex-1 overflow-y-auto p-7">
           {!currentRoom ? (
-            <div className="flex h-full flex-col items-center justify-center rounded-2xl border border-slate-200 bg-white p-10 text-center">
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-slate-100 text-slate-800">
-                <GraduationCap className="h-7 w-7" />
+            <div className="mx-auto flex max-w-xl flex-col items-center py-6 text-center sm:py-12">
+              <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+                <GraduationCap className="h-8 w-8" />
               </div>
-              <h2 className="mt-5 text-lg font-semibold text-slate-900">
-                {currentUser.role === 'tutor' ? 'Начните следующий урок' : 'Всё готово к занятию'}
+              <h2 className="mt-5 text-xl font-semibold tracking-tight text-slate-900">
+                {currentUser.role === 'tutor'
+                  ? contacts.length > 0 ? 'Готовы к уроку' : 'Добро пожаловать в Liaper!'
+                  : contacts.length > 0 ? 'Всё готово к занятию' : 'Добро пожаловать в Liaper!'}
               </h2>
               <p className="mt-2 max-w-md text-sm leading-relaxed text-slate-500">
-                {currentUser.role === 'tutor' ? 'Пригласите до 10 учеников по @нику. После подтверждения заявки начните звонок или напишите сообщение.' : `Сообщите преподавателю свой @${currentUser.username}. Примите его приглашение в контактах, чтобы начать общение.`}
+                {currentUser.role === 'tutor'
+                  ? contacts.length > 0 ? 'Позвоните ученику из списка контактов или соберите групповой урок.' : 'Три шага до первого занятия:'
+                  : contacts.length > 0 ? 'Когда преподаватель начнёт урок, появится окно входящего звонка.' : 'Три шага до первого занятия:'}
               </p>
+              {contacts.length === 0 && (
+                <ol className="mt-6 w-full max-w-sm space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-xs">
+                  {currentUser.role === 'tutor' ? <>
+                    <li className={`onboarding-step ${outgoingRequests.length > 0 ? 'is-done' : ''}`}><b>{outgoingRequests.length > 0 ? <Check className="h-3.5 w-3.5" /> : 1}</b><div><p className="text-sm font-semibold text-slate-900">Пригласите ученика по @нику</p><p className="text-xs text-slate-500">Попросите ученика зарегистрироваться и прислать свой ник.</p></div></li>
+                    <li className="onboarding-step"><b>2</b><div><p className="text-sm font-semibold text-slate-900">Дождитесь подтверждения</p><p className="text-xs text-slate-500">Ученик примет её в своём разделе «Преподаватели».</p></div></li>
+                    <li className="onboarding-step"><b>3</b><div><p className="text-sm font-semibold text-slate-900">Начните урок</p><p className="text-xs text-slate-500">Звонок, видео, демонстрация экрана и чат урока.</p></div></li>
+                  </> : <>
+                    <li className="onboarding-step"><b>1</b><div><p className="text-sm font-semibold text-slate-900">Отправьте преподавателю свой ник</p>
+                      <button type="button" onClick={copyOwnNick} className="mt-1.5 inline-flex items-center gap-1.5 rounded-lg bg-indigo-50 px-2.5 py-1 text-sm font-semibold text-indigo-700 hover:bg-indigo-100"><Copy className="h-3.5 w-3.5" />@{currentUser.username}</button></div></li>
+                    <li className={`onboarding-step ${incomingRequests.length > 0 ? 'is-done' : ''}`}><b>{incomingRequests.length > 0 ? <Check className="h-3.5 w-3.5" /> : 2}</b><div><p className="text-sm font-semibold text-slate-900">Примите приглашение</p><p className="text-xs text-slate-500">{incomingRequests.length > 0 ? 'Приглашение пришло — откройте «Преподаватели».' : 'Оно появится в разделе «Преподаватели».'}</p></div></li>
+                    <li className="onboarding-step"><b>3</b><div><p className="text-sm font-semibold text-slate-900">Присоединяйтесь к уроку</p><p className="text-xs text-slate-500">Преподаватель позвонит, вам останется нажать «Принять».</p></div></li>
+                  </>}
+                </ol>
+              )}
               <div className="mt-6 flex flex-wrap justify-center gap-3">
-                <button type="button" onClick={() => { setPanel('contacts'); document.getElementById('add-contact')?.focus(); }} className="inline-flex items-center gap-2 rounded-lg bg-slate-900 px-5 py-3 text-sm font-medium text-white"><UserPlus size={18} />{currentUser.role === 'tutor' ? 'Пригласить ученика' : 'Открыть контакты'}</button>
-                <button type="button" disabled={!connected} onClick={() => setShowGroupModal(true)} className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-5 py-3 text-sm font-medium"><Plus size={18} />Создать урок</button>
+                {currentUser.role === 'tutor' ? (
+                  <button type="button" onClick={() => { setPanel('contacts'); window.setTimeout(() => document.getElementById('add-contact')?.focus(), 50); }} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm shadow-indigo-600/20 hover:bg-indigo-500"><UserPlus size={18} />Пригласить ученика</button>
+                ) : incomingRequests.length > 0 ? (
+                  <button type="button" onClick={() => setPanel('contacts')} className="inline-flex items-center gap-2 rounded-xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white hover:bg-indigo-500"><Users size={18} />Открыть приглашения</button>
+                ) : null}
+                {contacts.length > 0 && currentUser.role === 'tutor' && (
+                  <button type="button" disabled={!connected} onClick={() => setShowGroupModal(true)} className="inline-flex items-center gap-2 rounded-xl border border-slate-300 bg-white px-5 py-3 text-sm font-semibold text-slate-800 hover:bg-slate-50"><Plus size={18} />Групповой урок</button>
+                )}
               </div>
-              <p className="mt-8 text-xs text-slate-500">Камера и микрофон включаются только во время звонка.
-              </p>
+              <p className="mt-8 inline-flex items-center gap-1.5 text-xs text-slate-400"><ShieldCheck className="h-3.5 w-3.5" />Камера и микрофон включаются только во время звонка</p>
             </div>
           ) : (
             <div
@@ -2437,6 +3039,7 @@ export function App() {
                     muted={isSelf}
                     label={p.display_name}
                     username={p.username}
+                    userId={p.user_id}
                     role={p.role}
                     audioEnabled={isSelf ? audioEnabled : p.audio_enabled}
                     videoEnabled={isSelf ? videoEnabled : p.video_enabled}
@@ -2456,89 +3059,53 @@ export function App() {
         </div>
 
         {currentRoom && (
-          <footer className="flex items-center justify-between border-t border-slate-200 bg-white px-7 py-4">
+          <footer className="call-footer flex items-center justify-between border-t border-slate-200 bg-white px-7 py-3">
             <div className="flex items-center gap-2 text-xs text-slate-500">
               <UserCheck className="h-4 w-4 text-emerald-600" />
               <span>Участников на уроке: {currentRoom.participants.length}</span>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2.5">
               <button
                 type="button"
                 aria-pressed={audioEnabled} aria-label={audioEnabled ? 'Выключить микрофон' : 'Включить микрофон'}
+                title={audioEnabled ? 'Выключить микрофон' : 'Включить микрофон'}
                 onClick={toggleMicrophone}
-                className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition ${
-                  audioEnabled
-                    ? 'border border-slate-300 bg-white text-slate-800 hover:bg-slate-50'
-                    : 'bg-rose-600 text-white hover:bg-rose-500'
-                }`}
+                className={`call-btn ${audioEnabled ? 'is-on' : 'is-off'}`}
               >
-                {audioEnabled ? (
-                  <>
-                    <Mic className="h-4 w-4" />
-                    Микрофон вкл
-                  </>
-                ) : (
-                  <>
-                    <MicOff className="h-4 w-4" />
-                    Микрофон выкл
-                  </>
-                )}
+                {audioEnabled ? <Mic className="h-5 w-5" /> : <MicOff className="h-5 w-5" />}
+                <span className="call-label">{audioEnabled ? 'Микрофон' : 'Без звука'}</span>
               </button>
-
               <button
                 type="button"
                 aria-pressed={videoEnabled} aria-label={videoEnabled ? 'Выключить камеру' : 'Включить камеру'}
+                title={videoEnabled ? 'Выключить камеру' : 'Включить камеру'}
                 onClick={toggleCamera}
-                className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition ${
-                  videoEnabled
-                    ? 'bg-slate-900 text-white hover:bg-slate-800'
-                    : 'border border-slate-300 bg-white text-slate-800 hover:bg-slate-50'
-                }`}
+                className={`call-btn ${videoEnabled ? 'is-on' : 'is-off'}`}
               >
-                {videoEnabled ? (
-                  <>
-                    <Video className="h-4 w-4" />
-                    Камера вкл
-                  </>
-                ) : (
-                  <>
-                    <VideoOff className="h-4 w-4" />
-                    Камера
-                  </>
-                )}
+                {videoEnabled ? <Video className="h-5 w-5" /> : <VideoOff className="h-5 w-5" />}
+                <span className="call-label">Камера</span>
               </button>
-
               <button
                 type="button"
                 aria-pressed={screenShareEnabled}
+                aria-label={screenShareEnabled ? 'Остановить показ экрана' : 'Показать экран'}
+                title={screenShareEnabled ? 'Остановить показ экрана' : 'Показать экран'}
                 onClick={toggleScreenShare}
-                className={`flex items-center gap-2 rounded-xl px-4 py-2.5 text-sm font-medium transition ${
-                  screenShareEnabled
-                    ? 'bg-emerald-600 text-white hover:bg-emerald-500'
-                    : 'border border-slate-300 bg-white text-slate-800 hover:bg-slate-50'
-                }`}
+                className={`call-btn ${screenShareEnabled ? 'is-active' : 'is-on'}`}
               >
-                {screenShareEnabled ? (
-                  <>
-                    <MonitorOff className="h-4 w-4" />
-                    Остановить показ
-                  </>
-                ) : (
-                  <>
-                    <Monitor className="h-4 w-4" />
-                    Демонстрация экрана
-                  </>
-                )}
+                {screenShareEnabled ? <MonitorOff className="h-5 w-5" /> : <Monitor className="h-5 w-5" />}
+                <span className="call-label">{screenShareEnabled ? 'Остановить показ' : 'Экран'}</span>
               </button>
-
               <button
                 type="button"
                 onClick={leaveCurrentRoom}
-                className="flex items-center gap-2 rounded-xl bg-rose-600 px-5 py-2.5 text-sm font-medium text-white hover:bg-rose-500"
+                aria-label="Завершить урок"
+                title="Завершить урок"
+                className="call-btn is-danger"
               >
-                <PhoneOff className="h-4 w-4" />
-                Завершить
+                <PhoneOff className="h-5 w-5" />
+                <span className="call-label">Завершить</span>
               </button>
             </div>
 
@@ -2552,6 +3119,7 @@ export function App() {
       {/* ==================================================================== */}
       {/* ПРАВАЯ КОЛОНКА: Чат Урока, Серверы и Обновления */}
       {/* ==================================================================== */}
+      <div {...resizeHandleProps('right')} />
       <aside className="chat-panel" aria-label={panel === 'settings' ? 'Настройки' : 'Сообщения'}>
         <div className="panel-heading"><h2>{panel === 'settings' ? 'Настройки' : 'Сообщения'}</h2>
           <span>{panel === 'settings' ? `Версия ${APP_VERSION}` : 'Личные чаты и уроки'}</span></div>
@@ -2560,111 +3128,136 @@ export function App() {
         {panel !== 'settings' && (
           <div className="flex flex-1 flex-col overflow-hidden">
             {/* Переключатель режима чата */}
-            <div className="border-b border-slate-200 bg-white px-4 py-3 space-y-2.5">
-              <div className="grid grid-cols-3 gap-1 rounded-lg bg-slate-100 p-1">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setChatMode('lesson');
-                    setSelectedArchiveId(null);
-                    setSelectedArchiveMsgKeys([]);
-                  }}
-                  className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
-                    chatMode === 'lesson'
-                      ? 'bg-white text-slate-900 shadow-2xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Чат урока
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setChatMode('direct');
-                    setSelectedArchiveId(null);
-                    setSelectedArchiveMsgKeys([]);
-                  }}
-                  className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
-                    chatMode === 'direct'
-                      ? 'bg-white text-slate-900 shadow-2xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Личный чат
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setChatMode('archive')}
-                  className={`rounded-md py-1.5 text-[11px] font-semibold transition ${
-                    chatMode === 'archive'
-                      ? 'bg-white text-slate-900 shadow-2xs'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  Архив ({archivedChats.length})
-                </button>
+            <div className="border-b border-slate-200 bg-white px-4 py-3 space-y-3">
+              <div className="grid grid-cols-3 gap-1 rounded-xl bg-slate-100 p-1" role="tablist" aria-label="Тип переписки">
+                {([
+                  ['direct', 'Личные', directUnreadTotal],
+                  ['lesson', 'Урок', currentRoom ? unreadChats[currentRoom.id] ?? 0 : 0],
+                  ['archive', archivedChats.length ? `Архив · ${archivedChats.length}` : 'Архив', 0],
+                ] as const).map(([mode, label, unread]) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    role="tab"
+                    aria-selected={chatMode === mode}
+                    onClick={() => {
+                      setChatMode(mode);
+                      setSelectedArchiveId(null);
+                      setSelectedArchiveMsgKeys([]);
+                    }}
+                    className={`relative inline-flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-[13px] font-semibold transition ${
+                      chatMode === mode ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {label}
+                    {mode === 'lesson' && currentRoom && <span className="live-dot" />}
+                    {unread > 0 && <span className="nav-badge">{unread}</span>}
+                  </button>
+                ))}
               </div>
 
               {chatMode === 'lesson' && currentRoom && (
-                <div className="flex items-center justify-between gap-2 pt-0.5">
-                  <span className="truncate text-xs font-medium text-slate-600">
-                    Урок: <strong className="text-slate-900">{currentRoom.title}</strong>
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-sm font-medium text-slate-600">
+                    <strong className="text-slate-900">{currentRoom.title}</strong>
                   </span>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setShowReportModal(true)}
-                      title="Пожаловаться и раскрыть ключ переписки для проверки в админке"
-                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1 text-[11px] font-medium text-rose-700 hover:bg-rose-600 hover:text-white"
-                    >
-                      <Flag className="h-3 w-3" />
-                      Жалоба
-                    </button>
+                  <div className="flex items-center gap-1">
                     <button
                       type="button"
                       onClick={() => void saveCurrentLessonToArchive(false, false, false)}
-                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-900 hover:text-white"
+                      title="Сохранить переписку урока в архив"
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-slate-600 hover:bg-slate-100 hover:text-slate-900"
                     >
-                      <Download className="h-3 w-3" />
+                      <Download className="h-3.5 w-3.5" />
                       В архив
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowReportModal(true)}
+                      aria-label="Пожаловаться на переписку"
+                      title="Пожаловаться на переписку"
+                      className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                    >
+                      <Flag className="h-3.5 w-3.5" />
                     </button>
                   </div>
                 </div>
               )}
 
-              {chatMode === 'direct' && (
-                <div className="flex items-center justify-between gap-2 pt-0.5">
-                  <select
-                    value={selectedChatContact?.id ?? ''}
-                    onChange={(e) => {
-                      const found = contacts.find((c) => c.id === e.target.value) ?? null;
-                      setSelectedChatContact(found);
-                    }}
-                    className="min-w-0 flex-1 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-900 focus:outline-none"
+              {chatMode === 'direct' && selectedChatContact && (
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedChatContact(null)}
+                    aria-label="Ко всем диалогам"
+                    title="Ко всем диалогам"
+                    className="-ml-1 rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 hover:text-slate-900"
                   >
-                    <option value="">— Выберите контакт для переписки —</option>
-                    {contacts.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.display_name} (@{c.username})
-                      </option>
-                    ))}
-                  </select>
-                  {selectedChatContact && (
-                    <button
-                      type="button"
-                      onClick={() => setShowReportModal(true)}
-                      title="Пожаловаться и раскрыть ключ переписки для проверки в админке"
-                      className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-rose-200 bg-rose-50 px-2.5 py-1.5 text-[11px] font-medium text-rose-700 hover:bg-rose-600 hover:text-white"
-                    >
-                      <Flag className="h-3 w-3" />
-                      Жалоба
-                    </button>
-                  )}
+                    <ChevronLeft className="h-5 w-5" />
+                  </button>
+                  <Avatar name={selectedChatContact.display_name} seed={selectedChatContact.id} size={34} online={selectedChatContact.online} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold text-slate-900">{selectedChatContact.display_name}</div>
+                    <div className="truncate text-xs text-slate-500">{selectedChatContact.online ? 'в сети' : `@${selectedChatContact.username}`}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => startCallByNick(selectedChatContact.username, true)}
+                    disabled={!connected || Boolean(currentRoom)}
+                    aria-label={`Видеозвонок @${selectedChatContact.username}`}
+                    title="Видеозвонок"
+                    className="rounded-lg p-2 text-slate-500 hover:bg-indigo-50 hover:text-indigo-600"
+                  >
+                    <Video className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowReportModal(true)}
+                    aria-label="Пожаловаться на переписку"
+                    title="Пожаловаться на переписку"
+                    className="rounded-lg p-2 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
+                  >
+                    <Flag className="h-4 w-4" />
+                  </button>
                 </div>
               )}
             </div>
 
-            {chatMode === 'archive' ? (
+            {chatMode === 'direct' && !selectedChatContact ? (
+              <div className="flex-1 overflow-y-auto p-2">
+                {contacts.length === 0 ? (
+                  <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+                    <MessageSquare className="h-8 w-8 text-slate-300" />
+                    <p className="mt-3 text-sm font-medium text-slate-700">Диалогов пока нет</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {currentUser.role === 'tutor' ? 'Пригласите ученика — после подтверждения здесь появится переписка.' : 'Примите приглашение преподавателя, чтобы начать переписку.'}
+                    </p>
+                  </div>
+                ) : (
+                  [...contacts]
+                    .sort((a, b) => {
+                      const ua = unreadChats[computeDmRoomId(currentUser.id, a.id)] ?? 0;
+                      const ub = unreadChats[computeDmRoomId(currentUser.id, b.id)] ?? 0;
+                      return ub - ua || Number(b.online) - Number(a.online) || a.display_name.localeCompare(b.display_name, 'ru');
+                    })
+                    .map((c) => {
+                      const unread = unreadChats[computeDmRoomId(currentUser.id, c.id)] ?? 0;
+                      return (
+                        <button key={c.id} type="button" className="conversation" onClick={() => setSelectedChatContact(c)}>
+                          <Avatar name={c.display_name} seed={c.id} size={42} online={c.online} />
+                          <span className="min-w-0 flex-1">
+                            <span className={`block truncate text-sm ${unread ? 'font-bold text-slate-900' : 'font-semibold text-slate-800'}`}>{c.display_name}</span>
+                            <span className="block truncate text-xs text-slate-500">
+                              {unread ? `Новых сообщений: ${unread}` : `@${c.username} • ${c.role === 'tutor' ? 'репетитор' : 'ученик'}`}
+                            </span>
+                          </span>
+                          {unread > 0 && <span className="nav-badge">{unread}</span>}
+                        </button>
+                      );
+                    })
+                )}
+              </div>
+            ) : chatMode === 'archive' ? (
               (() => {
                 const openedArchive = selectedArchiveId
                   ? archivedChats.find((a) => a.id === selectedArchiveId) ?? null
@@ -2680,15 +3273,6 @@ export function App() {
                   const selectedMsgs = openedArchive.messages.filter((m, idx) =>
                     selectedArchiveMsgKeys.includes(m.id || `idx-${idx}`)
                   );
-                  const effectiveForwardTarget =
-                    forwardTargetValue ||
-                    (currentRoom
-                      ? `lesson:${currentRoom.id}`
-                      : selectedChatContact
-                        ? `dm:${selectedChatContact.id}`
-                        : contacts[0]
-                          ? `dm:${contacts[0].id}`
-                          : '');
 
                   return (
                     <div className="flex flex-1 flex-col overflow-hidden">
@@ -2700,15 +3284,15 @@ export function App() {
                               setSelectedArchiveId(null);
                               setSelectedArchiveMsgKeys([]);
                             }}
-                            className="text-[11px] font-semibold text-slate-700 hover:text-slate-900"
+                            className="text-xs font-semibold text-slate-700 hover:text-slate-900"
                           >
                             ← К списку архивов
                           </button>
                           <div className="truncate text-xs font-semibold text-slate-900">
                             {openedArchive.title}
                           </div>
-                          <div className="text-[11px] text-slate-500">
-                            Сообщений: {openedArchive.messages.length} • Нажмите на сообщения для пересылки
+                          <div className="text-xs text-slate-500">
+                            Сообщений: {openedArchive.messages.length} · нажмите на сообщения, чтобы выбрать
                           </div>
                         </div>
                         <div className="flex items-center gap-1.5">
@@ -2718,7 +3302,7 @@ export function App() {
                               onClick={() =>
                                 setSelectedArchiveMsgKeys(allSelected ? [] : allKeys)
                               }
-                              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
                             >
                               {allSelected ? 'Снять' : 'Выбрать все'}
                             </button>
@@ -2727,7 +3311,7 @@ export function App() {
                             type="button"
                             onClick={() => downloadArchiveAsTxt(openedArchive)}
                             title="Скачать текстовую копию (.txt)"
-                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[11px] font-medium text-slate-700 hover:bg-slate-100"
+                            className="inline-flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100"
                           >
                             <Download className="h-3 w-3" />
                             .txt
@@ -2766,23 +3350,29 @@ export function App() {
                                       : [...prev, msgKey]
                                   );
                                 }}
-                                className={`flex cursor-pointer items-center gap-2 rounded-2xl p-1.5 transition ${
-                                  isSelected ? 'bg-sky-50 ring-1 ring-sky-200' : 'hover:bg-slate-50/70'
+                                role="checkbox"
+                                aria-checked={isSelected}
+                                aria-label={`Выбрать сообщение от ${m.sender}`}
+                                tabIndex={0}
+                                onKeyDown={(e) => {
+                                  if (e.key === ' ' || e.key === 'Enter') {
+                                    e.preventDefault();
+                                    e.currentTarget.click();
+                                  }
+                                }}
+                                className={`archive-msg group flex cursor-pointer items-center gap-2.5 rounded-2xl p-1.5 transition ${
+                                  isSelected ? 'is-selected bg-indigo-50/80' : 'hover:bg-slate-50'
                                 } ${isMine ? 'justify-end' : 'justify-start'}`}
                               >
-                                <input
-                                  type="checkbox"
-                                  checked={isSelected}
-                                  onChange={() => {}}
-                                  aria-label={`Выбрать сообщение от ${m.sender}`}
-                                  className="h-4 w-4 shrink-0 rounded border-slate-300 text-slate-900"
-                                />
+                                <span className="archive-check" aria-hidden="true">
+                                  {isSelected && <Check className="h-3 w-3" strokeWidth={3} />}
+                                </span>
                                 <div
                                   className={`flex max-w-[85%] flex-col ${
                                     isMine ? 'items-end' : 'items-start'
                                   }`}
                                 >
-                                  <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
+                                  <div className="mb-1 flex items-center gap-1.5 text-xs text-slate-500">
                                     <span className="font-medium text-slate-700">
                                       {isMine ? 'Вы' : m.sender}
                                     </span>
@@ -2793,7 +3383,7 @@ export function App() {
                                     <div
                                       className={`w-full whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
                                         isMine
-                                          ? 'bg-slate-900 text-white'
+                                          ? 'bg-indigo-600 text-white'
                                           : 'border border-slate-200 bg-white text-slate-800'
                                       }`}
                                     >
@@ -2823,7 +3413,7 @@ export function App() {
                       <div className="border-t border-slate-200 bg-slate-100 px-4 py-3">
                         {selectedMsgs.length === 0 ? (
                           <div className="text-center text-xs font-medium text-slate-500">
-                            🔒 Архив урока — только для чтения. Отметьте сообщения, чтобы переслать их в чат.
+                            <Lock className="mr-1.5 inline h-3.5 w-3.5 -translate-y-px" />Архив урока — только для чтения. Отметьте сообщения, чтобы переслать их в чат.
                           </div>
                         ) : (
                           <div className="space-y-2">
@@ -2839,45 +3429,18 @@ export function App() {
                                 Сбросить
                               </button>
                             </div>
-                            <div className="flex items-center gap-2">
-                              <select
-                                value={effectiveForwardTarget}
-                                onChange={(e) => setForwardTargetValue(e.target.value)}
-                                className="min-w-0 flex-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-800 focus:border-slate-900 focus:outline-none"
-                              >
-                                {currentRoom && (
-                                  <option value={`lesson:${currentRoom.id}`}>
-                                    Текущий урок: {currentRoom.title}
-                                  </option>
-                                )}
-                                {contacts.map((c) => (
-                                  <option key={c.id} value={`dm:${c.id}`}>
-                                    Личный чат: {c.display_name} (@{c.username})
-                                  </option>
-                                ))}
-                                {!currentRoom && contacts.length === 0 && (
-                                  <option value="">Нет доступных чатов</option>
-                                )}
-                              </select>
-                              <button
-                                type="button"
-                                disabled={
-                                  forwardingArchiveMsgs ||
-                                  !connected ||
-                                  !effectiveForwardTarget
-                                }
-                                onClick={() =>
-                                  void forwardArchiveMessages(
-                                    openedArchive,
-                                    selectedMsgs
-                                  )
-                                }
-                                className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
-                              >
-                                <Send className="h-3.5 w-3.5" />
-                                Переслать ({selectedMsgs.length})
-                              </button>
-                            </div>
+                            <button
+                              type="button"
+                              disabled={!connected}
+                              onClick={() => {
+                                setForwardTargetValue(currentRoom ? `lesson:${currentRoom.id}` : selectedChatContact ? `dm:${selectedChatContact.id}` : '');
+                                setForwardDialog({ archive: openedArchive, messages: selectedMsgs });
+                              }}
+                              className="inline-flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50"
+                            >
+                              <Forward className="h-4 w-4" />
+                              Переслать…
+                            </button>
                           </div>
                         )}
                       </div>
@@ -2923,7 +3486,7 @@ export function App() {
                               <div className="text-xs font-semibold text-slate-900">
                                 {arch.title}
                               </div>
-                              <div className="text-[11px] text-slate-500">
+                              <div className="text-xs text-slate-500">
                                 {new Date(arch.savedAt).toLocaleString('ru-RU')} • Сообщений:{' '}
                                 {arch.messages.length}
                               </div>
@@ -2935,13 +3498,13 @@ export function App() {
                                 setSelectedArchiveId(arch.id);
                                 setSelectedArchiveMsgKeys([]);
                               }}
-                              className="inline-flex items-center gap-1 rounded-lg bg-slate-900 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-slate-800"
+                              className="inline-flex items-center gap-1 rounded-lg bg-indigo-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-indigo-500"
                             >
                               Открыть чат
                             </button>
                           </div>
                           {arch.messages.length > 0 && (
-                            <div className="truncate text-[11px] text-slate-600">
+                            <div className="truncate text-xs text-slate-600">
                               <strong className="text-slate-800">
                                 {arch.messages[arch.messages.length - 1].sender}:
                               </strong>{' '}
@@ -2992,7 +3555,7 @@ export function App() {
                             key={m.id}
                             className={`group flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
                           >
-                            <div className="mb-1 flex items-center gap-1.5 text-[11px] text-slate-500">
+                            <div className="mb-1 flex items-center gap-1.5 text-xs text-slate-500">
                               <span className="font-medium text-slate-700">
                                 {isMine ? 'Вы' : m.sender_display_name}
                               </span>
@@ -3003,50 +3566,64 @@ export function App() {
                                   (изм.)
                                 </span>
                               )}
-                              {isMine && (
-                                <span className="ml-1 inline-flex items-center gap-0.5 opacity-80 transition group-hover:opacity-100">
-                                  <button
-                                    type="button"
-                                    onClick={() => startEditingChatMessage(m)}
-                                    title="Редактировать сообщение"
-                                    className="rounded p-0.5 text-slate-400 hover:bg-slate-200/70 hover:text-slate-800"
-                                  >
-                                    <Pencil className="h-3 w-3" />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleDeleteChatMessage(m)}
-                                    title="Удалить сообщение"
-                                    className="rounded p-0.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600"
-                                  >
-                                    <Trash2 className="h-3 w-3" />
-                                  </button>
-                                </span>
-                              )}
                             </div>
 
-                            {hasTextBubble && (
+                            <div className={`flex w-full items-center gap-1 ${isMine ? 'flex-row-reverse' : ''}`}>
                               <div
-                                className={`max-w-[88%] whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                                  isMine
-                                    ? 'bg-slate-900 text-white'
-                                    : 'border border-slate-200 bg-slate-50 text-slate-900'
+                                className={`flex min-w-0 max-w-[85%] flex-col ${isMine ? 'items-end' : 'items-start'} ${
+                                  messageMenu?.message.id === m.id ? 'is-menu-target' : ''
                                 }`}
+                                onContextMenu={(e) => {
+                                  if (window.getSelection()?.toString()) return;
+                                  e.preventDefault();
+                                  openMessageMenu(m, e.clientX, e.clientY, hideDefaultCaption);
+                                }}
                               >
-                                {m.plaintext}
-                              </div>
-                            )}
+                                {m.forwarded && !hasTextBubble && (
+                                  <ForwardedLabel forwarded={m.forwarded} />
+                                )}
+                                {hasTextBubble && (
+                                  <div
+                                    className={`message-bubble whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                                      isMine
+                                        ? 'bg-indigo-600 text-white'
+                                        : 'border border-slate-200 bg-slate-50 text-slate-900'
+                                    }`}
+                                  >
+                                    {m.forwarded && <ForwardedLabel forwarded={m.forwarded} onAccent={isMine} />}
+                                    {m.plaintext}
+                                  </div>
+                                )}
 
-                            {m.attachment && token && (
-                              <div className={`max-w-[88%] ${hasTextBubble ? 'mt-1.5' : ''}`}>
-                                <AttachmentCard
-                                  meta={m.attachment}
-                                  controlBase={DEFAULT_CONTROL_HTTP}
-                                  token={token}
-                                  isMine={isMine}
-                                />
+                                {m.attachment && token && (
+                                  <div className={`max-w-full ${hasTextBubble ? 'mt-1.5' : ''}`}>
+                                    <AttachmentCard
+                                      meta={m.attachment}
+                                      controlBase={DEFAULT_CONTROL_HTTP}
+                                      token={token}
+                                      isMine={isMine}
+                                    />
+                                  </div>
+                                )}
                               </div>
-                            )}
+                              {(isMine || (!hideDefaultCaption && m.plaintext.trim())) && (
+                                <button
+                                  type="button"
+                                  aria-label="Действия с сообщением"
+                                  aria-haspopup="menu"
+                                  aria-expanded={messageMenu?.message.id === m.id}
+                                  title={isMine ? 'Изменить или удалить' : 'Действия'}
+                                  onClick={(e) => {
+                                    if (messageMenu?.message.id === m.id) { closeMessageMenu(); return; }
+                                    const r = e.currentTarget.getBoundingClientRect();
+                                    openMessageMenu(m, isMine ? r.right - 200 : r.left, r.bottom + 4, hideDefaultCaption);
+                                  }}
+                                  className={`message-more ${messageMenu?.message.id === m.id ? 'is-open' : ''}`}
+                                >
+                                  <MoreHorizontal className="h-4 w-4" />
+                                </button>
+                              )}
+                            </div>
                           </div>
                         );
                       })}
@@ -3077,7 +3654,7 @@ export function App() {
                           <Pencil className="h-3.5 w-3.5 shrink-0" />
                           <span>Редактирование сообщения</span>
                         </div>
-                        <p className="truncate text-[11px] text-slate-600">
+                        <p className="truncate text-xs text-slate-600">
                           {editingMessage.plaintext}
                         </p>
                       </div>
@@ -3103,9 +3680,9 @@ export function App() {
                               key={cat.label}
                               type="button"
                               onClick={() => setEmojiCategoryIdx(idx)}
-                              className={`rounded-lg px-2 py-1 text-[11px] font-semibold transition ${
+                              className={`rounded-lg px-2 py-1 text-xs font-semibold transition ${
                                 emojiCategoryIdx === idx
-                                  ? 'bg-slate-900 text-white'
+                                  ? 'bg-indigo-600 text-white'
                                   : 'bg-white text-slate-600 hover:bg-slate-200/70'
                               }`}
                             >
@@ -3137,6 +3714,13 @@ export function App() {
                     </div>
                   )}
                   <div className="flex items-center gap-2">
+                    <MediaRecorderBar
+                      disabled={!activeChatRoomId || !connected}
+                      onReadyAttachment={handleReadyAttachment}
+                      onError={(msg) => setSystemBanner(msg)}
+                      onToggleEmoji={() => setShowEmojiPicker((v) => !v)}
+                      emojiOpen={showEmojiPicker}
+                    />
                     <input
                       ref={chatInputRef}
                       type="text"
@@ -3150,20 +3734,13 @@ export function App() {
                       }
                       value={chatInput}
                       onChange={(e) => { setChatInput(e.target.value); if (activeChatRoomId) draftsRef.current[activeChatRoomId] = e.target.value; }}
-                      className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-slate-900 focus:outline-none disabled:bg-slate-100"
-                    />
-                    <MediaRecorderBar
-                      disabled={!activeChatRoomId || !connected}
-                      onReadyAttachment={handleReadyAttachment}
-                      onError={(msg) => setSystemBanner(msg)}
-                      onToggleEmoji={() => setShowEmojiPicker((v) => !v)}
-                      emojiOpen={showEmojiPicker}
+                      className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:outline-none disabled:bg-slate-100"
                     />
                     <button
                       type="submit"
                       aria-label="Отправить сообщение"
                       disabled={!activeChatRoomId || !chatInput.trim() || !connected || sendingChat}
-                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40"
+                      className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-indigo-600 text-white hover:bg-indigo-500 disabled:opacity-40"
                     >
                       <Send className="h-4 w-4" />
                     </button>
@@ -3177,6 +3754,26 @@ export function App() {
         {/* ВКЛАДКА 3: Обновления Приложений */}
         {panel === 'settings' && (
           <div className="flex-1 space-y-5 overflow-y-auto p-5">
+            <section className="rounded-2xl border border-slate-200 bg-white p-5" aria-label="Профиль">
+              <div className="flex items-center gap-4">
+                <Avatar name={currentUser.display_name} seed={currentUser.id} size={56} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-base font-semibold text-slate-900">{currentUser.display_name}</div>
+                  <div className="mt-0.5 text-sm text-slate-500">{currentUser.role === 'tutor' ? 'Репетитор' : 'Ученик'}</div>
+                </div>
+              </div>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <button type="button" onClick={copyOwnNick} title="Скопировать ник" className="inline-flex items-center gap-2 rounded-xl bg-indigo-50 px-3 py-2 text-sm font-semibold text-indigo-700 hover:bg-indigo-100">
+                  <Copy className="h-4 w-4" />@{currentUser.username}
+                </button>
+                <button type="button" onClick={handleLogout} className="ml-auto inline-flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50">
+                  <LogOut className="h-4 w-4" />Выйти
+                </button>
+              </div>
+              <p className="mt-3 text-xs text-slate-500">
+                {currentUser.role === 'tutor' ? 'Ученики находят вас по этому нику, а вы их — по их нику.' : 'Отправьте этот ник преподавателю, чтобы он пригласил вас в контакты.'}
+              </p>
+            </section>
             {token && (
               <StorageUsage
                 key={currentUser?.id}
@@ -3188,14 +3785,14 @@ export function App() {
             <div>
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-slate-900">
-                  Обновления приложений
+                  Приложения
                 </h3>
-                <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700">
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-700">
                   v{APP_VERSION}
                 </span>
               </div>
               <p className="mt-1 text-xs leading-relaxed text-slate-500">
-                Скачивание и проверка обновлений для Windows, Linux и Android.
+                Liaper для Windows, Linux и Android: проверьте, установлена ли последняя версия.
               </p>
             </div>
 
@@ -3216,7 +3813,7 @@ export function App() {
                   type="button"
                   disabled={checkingUpdate}
                   onClick={() => checkAppUpdate(selectedUpdatePlatform)}
-                  className="flex items-center gap-1.5 rounded-lg bg-slate-900 px-3.5 py-2 text-xs font-medium text-white hover:bg-slate-800"
+                  className="flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3.5 py-2 text-xs font-medium text-white hover:bg-indigo-500"
                 >
                   <RefreshCw className="h-3.5 w-3.5" />
                   Проверить
@@ -3263,7 +3860,7 @@ export function App() {
                     <span className="font-semibold text-slate-900">
                       {({ windows_x86_64: 'Windows', linux_x86_64: 'Linux', android_arm64: 'Android', android_universal: 'Android', web: 'Web' })[rel.platform]}
                     </span>
-                    <span className="rounded bg-slate-900 px-2 py-0.5 text-[11px] text-white">
+                    <span className="rounded bg-slate-900 px-2 py-0.5 text-xs text-white">
                       v{rel.version}
                     </span>
                   </div>
@@ -3286,6 +3883,83 @@ export function App() {
           {archiveUnlockError && <p role="alert" className="text-sm text-rose-700">{archiveUnlockError}</p>}
           <button type="submit" disabled={archiveUnlocking} className="w-full rounded-lg bg-slate-900 p-3 text-sm text-white">{archiveUnlocking ? 'Разблокировка…' : 'Разблокировать'}</button>
         </form>
+      </Modal>}
+      {messageMenu && (
+        <MessageMenu
+          state={messageMenu}
+          onClose={closeMessageMenu}
+          onCopy={() => copyMessageText(messageMenu.message)}
+          onEdit={() => startEditingChatMessage(messageMenu.message)}
+          onDelete={() => setDeletingMessage(messageMenu.message)}
+        />
+      )}
+      {forwardDialog && (() => {
+        const q = forwardSearch.trim().toLowerCase().replace(/^@/, '');
+        const targets = [
+          ...(currentRoom ? [{ value: `lesson:${currentRoom.id}`, title: 'Чат урока', subtitle: currentRoom.title, contact: null as UserPublicProfile | null }] : []),
+          ...contacts.map((c) => ({ value: `dm:${c.id}`, title: c.display_name, subtitle: `@${c.username}`, contact: c as UserPublicProfile | null })),
+        ].filter((t) => !q || t.title.toLowerCase().includes(q) || t.subtitle.toLowerCase().includes(q));
+        const n = forwardDialog.messages.length;
+        const first = forwardDialog.messages[0];
+        return (
+          <Modal label="Переслать сообщения" onClose={() => { if (!forwardingArchiveMsgs) setForwardDialog(null); }}>
+            <h2 className="text-lg font-semibold">Переслать {n === 1 ? 'сообщение' : `${n} ${n < 5 ? 'сообщения' : 'сообщений'}`}</h2>
+            <div className="mt-3 rounded-xl border-l-4 border-indigo-400 bg-slate-50 px-3 py-2 text-sm">
+              <div className="text-xs font-semibold text-indigo-700">{first.sender}{n > 1 ? ` и ещё ${n - 1}` : ''}</div>
+              <div className="line-clamp-2 text-slate-700">{first.attachment && !first.text ? first.attachment.name : first.text || first.attachment?.name}</div>
+            </div>
+            <label className="mt-4 flex items-center gap-2 rounded-xl border border-slate-300 px-3 py-2 focus-within:border-indigo-500">
+              <Search className="h-4 w-4 text-slate-400" />
+              <input value={forwardSearch} onChange={(e) => setForwardSearch(e.target.value)} placeholder="Найти чат" aria-label="Найти чат" className="min-w-0 flex-1 bg-transparent text-sm outline-none" />
+            </label>
+            <div role="radiogroup" aria-label="Куда переслать" className="mt-2 max-h-64 space-y-1 overflow-y-auto">
+              {targets.length === 0 && <p className="py-6 text-center text-sm text-slate-500">{contacts.length === 0 && !currentRoom ? 'Пока не с кем переписываться.' : 'Ничего не найдено.'}</p>}
+              {targets.map((t) => {
+                const active = forwardTargetValue === t.value;
+                return (
+                  <button key={t.value} type="button" role="radio" aria-checked={active} onClick={() => setForwardTargetValue(t.value)}
+                    className={`flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition ${active ? 'bg-indigo-50 ring-1 ring-indigo-200' : 'hover:bg-slate-50'}`}>
+                    {t.contact ? <Avatar name={t.contact.display_name} seed={t.contact.id} size={36} online={t.contact.online} />
+                      : <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-emerald-100 text-emerald-700"><Video className="h-4 w-4" /></span>}
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-semibold text-slate-900">{t.title}</span>
+                      <span className="block truncate text-xs text-slate-500">{t.subtitle}</span>
+                    </span>
+                    <span className={`grid h-5 w-5 shrink-0 place-items-center rounded-full border-2 ${active ? 'border-indigo-600 bg-indigo-600 text-white' : 'border-slate-300'}`}>{active && <Check className="h-3 w-3" strokeWidth={3} />}</span>
+                  </button>
+                );
+              })}
+            </div>
+            <input value={forwardComment} onChange={(e) => setForwardComment(e.target.value)} maxLength={2000} placeholder="Комментарий (необязательно)" aria-label="Комментарий" className="mt-3 w-full rounded-xl border border-slate-300 px-3 py-2 text-sm focus:border-indigo-500 focus:outline-none" />
+            <div className="mt-5 flex justify-end gap-3">
+              <button type="button" disabled={forwardingArchiveMsgs} onClick={() => setForwardDialog(null)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium hover:bg-slate-50">Отмена</button>
+              <button type="button" disabled={!forwardTargetValue || forwardingArchiveMsgs || !connected}
+                onClick={() => void forwardArchiveMessages(forwardDialog.archive, forwardDialog.messages, forwardTargetValue, forwardComment)}
+                className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-500 disabled:opacity-50">
+                {forwardingArchiveMsgs ? <Loader2 className="h-4 w-4 animate-spin" /> : <Forward className="h-4 w-4" />}
+                {forwardingArchiveMsgs ? 'Пересылаем…' : 'Переслать'}
+              </button>
+            </div>
+          </Modal>
+        );
+      })()}
+      {deletingMessage && <Modal label="Удалить сообщение" onClose={() => setDeletingMessage(null)}>
+        <div className="flex items-start gap-3">
+          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-full bg-rose-50 text-rose-600"><Trash2 className="h-5 w-5" /></span>
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold">Удалить сообщение?</h2>
+            <p className="mt-1 text-sm text-slate-600">Оно исчезнет у всех участников чата{deletingMessage.attachment ? ' вместе с вложением' : ''}. Отменить удаление нельзя.</p>
+          </div>
+        </div>
+        {(deletingMessage.plaintext.trim() && !deletingMessage.attachment) && (
+          <p className="mt-4 line-clamp-3 rounded-xl bg-slate-50 px-3 py-2 text-sm text-slate-700">{deletingMessage.plaintext}</p>
+        )}
+        <div className="mt-6 flex justify-end gap-3">
+          <button type="button" autoFocus onClick={() => setDeletingMessage(null)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium hover:bg-slate-50">Отмена</button>
+          <button type="button" className="rounded-lg bg-rose-600 px-4 py-2 text-sm font-semibold text-white hover:bg-rose-500" onClick={() => {
+            handleDeleteChatMessage(deletingMessage); setDeletingMessage(null);
+          }}>Удалить</button>
+        </div>
       </Modal>}
       {removingContact && <Modal label="Удалить контакт" onClose={() => setRemovingContact(null)}>
         <h2 className="text-lg font-semibold">Удалить {removingContact.display_name}?</h2>
@@ -3319,7 +3993,7 @@ export function App() {
                 value={reportReason}
                 onChange={(e) => setReportReason(e.target.value)}
                 placeholder="Опишите нарушение или причину жалобы..."
-                className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-slate-900 focus:outline-none"
+                className="w-full rounded-xl border border-slate-300 px-3 py-2 text-xs text-slate-900 focus:border-indigo-500 focus:outline-none"
               />
             </div>
             <div className="flex justify-end gap-2 pt-2">

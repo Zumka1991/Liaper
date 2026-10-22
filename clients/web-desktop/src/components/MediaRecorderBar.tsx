@@ -543,7 +543,7 @@ export function MediaRecorderBar({
                   ? 'Видеокружок готов к отправке'
                   : 'Голосовое сообщение готово'}
               </p>
-              <p className="text-[11px] text-slate-500">
+              <p className="text-xs text-slate-500">
                 {formatDurationMmSs(previewDraft.durationMs || 0)} ·{' '}
                 {formatBytesRu(previewDraft.plaintextBytes.byteLength)}
               </p>
@@ -589,68 +589,40 @@ export function MediaRecorderBar({
         type="button"
         disabled={disabled}
         onClick={() => setMenuOpen((prev) => !prev)}
-        title="Вложения, медиа и эмодзи"
-        aria-label="Меню вложений и медиа"
-        className={`flex h-10 w-10 items-center justify-center rounded-xl border transition disabled:opacity-40 ${
-          menuOpen || emojiOpen
-            ? 'border-slate-900 bg-slate-900 text-white'
-            : 'border-slate-300 bg-white text-slate-600 hover:bg-slate-100 hover:text-slate-900'
-        }`}
+        title="Прикрепить файл, голосовое или видеокружок"
+        aria-label="Открыть меню вложений"
+        aria-haspopup="menu"
+        aria-expanded={menuOpen}
+        className={`attach-trigger ${menuOpen ? 'is-open' : ''} ${emojiOpen && !menuOpen ? 'is-emoji' : ''}`}
       >
-        <Plus className="h-4 w-4" />
+        <Plus className="attach-trigger-icon h-5 w-5" strokeWidth={2.4} />
       </button>
 
       {menuOpen && !disabled && (
-        <div className="absolute bottom-full right-0 z-30 mb-2 w-60 rounded-2xl border border-slate-200 bg-white p-1.5 shadow-lg">
-          {onToggleEmoji && (
+        <div role="menu" aria-label="Вложения" className="attach-menu">
+          {[
+            { key: 'file', icon: Paperclip, tone: 'is-indigo', title: 'Файл', hint: 'PDF, Word или фото', run: () => fileInputRef.current?.click() },
+            { key: 'voice', icon: Mic, tone: 'is-emerald', title: 'Голосовое', hint: 'Запись с микрофона', run: () => void startRecording(false) },
+            { key: 'video', icon: Video, tone: 'is-rose', title: 'Видеокружок', hint: 'Короткое видео с камеры', run: () => void startRecording(true) },
+            ...(onToggleEmoji ? [{ key: 'emoji', icon: Smile, tone: 'is-amber', title: 'Эмодзи', hint: 'Набор смайликов', run: onToggleEmoji }] : []),
+          ].map(({ key, icon: Icon, tone, title, hint, run }) => (
             <button
+              key={key}
               type="button"
+              role="menuitem"
               onClick={() => {
                 setMenuOpen(false);
-                onToggleEmoji();
+                run();
               }}
-              className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-slate-100"
+              className="attach-item"
             >
-              <Smile className="h-4 w-4 text-amber-500" />
-              <span>Набор эмодзи</span>
+              <span className={`attach-item-icon ${tone}`}><Icon className="h-[18px] w-[18px]" /></span>
+              <span className="min-w-0">
+                <span className="block text-sm font-semibold text-slate-900">{title}</span>
+                <span className="block text-xs text-slate-500">{hint}</span>
+              </span>
             </button>
-          )}
-          <button
-            type="button"
-            onClick={() => {
-              setMenuOpen(false);
-              fileInputRef.current?.click();
-            }}
-            aria-label="Прикрепить PDF, Word или изображение"
-            className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-slate-100"
-          >
-            <Paperclip className="h-4 w-4 text-slate-600" />
-            <span>Прикрепить файл (PDF, Word, фото)</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setMenuOpen(false);
-              void startRecording(false);
-            }}
-            aria-label="Записать голосовое сообщение"
-            className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-slate-100"
-          >
-            <Mic className="h-4 w-4 text-indigo-600" />
-            <span>Записать голосовое (войс)</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setMenuOpen(false);
-              void startRecording(true);
-            }}
-            aria-label="Записать видеокружок"
-            className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition hover:bg-slate-100"
-          >
-            <Video className="h-4 w-4 text-rose-600" />
-            <span>Записать видеокружок</span>
-          </button>
+          ))}
         </div>
       )}
     </div>

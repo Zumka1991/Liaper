@@ -60,7 +60,8 @@ class ChatAttachmentMeta {
   factory ChatAttachmentMeta.fromJson(Map<String, dynamic> json) {
     return ChatAttachmentMeta(
       id: (json['id'] ?? '').toString(),
-      name: sanitizeAttachmentFilename((json['name'] ?? 'attachment').toString()),
+      name:
+          sanitizeAttachmentFilename((json['name'] ?? 'attachment').toString()),
       mimeType: (json['mime_type'] ?? 'application/octet-stream').toString(),
       kind: (json['kind'] ?? 'pdf').toString(),
       plaintextSize: (json['plaintext_size'] as num?)?.toInt() ?? 0,
@@ -182,10 +183,7 @@ Map<String, String>? classifyAttachmentFile(String fileName, String mimeType) {
   }
   if (lowerMime == 'application/x-liaper-videonote' ||
       lowerName.endsWith('.lpvn')) {
-    return {
-      'kind': 'video_note',
-      'mimeType': 'application/x-liaper-videonote'
-    };
+    return {'kind': 'video_note', 'mimeType': 'application/x-liaper-videonote'};
   }
   return null;
 }
@@ -449,8 +447,7 @@ class AndroidE2eeService {
           RoomSecretKeyBundle? activeKey;
           keysMap.forEach((kId, rawB64) {
             try {
-              final bundle =
-                  RoomSecretKeyBundle.fromRawB64(rawB64.toString());
+              final bundle = RoomSecretKeyBundle.fromRawB64(rawB64.toString());
               keysById[bundle.roomKeyId] = bundle;
               if (bundle.roomKeyId == activeKeyId || kId == activeKeyId) {
                 activeKey = bundle;
@@ -489,16 +486,22 @@ class AndroidE2eeService {
   }
 
   static String serializeChatPayload(
-      String text, ChatAttachmentMeta? attachment) {
-    if (attachment == null) return text;
+      String text, ChatAttachmentMeta? attachment,
+      [ForwardedFrom? forwarded]) {
+    if (attachment == null && forwarded == null) return text;
     return jsonEncode({
       '_liaper_msg': 1,
       'text': text,
-      'attachment': attachment.toJson(),
+      if (attachment != null) 'attachment': attachment.toJson(),
+      if (forwarded != null) 'forwarded': forwarded.toJson(),
     });
   }
 
-  static ({String text, ChatAttachmentMeta? attachment}) parseChatPayload(
+  static ({
+    String text,
+    ChatAttachmentMeta? attachment,
+    ForwardedFrom? forwarded
+  }) parseChatPayload(
     String rawPlaintext, {
     required bool allowAttachment,
   }) {
@@ -513,11 +516,26 @@ class AndroidE2eeService {
             att = ChatAttachmentMeta.fromJson(
                 parsed['attachment'] as Map<String, dynamic>);
           }
-          return (text: text, attachment: att);
+          final fwd = ForwardedFrom.fromJson(parsed['forwarded']);
+          if (fwd == null) {
+            final legacy = ForwardedFrom.parseLegacy(text);
+            if (legacy != null) {
+              return (
+                text: legacy.text,
+                attachment: att,
+                forwarded: legacy.from
+              );
+            }
+          }
+          return (text: text, attachment: att, forwarded: fwd);
         }
       } catch (_) {}
     }
-    return (text: rawPlaintext, attachment: null);
+    final legacy = ForwardedFrom.parseLegacy(rawPlaintext);
+    if (legacy != null) {
+      return (text: legacy.text, attachment: null, forwarded: legacy.from);
+    }
+    return (text: rawPlaintext, attachment: null, forwarded: null);
   }
 
   static Future<Map<String, String>> encryptChatWithBundle(
@@ -563,11 +581,13 @@ class AndroidE2eeService {
     return utf8.decode(clearBytes);
   }
 
-  static Future<({
-    String plaintext,
-    ChatAttachmentMeta? attachment,
-    bool verifiedE2ee,
-  })> decryptChatMessageWithKeyring({
+  static Future<
+      ({
+        String plaintext,
+        ChatAttachmentMeta? attachment,
+        ForwardedFrom? forwarded,
+        bool verifiedE2ee,
+      })> decryptChatMessageWithKeyring({
     required String roomId,
     required String ciphertextB64,
     required String ivB64,
@@ -587,11 +607,13 @@ class AndroidE2eeService {
 
     for (final candidate in candidates) {
       try {
-        final raw = await _decryptRawWithBundle(ciphertextB64, ivB64, candidate);
+        final raw =
+            await _decryptRawWithBundle(ciphertextB64, ivB64, candidate);
         final parsed = parseChatPayload(raw, allowAttachment: true);
         return (
           plaintext: parsed.text,
           attachment: parsed.attachment,
+          forwarded: parsed.forwarded,
           verifiedE2ee: true,
         );
       } catch (_) {}
@@ -608,6 +630,7 @@ class AndroidE2eeService {
       return (
         plaintext: parsed.text,
         attachment: null,
+        forwarded: parsed.forwarded,
         verifiedE2ee: false,
       );
     }
@@ -657,12 +680,13 @@ class AndroidAttachmentService {
     return nodeUrl;
   }
 
-  static Future<({
-    Uint8List ciphertextBytes,
-    String fileKeyB64,
-    String nonceB64,
-    String sha256Hex,
-  })> encryptAttachmentBytes(Uint8List plaintextBytes) async {
+  static Future<
+      ({
+        Uint8List ciphertextBytes,
+        String fileKeyB64,
+        String nonceB64,
+        String sha256Hex,
+      })> encryptAttachmentBytes(Uint8List plaintextBytes) async {
     if (plaintextBytes.isEmpty) {
       throw const FormatException('Файл пуст');
     }
@@ -876,12 +900,10 @@ class AndroidAttachmentService {
     }
 
     onProgress?.call(0.1);
-    final grantRes = await http
-        .get(
-          Uri.parse('$controlBaseUrl/api/attachments/${meta.id}/download'),
-          headers: {'Authorization': 'Bearer $token'},
-        )
-        .timeout(const Duration(seconds: 20));
+    final grantRes = await http.get(
+      Uri.parse('$controlBaseUrl/api/attachments/${meta.id}/download'),
+      headers: {'Authorization': 'Bearer $token'},
+    ).timeout(const Duration(seconds: 20));
 
     if (grantRes.statusCode == 410) {
       throw const AttachmentExpiredException('Срок хранения истёк');
@@ -902,12 +924,10 @@ class AndroidAttachmentService {
     final downloadUrl = resolveNodeHttpUrl(controlBaseUrl, rawDownloadUrl);
     onProgress?.call(0.35);
 
-    final blobRes = await http
-        .get(
-          Uri.parse(downloadUrl),
-          headers: {'Authorization': 'Bearer $downloadToken'},
-        )
-        .timeout(const Duration(seconds: 60));
+    final blobRes = await http.get(
+      Uri.parse(downloadUrl),
+      headers: {'Authorization': 'Bearer $downloadToken'},
+    ).timeout(const Duration(seconds: 60));
     if (blobRes.statusCode == 410) {
       throw const AttachmentExpiredException('Срок хранения истёк');
     }
@@ -1024,5 +1044,68 @@ class AndroidAttachmentService {
     final m = totalSec ~/ 60;
     final s = totalSec % 60;
     return '$m:${s.toString().padLeft(2, '0')}';
+  }
+}
+
+/// Откуда переслано сообщение (из архива урока).
+class ForwardedFrom {
+  final String source;
+  final String sender;
+  final String? username;
+  final String? time;
+
+  const ForwardedFrom({
+    required this.source,
+    required this.sender,
+    this.username,
+    this.time,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'source': source,
+        'sender': sender,
+        if (username != null && username!.isNotEmpty) 'username': username,
+        if (time != null && time!.isNotEmpty) 'time': time,
+      };
+
+  static String? _str(dynamic v, int max) {
+    if (v is! String || v.isEmpty) return null;
+    return v.length > max ? v.substring(0, max) : v;
+  }
+
+  static ForwardedFrom? fromJson(dynamic value) {
+    if (value is! Map) return null;
+    final source = _str(value['source'], 120);
+    final sender = _str(value['sender'], 80);
+    if (source == null || sender == null) return null;
+    return ForwardedFrom(
+      source: source,
+      sender: sender,
+      username: _str(value['username'], 40),
+      time: _str(value['time'], 40),
+    );
+  }
+
+  static final _legacy =
+      RegExp(r'^Переслано из архива «([^»]*)» \(([^)]*)\)(?::\n([\s\S]*))?$');
+
+  /// Сообщения, пересланные старыми версиями одной строкой-заголовком.
+  static ({String text, ForwardedFrom from})? parseLegacy(String text) {
+    final m = _legacy.firstMatch(text);
+    if (m == null) return null;
+    final meta = m.group(2) ?? '';
+    final comma = meta.lastIndexOf(',');
+    final who = (comma >= 0 ? meta.substring(0, comma) : meta).trim();
+    final time = comma >= 0 ? meta.substring(comma + 1).trim() : null;
+    final at = who.lastIndexOf(' @');
+    return (
+      text: m.group(3) ?? '',
+      from: ForwardedFrom(
+        source: m.group(1) ?? '',
+        sender: at >= 0 ? who.substring(0, at).trim() : who,
+        username: at >= 0 ? who.substring(at + 2) : null,
+        time: time,
+      ),
+    );
   }
 }

@@ -123,6 +123,8 @@ pub struct ControlState {
     pub user_id_by_username: DashMap<String, Uuid>,
     pub tokens: DashMap<String, Uuid>,
     pub sessions: DashMap<Uuid, Vec<(Uuid, ClientSender)>>,
+    /// На каком устройстве (WebSocket-соединении) аккаунт сейчас в звонке: user → (room, conn)
+    pub call_devices: DashMap<Uuid, (Uuid, Uuid)>,
     pub contacts_by_user: DashMap<Uuid, HashSet<Uuid>>,
     pub contact_requests: DashMap<Uuid, StoredContactRequest>,
     pub media_nodes: DashMap<String, MediaNodeInfo>,
@@ -144,6 +146,7 @@ pub struct ControlState {
     pub admin_usernames: HashSet<String>,
     pub admin_secret: Option<String>,
     pub antifraud: crate::antifraud::AntiFraudEngine,
+    pub pow: crate::pow::PowGuard,
     pub pg_client: tokio::sync::RwLock<Option<Arc<tokio_postgres::Client>>>,
     pub contact_mutations: tokio::sync::Mutex<()>,
 }
@@ -163,8 +166,8 @@ impl ControlState {
         let admin_secret = std::env::var("LIAPER_ADMIN_SECRET")
             .ok()
             .filter(|secret| !secret.trim().is_empty());
-        let raw_admins = std::env::var("LIAPER_ADMIN_USERNAMES")
-            .unwrap_or_else(|_| "napsy,admin".to_string());
+        // Без явной настройки администраторов нет: ник по умолчанию мог бы зарегистрировать кто угодно.
+        let raw_admins = std::env::var("LIAPER_ADMIN_USERNAMES").unwrap_or_default();
         let admin_usernames: HashSet<String> = raw_admins
             .split(',')
             .map(Self::normalize_username)
@@ -176,6 +179,7 @@ impl ControlState {
             user_id_by_username: DashMap::new(),
             tokens: DashMap::new(),
             sessions: DashMap::new(),
+            call_devices: DashMap::new(),
             contacts_by_user: DashMap::new(),
             contact_requests: DashMap::new(),
             media_nodes: DashMap::new(),
@@ -197,6 +201,7 @@ impl ControlState {
             admin_usernames,
             admin_secret,
             antifraud: crate::antifraud::AntiFraudEngine::new(),
+            pow: crate::pow::PowGuard::new(),
             pg_client: tokio::sync::RwLock::new(None),
             contact_mutations: tokio::sync::Mutex::new(()),
         });
@@ -338,6 +343,13 @@ impl ControlState {
                     .await;
             }
         }
+        // Сессии живут не дольше 30 дней; дальше нужен повторный вход.
+        let _ = client
+            .execute(
+                "DELETE FROM user_sessions WHERE created_at < NOW() - INTERVAL '30 days'",
+                &[],
+            )
+            .await;
         for row in client
             .query("SELECT token,user_id FROM user_sessions", &[])
             .await?
@@ -460,6 +472,16 @@ impl ControlState {
         }
     }
 
+    pub async fn revoke_session(&self, token: &str) {
+        self.tokens.remove(token);
+        if let Some(client) = self.pg_client.read().await.clone() {
+            let _ = client
+                .execute("DELETE FROM user_sessions WHERE token=$1", &[&token])
+                .await;
+        }
+        self.save_sessions_to_disk();
+    }
+
     pub async fn persist_session(&self, token: &str, user_id: Uuid) {
         self.tokens.insert(token.to_string(), user_id);
         self.save_sessions_to_disk();
@@ -483,7 +505,7 @@ impl ControlState {
         } else {
             "student"
         };
-        client.execute("INSERT INTO users (id,username,display_name,role,password_hash,password_salt,e2ee_public_key,key_fingerprint) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET display_name=EXCLUDED.display_name,e2ee_public_key=EXCLUDED.e2ee_public_key,key_fingerprint=EXCLUDED.key_fingerprint", &[&u.id,&u.username,&u.display_name,&role,&u.password_hash,&u.salt_b64,&u.e2ee_public_key,&u.key_fingerprint]).await?;
+        client.execute("INSERT INTO users (id,username,display_name,role,password_hash,password_salt,e2ee_public_key,key_fingerprint) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (id) DO UPDATE SET display_name=EXCLUDED.display_name,password_hash=EXCLUDED.password_hash,password_salt=EXCLUDED.password_salt,e2ee_public_key=EXCLUDED.e2ee_public_key,key_fingerprint=EXCLUDED.key_fingerprint", &[&u.id,&u.username,&u.display_name,&role,&u.password_hash,&u.salt_b64,&u.e2ee_public_key,&u.key_fingerprint]).await?;
         Ok(())
     }
 
@@ -551,12 +573,44 @@ impl ControlState {
             .collect()
     }
 
-    pub fn hash_password(password: &str, salt_b64: &str) -> String {
+    /// Legacy salted SHA-256 (v1). Kept only to verify and upgrade old hashes.
+    fn legacy_hash_password(password: &str, salt_b64: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(salt_b64.as_bytes());
         hasher.update(b":liaper-auth-v1:");
         hasher.update(password.as_bytes());
         BASE64.encode(hasher.finalize())
+    }
+
+    /// Argon2id PHC string; `salt_b64` is ignored (the PHC string carries its own salt).
+    pub fn hash_password(password: &str, _salt_b64: &str) -> String {
+        use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+        let salt = SaltString::generate(&mut OsRng);
+        argon2::Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .expect("argon2 hashing")
+            .to_string()
+    }
+
+    /// Constant-time verification of both Argon2id and legacy v1 hashes.
+    pub fn verify_password(password: &str, salt_b64: &str, stored: &str) -> bool {
+        use argon2::password_hash::{PasswordHash, PasswordVerifier};
+        if stored.starts_with("$argon2") {
+            return PasswordHash::new(stored)
+                .map(|parsed| {
+                    argon2::Argon2::default()
+                        .verify_password(password.as_bytes(), &parsed)
+                        .is_ok()
+                })
+                .unwrap_or(false);
+        }
+        use subtle::ConstantTimeEq;
+        let computed = Self::legacy_hash_password(password, salt_b64);
+        computed.as_bytes().ct_eq(stored.as_bytes()).into()
+    }
+
+    pub fn needs_rehash(stored: &str) -> bool {
+        !stored.starts_with("$argon2id$")
     }
 
     pub fn generate_salt() -> String {
@@ -594,12 +648,13 @@ impl ControlState {
 
     pub fn verify_admin_password(&self, password: &str) -> bool {
         if let Some(creds) = self.admin_master_creds.read().ok().and_then(|g| g.clone()) {
-            return Self::hash_password(password, &creds.salt_b64) == creds.password_hash;
+            return Self::verify_password(password, &creds.salt_b64, &creds.password_hash);
         }
         if let Ok(env_pass) = std::env::var("LIAPER_ADMIN_PASSWORD") {
             let trimmed = env_pass.trim();
             if !trimmed.is_empty() {
-                return password == trimmed;
+                use subtle::ConstantTimeEq;
+                return password.as_bytes().ct_eq(trimmed.as_bytes()).into();
             }
         }
         false
@@ -1132,10 +1187,55 @@ impl ControlState {
         }
     }
 
+    /// Соединение, с которого пользователь участвует в звонке этой комнаты (если оно ещё открыто).
+    pub fn call_device(&self, user_id: &Uuid, room_id: &Uuid) -> Option<Uuid> {
+        let (room, conn) = *self.call_devices.get(user_id)?;
+        if room != *room_id {
+            return None;
+        }
+        let alive = self
+            .sessions
+            .get(user_id)
+            .is_some_and(|list| list.iter().any(|(id, _)| *id == conn));
+        alive.then_some(conn)
+    }
+
+    pub fn set_call_device(&self, user_id: Uuid, room_id: Uuid, conn_id: Uuid) {
+        self.call_devices.insert(user_id, (room_id, conn_id));
+    }
+
+    /// Рассылка участникам комнаты. Если участник в звонке с одного устройства, событие идёт
+    /// только туда, а остальные его устройства узнают, что урок идёт на другом устройстве.
     pub fn broadcast_to_room(&self, room_id: &Uuid, msg: &ControlToClientMsg) {
-        if let Some(room) = self.rooms.get(room_id) {
-            for p in &room.participants {
-                self.send_to_user(&p.user_id, msg);
+        let participants: Vec<Uuid> = match self.rooms.get(room_id) {
+            Some(room) => room.participants.iter().map(|p| p.user_id).collect(),
+            None => return,
+        };
+        let elsewhere = match msg {
+            ControlToClientMsg::RoomUpdated { room } => Some(ControlToClientMsg::CallOnOtherDevice {
+                room_id: *room_id,
+                room: Some(room.clone()),
+            }),
+            _ => None,
+        };
+        for user_id in participants {
+            let Some(call_conn) = self.call_device(&user_id, room_id) else {
+                // Устройство со звонком отключилось и ждёт возвращения: состояние комнаты
+                // другим вкладкам не шлём, иначе они подключатся к звонку без спроса
+                let waiting = self.call_devices.get(&user_id).is_some_and(|e| e.0 == *room_id);
+                if !(waiting && elsewhere.is_some()) {
+                    self.send_to_user(&user_id, msg);
+                }
+                continue;
+            };
+            if let Some(conns) = self.sessions.get(&user_id) {
+                for (conn_id, tx) in conns.iter() {
+                    if *conn_id == call_conn {
+                        let _ = tx.send(msg.clone());
+                    } else if let Some(note) = &elsewhere {
+                        let _ = tx.send(note.clone());
+                    }
+                }
             }
         }
     }

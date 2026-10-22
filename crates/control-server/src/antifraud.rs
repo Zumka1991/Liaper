@@ -143,6 +143,12 @@ impl AntiFraudEngine {
     /// Проверяет лимит частоты в скользящем окне.
     pub fn allow_rate(&self, bucket_key: &str, window_secs: i64, max_count: usize) -> bool {
         let now = Utc::now();
+        // Окна по IP копятся бесконечно — чистим давно неактивные
+        if self.rate_windows.len() > 50_000 {
+            let cutoff = now - Duration::hours(2);
+            self.rate_windows
+                .retain(|_, w| w.timestamps.back().is_some_and(|t| *t >= cutoff));
+        }
         let mut win = self
             .rate_windows
             .entry(bucket_key.to_string())

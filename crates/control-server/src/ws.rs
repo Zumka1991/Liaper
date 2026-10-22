@@ -5,6 +5,7 @@ use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use liaper_common::{
     ClientToControlMsg, ControlToClientMsg, EncryptedChatMessage, RoomInfo, RoomParticipantState,
+    UserRole,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -33,12 +34,13 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
         self_profile.username, self_profile.id
     );
 
-    let active_rooms: Vec<RoomInfo> = state
+    // Урок, который уже идёт на другом устройстве, сюда не подключаем — только сообщаем о нём
+    let (active_rooms, rooms_elsewhere): (Vec<RoomInfo>, Vec<RoomInfo>) = state
         .rooms
         .iter()
         .filter(|r| r.participants.iter().any(|p| p.user_id == user_id))
         .map(|r| r.value().clone())
-        .collect();
+        .partition(|r| state.call_device(&user_id, &r.id).is_none());
     let (contacts, incoming_requests, outgoing_requests) = state.user_contacts_bundle(&user_id);
 
     let welcome = ControlToClientMsg::Welcome {
@@ -50,6 +52,12 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
         media_nodes: state.list_nodes_sorted(),
     };
     let _ = tx.send(welcome);
+    for room in rooms_elsewhere {
+        let _ = tx.send(ControlToClientMsg::CallOnOtherDevice {
+            room_id: room.id,
+            room: Some(room),
+        });
+    }
 
     // Доставляем сохранённые конверты E2EE-ключей перед историей сообщений
     for env in state.envelopes_for_recipient(&user_id) {
@@ -85,7 +93,7 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
     while let Some(Ok(frame)) = ws_receiver.next().await {
         if let Message::Text(text) = frame {
             match serde_json::from_str::<ClientToControlMsg>(&text) {
-                Ok(cmd) => process_client_command(&state, user_id, cmd).await,
+                Ok(cmd) => process_client_command_on(&state, user_id, conn_id, cmd).await,
                 Err(err) => {
                     warn!("Invalid WS message from {}: {}", user_id, err);
                     state.send_to_user(
@@ -104,15 +112,62 @@ pub async fn handle_client_socket(socket: WebSocket, state: Arc<ControlState>, u
         conns.retain(|(id, _)| *id != conn_id);
     }
 
+    // Закрылось устройство, на котором шёл звонок. Это может быть обновление страницы или
+    // обрыв сети: даём время вернуться, и только потом выводим из урока
+    let call_room = state
+        .call_devices
+        .get(&user_id)
+        .filter(|entry| entry.1 == conn_id)
+        .map(|entry| entry.0);
+    if let Some(room_id) = call_room {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_GRACE_SECS)).await;
+            expire_call_device(&state, user_id, room_id, conn_id);
+        });
+    }
+
     if !state.is_user_online(&user_id) {
-        remove_user_from_all_rooms(&state, user_id);
+        let room_ids: Vec<Uuid> = state
+            .rooms
+            .iter()
+            .filter(|r| Some(r.id) != call_room && r.participants.iter().any(|p| p.user_id == user_id))
+            .map(|r| r.id)
+            .collect();
+        for room_id in room_ids {
+            remove_user_from_room(&state, room_id, user_id);
+        }
         state.notify_user_contacts_presence(&user_id);
     }
 
     info!("Client disconnected: @{}", self_profile.username);
 }
 
+/// Сколько ждать возвращения в урок после обновления страницы или обрыва связи.
+const RECONNECT_GRACE_SECS: u64 = 60;
+
+/// Если за время ожидания пользователь не вернулся в урок ни с одного устройства — выводим его.
+fn expire_call_device(state: &Arc<ControlState>, user_id: Uuid, room_id: Uuid, conn_id: Uuid) {
+    let still_waiting = state
+        .call_devices
+        .get(&user_id)
+        .is_some_and(|entry| *entry == (room_id, conn_id));
+    if still_waiting {
+        remove_user_from_room(state, room_id, user_id);
+    }
+}
+
+#[cfg(test)]
 async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: ClientToControlMsg) {
+    process_client_command_on(state, user_id, Uuid::nil(), cmd).await
+}
+
+async fn process_client_command_on(
+    state: &Arc<ControlState>,
+    user_id: Uuid,
+    conn_id: Uuid,
+    cmd: ClientToControlMsg,
+) {
     let caller = match state.users_by_id.get(&user_id) {
         Some(u) => u.clone(),
         None => return,
@@ -316,6 +371,15 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             invited_usernames,
             preferred_region,
         } => {
+            if caller.role != UserRole::Tutor {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Групповые уроки создаёт преподаватель".into(),
+                    },
+                );
+                return;
+            }
             if !state
                 .antifraud
                 .allow_rate(&format!("call:{user_id}"), 60, 6)
@@ -405,10 +469,8 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             };
 
             state.rooms.insert(room_id, room.clone());
-            state.send_to_user(
-                &caller.id,
-                &ControlToClientMsg::RoomUpdated { room: room.clone() },
-            );
+            state.set_call_device(caller.id, room_id, conn_id);
+            state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room: room.clone() });
 
             for raw_nick in invited_usernames {
                 let norm = ControlState::normalize_username(&raw_nick);
@@ -523,7 +585,7 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
 
             let room = RoomInfo {
                 id: room_id,
-                title: format!("{} ↔ {}", caller.display_name, target_user.display_name),
+                title: format!("{} и {}", caller.display_name, target_user.display_name),
                 host_id: caller.id,
                 host_username: caller.username.clone(),
                 assigned_node: assigned_node.clone(),
@@ -537,10 +599,8 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
                 .entry(room_id)
                 .or_default()
                 .insert(target_id);
-            state.send_to_user(
-                &caller.id,
-                &ControlToClientMsg::RoomUpdated { room: room.clone() },
-            );
+            state.set_call_device(caller.id, room_id, conn_id);
+            state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room: room.clone() });
 
             state.send_to_user(
                 &target_id,
@@ -655,6 +715,8 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             }
 
             if let Some(room) = updated_room {
+                // Звонок переходит на это устройство; прежнее получит CallOnOtherDevice и отключится
+                state.set_call_device(caller.id, room_id, conn_id);
                 state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room });
 
                 if let Some(envelopes) = state.room_key_envelopes.get(&(room_id, caller.id)) {
@@ -695,6 +757,10 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             } else {
                 return;
             }
+            state.send_to_user(
+                &caller.id,
+                &ControlToClientMsg::CallOnOtherDevice { room_id, room: None },
+            );
             if let Some(room) = state.rooms.get(&room_id) {
                 for p in &room.participants {
                     state.send_to_user(
@@ -710,7 +776,40 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
         }
 
         ClientToControlMsg::LeaveRoom { room_id } => {
+            // Выйти из урока может только устройство, на котором идёт звонок
+            if state.call_device(&caller.id, &room_id).is_some_and(|c| c != conn_id) {
+                return;
+            }
             remove_user_from_room(state, room_id, caller.id);
+        }
+
+        ClientToControlMsg::RenameRoom { room_id, title } => {
+            let clean: String = title.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect();
+            if clean.is_empty() {
+                return;
+            }
+            let mut updated_room = None;
+            let mut denied = false;
+            if let Some(mut room) = state.rooms.get_mut(&room_id) {
+                let in_room = room.participants.iter().any(|p| p.user_id == caller.id);
+                if in_room && (room.host_id == caller.id || caller.role == UserRole::Tutor) {
+                    room.title = clean;
+                    updated_room = Some(room.clone());
+                } else {
+                    denied = true;
+                }
+            }
+            if denied {
+                state.send_to_user(
+                    &caller.id,
+                    &ControlToClientMsg::Error {
+                        message: "Тему урока меняет преподаватель".into(),
+                    },
+                );
+            }
+            if let Some(room) = updated_room {
+                state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room });
+            }
         }
 
         ClientToControlMsg::UpdateMediaState {
@@ -720,6 +819,9 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
             screen_share_enabled,
             speaking,
         } => {
+            if state.call_device(&caller.id, &room_id).is_some_and(|c| c != conn_id) {
+                return;
+            }
             let mut updated_room = None;
             if let Some(mut room) = state.rooms.get_mut(&room_id) {
                 if let Some(p) = room
@@ -1125,9 +1227,13 @@ async fn process_client_command(state: &Arc<ControlState>, user_id: Uuid, cmd: C
 fn remove_user_from_room(state: &Arc<ControlState>, room_id: Uuid, user_id: Uuid) {
     let mut updated_room = None;
     let mut should_remove_room = false;
+    let mut was_participant = false;
 
+    state.call_devices.remove_if(&user_id, |_, (room, _)| *room == room_id);
     if let Some(mut room) = state.rooms.get_mut(&room_id) {
+        let before = room.participants.len();
         room.participants.retain(|p| p.user_id != user_id);
+        was_participant = room.participants.len() != before;
         if room.participants.is_empty() {
             should_remove_room = true;
         } else {
@@ -1141,18 +1247,9 @@ fn remove_user_from_room(state: &Arc<ControlState>, room_id: Uuid, user_id: Uuid
     } else if let Some(room) = updated_room {
         state.broadcast_to_room(&room_id, &ControlToClientMsg::RoomUpdated { room });
     }
-}
-
-fn remove_user_from_all_rooms(state: &Arc<ControlState>, user_id: Uuid) {
-    let room_ids: Vec<Uuid> = state
-        .rooms
-        .iter()
-        .filter(|r| r.participants.iter().any(|p| p.user_id == user_id))
-        .map(|r| *r.key())
-        .collect();
-
-    for room_id in room_ids {
-        remove_user_from_room(state, room_id, user_id);
+    if was_participant {
+        // Остальные устройства убирают плашку «урок идёт на другом устройстве»
+        state.send_to_user(&user_id, &ControlToClientMsg::CallOnOtherDevice { room_id, room: None });
     }
 }
 
@@ -1259,6 +1356,18 @@ mod contact_tests {
         .await;
         assert_eq!(state.student_count(tutor), 10);
         assert!(state.are_contacts(&tutor, &pending.to_user_id));
+        // Ученик не может создать групповой урок
+        process_client_command(
+            &state,
+            students[1],
+            ClientToControlMsg::CreateRoom {
+                title: "Not allowed".into(),
+                invited_usernames: vec![tutor.simple().to_string()],
+                preferred_region: None,
+            },
+        )
+        .await;
+        assert!(state.rooms.is_empty());
         process_client_command(
             &state,
             tutor,
@@ -1391,5 +1500,162 @@ mod contact_tests {
         .await;
         assert_eq!(state.envelopes_for_recipient(&student).len(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn call_stays_on_one_device_and_moves_explicitly() {
+        let root = std::env::temp_dir().join(format!("liaper-devices-test-{}", Uuid::new_v4()));
+        let state = ControlState::new(root.join("users.json"));
+        let add = |role| {
+            let id = Uuid::new_v4();
+            let username = id.simple().to_string();
+            state.users_by_id.insert(
+                id,
+                StoredUser {
+                    id,
+                    username: username.clone(),
+                    display_name: "Test".into(),
+                    password_hash: "hash".into(),
+                    salt_b64: "salt".into(),
+                    role,
+                    e2ee_public_key: "key".into(),
+                    key_fingerprint: "fp".into(),
+                },
+            );
+            state.user_id_by_username.insert(username, id);
+            id
+        };
+        let tutor = add(UserRole::Tutor);
+        let student = add(UserRole::Student);
+        state.add_mutual_contact(tutor, student);
+
+        let connect = |user: Uuid| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let conn = Uuid::new_v4();
+            state.sessions.entry(user).or_default().push((conn, tx));
+            (conn, rx)
+        };
+        let drain = |rx: &mut mpsc::UnboundedReceiver<ControlToClientMsg>| {
+            let mut out = Vec::new();
+            while let Ok(m) = rx.try_recv() {
+                out.push(m);
+            }
+            out
+        };
+        let (tutor_conn, _tutor_rx) = connect(tutor);
+        let (phone, mut phone_rx) = connect(student);
+        let (laptop, mut laptop_rx) = connect(student);
+
+        process_client_command_on(
+            &state,
+            tutor,
+            tutor_conn,
+            ClientToControlMsg::CallByNick { target_username: student.simple().to_string(), with_video: true },
+        )
+        .await;
+        let room_id = state.rooms.iter().next().unwrap().id;
+        // Звонит на обоих устройствах
+        assert!(drain(&mut phone_rx).iter().any(|m| matches!(m, ControlToClientMsg::IncomingCall { .. })));
+        assert!(drain(&mut laptop_rx).iter().any(|m| matches!(m, ControlToClientMsg::IncomingCall { .. })));
+
+        let join = || ClientToControlMsg::JoinRoom { room_id, audio_enabled: true, video_enabled: true };
+        process_client_command_on(&state, student, phone, join()).await;
+        let on_phone = drain(&mut phone_rx);
+        let on_laptop = drain(&mut laptop_rx);
+        assert!(on_phone.iter().any(|m| matches!(m, ControlToClientMsg::RoomUpdated { .. })));
+        assert!(!on_laptop.iter().any(|m| matches!(m, ControlToClientMsg::RoomUpdated { .. })));
+        assert!(on_laptop.iter().any(|m| matches!(m, ControlToClientMsg::CallOnOtherDevice { room: Some(_), .. })));
+
+        // Тему задаёт преподаватель, ученик — нет
+        let rename = |title: &str| ClientToControlMsg::RenameRoom { room_id, title: title.into() };
+        process_client_command_on(&state, student, phone, rename("Взлом")).await;
+        assert_ne!(state.rooms.get(&room_id).unwrap().title, "Взлом");
+        process_client_command_on(&state, tutor, tutor_conn, rename("  Квадратные   уравнения ")).await;
+        assert_eq!(state.rooms.get(&room_id).unwrap().title, "Квадратные уравнения");
+        assert!(drain(&mut phone_rx).iter().any(|m| matches!(m, ControlToClientMsg::RoomUpdated { room } if room.title == "Квадратные уравнения")));
+
+        // Ноутбук не может завершить урок, идущий на телефоне
+        process_client_command_on(&state, student, laptop, ClientToControlMsg::LeaveRoom { room_id }).await;
+        assert!(state.rooms.get(&room_id).unwrap().participants.iter().any(|p| p.user_id == student));
+
+        // «Перенести сюда»: звонок уходит на ноутбук, телефон получает уведомление
+        process_client_command_on(&state, student, laptop, join()).await;
+        assert!(drain(&mut laptop_rx).iter().any(|m| matches!(m, ControlToClientMsg::RoomUpdated { .. })));
+        assert!(drain(&mut phone_rx).iter().any(|m| matches!(m, ControlToClientMsg::CallOnOtherDevice { room: Some(_), .. })));
+        assert_eq!(state.call_device(&student, &room_id), Some(laptop));
+
+        process_client_command_on(&state, student, laptop, ClientToControlMsg::LeaveRoom { room_id }).await;
+        assert!(!state.rooms.get(&room_id).unwrap().participants.iter().any(|p| p.user_id == student));
+        assert!(drain(&mut phone_rx).iter().any(|m| matches!(m, ControlToClientMsg::CallOnOtherDevice { room: None, .. })));
+        assert!(state.call_devices.get(&student).is_none());
+    }
+
+    #[tokio::test]
+    async fn page_reload_keeps_lesson_until_grace_expires() {
+        let root = std::env::temp_dir().join(format!("liaper-reload-test-{}", Uuid::new_v4()));
+        let state = ControlState::new(root.join("users.json"));
+        let add = |role| {
+            let id = Uuid::new_v4();
+            let username = id.simple().to_string();
+            state.users_by_id.insert(
+                id,
+                StoredUser {
+                    id,
+                    username: username.clone(),
+                    display_name: "Test".into(),
+                    password_hash: "hash".into(),
+                    salt_b64: "salt".into(),
+                    role,
+                    e2ee_public_key: "key".into(),
+                    key_fingerprint: "fp".into(),
+                },
+            );
+            state.user_id_by_username.insert(username, id);
+            id
+        };
+        let tutor = add(UserRole::Tutor);
+        let student = add(UserRole::Student);
+        state.add_mutual_contact(tutor, student);
+        let connect = |user: Uuid| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let conn = Uuid::new_v4();
+            state.sessions.entry(user).or_default().push((conn, tx));
+            (conn, rx)
+        };
+        let disconnect = |user: Uuid, conn: Uuid| {
+            state.sessions.get_mut(&user).unwrap().retain(|(id, _)| *id != conn);
+        };
+        let (tutor_conn, _t_rx) = connect(tutor);
+        let (old_tab, _o_rx) = connect(student);
+        process_client_command_on(
+            &state,
+            tutor,
+            tutor_conn,
+            ClientToControlMsg::CallByNick { target_username: student.simple().to_string(), with_video: false },
+        )
+        .await;
+        let room_id = state.rooms.iter().next().unwrap().id;
+        let join = || ClientToControlMsg::JoinRoom { room_id, audio_enabled: true, video_enabled: false };
+        process_client_command_on(&state, student, old_tab, join()).await;
+
+        // Обновление страницы: старая вкладка закрылась, новая подключилась
+        disconnect(student, old_tab);
+        let (new_tab, mut new_rx) = connect(student);
+        // Пока ученик не вернулся, новая вкладка не подключается к звонку сама
+        process_client_command_on(&state, tutor, tutor_conn, ClientToControlMsg::RenameRoom { room_id, title: "Тема".into() }).await;
+        let mut got_update = false;
+        while let Ok(m) = new_rx.try_recv() {
+            got_update |= matches!(m, ControlToClientMsg::RoomUpdated { .. });
+        }
+        assert!(!got_update);
+        // «Вернуться в урок»
+        process_client_command_on(&state, student, new_tab, join()).await;
+        expire_call_device(&state, student, room_id, old_tab);
+        assert!(state.rooms.get(&room_id).unwrap().participants.iter().any(|p| p.user_id == student));
+
+        // Закрыл вкладку и не вернулся — по истечении ожидания выходит из урока
+        disconnect(student, new_tab);
+        expire_call_device(&state, student, room_id, new_tab);
+        assert!(!state.rooms.get(&room_id).unwrap().participants.iter().any(|p| p.user_id == student));
     }
 }

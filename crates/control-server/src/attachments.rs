@@ -55,7 +55,7 @@ async fn database(state: &ControlState) -> Result<Arc<tokio_postgres::Client>, A
         .await
         .clone()
         .filter(|c| !c.is_closed())
-        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "PostgreSQL недоступна"))
+        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "Хранилище файлов временно недоступно. Попробуйте позже"))
 }
 fn db_error(e: tokio_postgres::Error) -> ApiError {
     tracing::error!("Attachment DB: {e}");
@@ -343,7 +343,7 @@ pub async fn download(
     let node = nodes()?
         .into_iter()
         .find(|n| n.node_id == node_id)
-        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "Файловая нода недоступна"))?;
+        .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "Хранилище файлов временно недоступно. Попробуйте позже"))?;
     let ticket = FileTicket {
         blob_id: id,
         node_id,
