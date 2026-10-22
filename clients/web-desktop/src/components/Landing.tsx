@@ -27,10 +27,10 @@ import {
   Video,
   X,
 } from 'lucide-react';
-import type { UserRole } from '../types/protocol';
+import type { AppReleaseManifest, UserRole } from '../types/protocol';
 import { LogoMark } from './Logo';
 
-type Props = { onRegister: (role?: UserRole) => void; onLogin: () => void };
+type Props = { onRegister: (role?: UserRole) => void; onLogin: () => void; controlBase: string };
 
 const SUBJECTS = ['Математика', 'Английский', 'Физика', 'Русский язык', 'Химия', 'Программирование', 'Музыка', 'ЕГЭ и ОГЭ'];
 
@@ -285,8 +285,63 @@ const AiDemo = () => {
   );
 };
 
+const formatSize = (bytes: number) => (bytes > 0 ? `${(bytes / 1024 / 1024).toFixed(bytes > 20 * 1024 * 1024 ? 0 : 1)} МБ` : '');
+
+/** Карточки скачивания: ссылки и версии берутся из реестра релизов сервера. */
+const DownloadCards: React.FC<{ controlBase: string }> = ({ controlBase }) => {
+  const [releases, setReleases] = useState<AppReleaseManifest[] | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch(`${controlBase}/api/releases`)
+      .then((r) => (r.ok ? r.json() : []))
+      .then((list: AppReleaseManifest[]) => { if (alive) setReleases(Array.isArray(list) ? list : []); })
+      .catch(() => { if (alive) setReleases([]); });
+    return () => { alive = false; };
+  }, [controlBase]);
+  const find = (...platforms: string[]) => releases?.find((r) => platforms.includes(r.platform));
+  const win = find('windows_x86_64');
+  const linux = find('linux_x86_64');
+  const android = find('android_arm64', 'android_universal');
+  const deb = linux?.download_url.endsWith('.AppImage') ? linux.download_url.replace(/\.AppImage$/, '.deb') : null;
+  const cards = [
+    { icon: MonitorUp, name: 'Windows', note: 'Windows 10 и 11, 64-бит', release: win, label: 'Скачать установщик', extra: null as null | { href: string; label: string } },
+    { icon: Smartphone, name: 'Android', note: 'Android 7 и новее', release: android, label: 'Скачать APK', extra: null },
+    { icon: Laptop, name: 'Linux', note: 'AppImage для любого дистрибутива', release: linux, label: 'Скачать AppImage', extra: deb ? { href: deb, label: '.deb для Ubuntu и Debian' } : null },
+  ];
+  return (
+    <div className="mt-12 grid gap-5 md:grid-cols-2 lg:grid-cols-4">
+      <div className="lp-reveal flex flex-col rounded-3xl bg-gradient-to-br from-indigo-600 to-violet-700 p-6 text-white shadow-xl shadow-indigo-600/20">
+        <span className="grid h-12 w-12 place-items-center rounded-2xl bg-white/15"><Laptop className="h-6 w-6" /></span>
+        <h3 className="mt-5 text-lg font-semibold">Браузер</h3>
+        <p className="mt-1 text-sm text-indigo-100">Chrome, Edge, Firefox, Safari — без установки.</p>
+        <a href="#register" className="mt-auto inline-flex items-center justify-center gap-2 rounded-xl bg-white px-4 py-2.5 text-sm font-semibold text-indigo-700 hover:bg-indigo-50">
+          Начать в браузере <ArrowRight className="h-4 w-4" />
+        </a>
+      </div>
+      {cards.map(({ icon: Icon, name, note, release, label, extra }, i) => (
+        <div key={name} className="lp-reveal flex flex-col rounded-3xl border border-slate-200 bg-white p-6 transition hover:border-indigo-200 hover:shadow-lg hover:shadow-indigo-900/5" style={{ transitionDelay: `${(i + 1) * 60}ms` }}>
+          <span className="grid h-12 w-12 place-items-center rounded-2xl bg-indigo-50 text-indigo-600"><Icon className="h-6 w-6" /></span>
+          <h3 className="mt-5 text-lg font-semibold">{name}</h3>
+          <p className="mt-1 text-sm text-slate-600">{note}</p>
+          <p className="mt-1 text-xs text-slate-400">{release ? `Версия ${release.version}${release.file_size_bytes ? ` · ${formatSize(release.file_size_bytes)}` : ''}` : releases === null ? 'Загружаем…' : 'Скоро'}</p>
+          <div className="mt-auto flex flex-col gap-2 pt-5">
+            {release ? (
+              <a href={release.download_url} download className="inline-flex items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800">
+                <Download className="h-4 w-4" /> {label}
+              </a>
+            ) : (
+              <span className="inline-flex items-center justify-center rounded-xl bg-slate-100 px-4 py-2.5 text-sm font-semibold text-slate-400">Скоро</span>
+            )}
+            {release && extra && <a href={extra.href} download className="text-center text-xs font-medium text-indigo-700 hover:underline">{extra.label}</a>}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+};
+
 /** Публичная страница продукта для незарегистрированных посетителей Web-версии. */
-export const Landing: React.FC<Props> = ({ onRegister, onLogin }) => {
+export const Landing: React.FC<Props> = ({ onRegister, onLogin, controlBase }) => {
   const rootRef = useReveal();
   const [scrolled, setScrolled] = useState(false);
   useEffect(() => {
@@ -308,6 +363,7 @@ export const Landing: React.FC<Props> = ({ onRegister, onLogin }) => {
             <a href="#features" className="hover:text-slate-900">Возможности</a>
             <a href="#how" className="hover:text-slate-900">Как начать</a>
             <a href="#ai" className="hover:text-slate-900">ИИ-помощник</a>
+            <a href="#download" className="hover:text-slate-900">Скачать</a>
             <a href="#faq" className="hover:text-slate-900">Вопросы</a>
           </nav>
           <div className="flex items-center gap-2">
@@ -503,20 +559,10 @@ export const Landing: React.FC<Props> = ({ onRegister, onLogin }) => {
           </div>
         </section>
 
-        {/* Устройства */}
-        <section className="mx-auto max-w-6xl px-5 pb-20">
-          <div className="lp-reveal grid items-center gap-6 rounded-3xl border border-slate-200 p-6 sm:p-8 md:grid-cols-[1fr_auto]">
-            <div>
-              <h2 className="text-2xl font-semibold tracking-tight">Занимайтесь с чего удобно</h2>
-              <p className="mt-2 text-slate-600">Начните в браузере — приложения для компьютера и телефона можно скачать в настройках после входа.</p>
-            </div>
-            <div className="flex flex-wrap gap-2.5">
-              {[[Laptop, 'Браузер'], [MonitorUp, 'Windows'], [Laptop, 'Linux'], [Smartphone, 'Android']].map(([Icon, name]) => {
-                const I = Icon as typeof Laptop;
-                return <span key={name as string} className="inline-flex items-center gap-2 rounded-xl bg-slate-50 px-4 py-2.5 text-sm font-semibold text-slate-700 ring-1 ring-slate-200"><I className="h-4 w-4 text-indigo-600" />{name as string}</span>;
-              })}
-            </div>
-          </div>
+        {/* Скачать */}
+        <section id="download" className="mx-auto max-w-6xl scroll-mt-20 px-5 pb-20">
+          <SectionTitle center eyebrow="Скачать" title="Занимайтесь с чего удобно" text="Liaper работает в браузере без установки. Для компьютера и телефона есть приложения — они обновляются сами." />
+          <DownloadCards controlBase={controlBase} />
         </section>
 
         {/* Вопросы */}

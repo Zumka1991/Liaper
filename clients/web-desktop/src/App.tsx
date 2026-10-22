@@ -2035,6 +2035,7 @@ export function App() {
       <Landing
         onRegister={(role) => { if (role) setRoleInput(role); window.location.hash = 'register'; }}
         onLogin={() => { window.location.hash = 'login'; }}
+        controlBase={DEFAULT_CONTROL_HTTP}
       />
     );
   }
