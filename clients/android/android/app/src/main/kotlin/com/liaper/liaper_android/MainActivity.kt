@@ -312,6 +312,32 @@ class MainActivity : FlutterActivity() {
                     result.success(pending)
                 }
                 "getPushToken" -> fetchPushToken(result)
+                // Сквозное шифрование медиа звонка: ключи комнаты из связки ключей Dart
+                "setMediaKeys" -> {
+                    MediaFrameCipher.setKeys(
+                        call.argument<String>("roomId") ?: "",
+                        call.argument<String>("userId") ?: "",
+                        call.argument<String>("activeKeyId") ?: "",
+                        call.argument<Map<String, String>>("keys") ?: emptyMap()
+                    )
+                    result.success(true)
+                }
+                "clearMediaKeys" -> {
+                    MediaFrameCipher.clear()
+                    result.success(true)
+                }
+                "encryptMedia" -> {
+                    val frame = MediaFrameCipher.encrypt(
+                        call.argument<String>("kind") ?: "",
+                        call.argument<ByteArray>("bytes") ?: ByteArray(0)
+                    )
+                    result.success(frame?.let { mapOf("ct" to it.ciphertext, "iv" to it.iv, "keyId" to it.keyId) })
+                }
+                "decryptMedia" -> result.success(decryptMediaArgs(call))
+                "playEncryptedPcm16" -> {
+                    decryptMediaArgs(call, kind = "audio_pcm16")?.let { playPcmChunk(it) }
+                    result.success(true)
+                }
                 "openUrl" -> {
                     // Ссылки из чата: только веб-адреса, во внешнем браузере
                     val uri = Uri.parse(call.argument<String>("url") ?: "")
@@ -339,6 +365,15 @@ class MainActivity : FlutterActivity() {
             }
         }
     }
+
+    private fun decryptMediaArgs(call: io.flutter.plugin.common.MethodCall, kind: String? = null): ByteArray? =
+        MediaFrameCipher.decrypt(
+            kind ?: call.argument<String>("kind") ?: "",
+            call.argument<String>("senderId") ?: "",
+            call.argument<String>("keyId") ?: "",
+            call.argument<ByteArray>("iv") ?: ByteArray(0),
+            call.argument<ByteArray>("ct") ?: ByteArray(0)
+        )
 
     private fun createFallbackSquareJpeg(size: Int, quality: Int): ByteArray {
         val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
@@ -740,10 +775,14 @@ class MainActivity : FlutterActivity() {
                             }
                         }
                         if (!micMuted) {
-                            val copy = chunkBuf.copyOf(read)
-                            mainHandler.post {
-                                if (isRecording && !micMuted) {
-                                    methodChannel?.invokeMethod("onPcm16Chunk", copy)
+                            // Шифруем ещё в потоке записи; без ключа комнаты звук не отправляется
+                            val frame = MediaFrameCipher.encrypt("audio_pcm16", chunkBuf.copyOf(read))
+                            if (frame != null) {
+                                val args = mapOf("ct" to frame.ciphertext, "iv" to frame.iv, "keyId" to frame.keyId)
+                                mainHandler.post {
+                                    if (isRecording && !micMuted) {
+                                        methodChannel?.invokeMethod("onPcm16Chunk", args)
+                                    }
                                 }
                             }
                         }

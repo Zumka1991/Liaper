@@ -1,6 +1,6 @@
 [package]
 name = "liaper-desktop"
-version = "0.2.1"
+version = "0.2.2"
 description = "Liaper Desktop (Windows & Linux) powered by Tauri v2 and Rust"
 edition = "2021"
 

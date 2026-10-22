@@ -1,0 +1,12 @@
+{
+  "raw_key_b64": "AQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09o=",
+  "plaintext_b64": "bGlhcGVyIG1lZGlhIGZyYW1lIHYxOiBQQ00xNiBvciBKUEVHIGJ5dGVz",
+  "room_id": "7f1c2b3a-0000-4000-8000-000000000001",
+  "sender_id": "96cd663b-ae8c-44fc-bef9-fd71441d1587",
+  "kind": "audio_pcm16",
+  "frame": {
+    "ciphertext_b64": "rsb+b+jEa3pQL6ythW6LYWEdLs2wOijBWFAtci5ZBE/f6eIeTRrmu9O3CYfQYS04Disnl8hxj7ioBg==",
+    "iv_b64": "yMfGxcTDwsHAv769",
+    "room_key_id": "room-key-test-1"
+  }
+}

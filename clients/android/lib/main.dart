@@ -48,7 +48,7 @@ void main() {
   runApp(const LiaperMobileApp());
 }
 
-const String kCurrentAppVersion = '0.2.1';
+const String kCurrentAppVersion = '0.2.2';
 const String kPlatformAndroid = 'android_arm64';
 
 class LiaperMobileApp extends StatelessWidget {
@@ -641,7 +641,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
     _mediaChannel.setMethodCallHandler((call) async {
       if (call.method == 'onPcm16Chunk') {
         final dynamic raw = call.arguments;
-        if (raw is Uint8List) {
+        if (raw is Map) {
           _sendAudioPcmToSfu(raw);
         }
       } else if (call.method == 'onCallNotificationAction') {
@@ -878,6 +878,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
     }
     final prefs = await SharedPreferences.getInstance();
     await AndroidE2eeService.saveRoomKeyrings(prefs, _roomKeyrings);
+    // Новый или ротированный ключ комнаты идущего звонка — сразу в шифр медиа
+    if (_currentRoom?['id']?.toString() == roomId) _syncMediaKeys(roomId);
 
     final ring = _roomKeyrings[roomId];
     bool updatedAny = false;
@@ -1906,6 +1908,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
 
     await _startLocalMedia(withAudio: _micEnabled, withVideo: _camEnabled);
     if (!mounted || _currentRoom?['id'] != roomId) return;
+    _syncMediaKeys(roomId);
     _connectToSfuNode(room);
   }
 
@@ -2040,8 +2043,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
             'user_id': _currentUser!['id'],
             'username': _currentUser!['username'],
             'display_name': _currentUser!['display_name'],
-            'e2ee_enabled': false,
-            'room_key_id': 'NONE',
+            'e2ee_enabled': true,
+            'room_key_id': _roomKeyrings[roomId]?.activeKey.roomKeyId ?? 'NONE',
             'ticket': ticket,
           },
         }),
@@ -2062,15 +2065,24 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
               final cipherB64 = payload['ciphertext_b64'] as String?;
               if (cipherB64 == null) return;
 
-              final bytes = base64Decode(cipherB64);
-              if (kind == 'video_jpeg' || kind == 'video') {
-                if (mounted) {
-                  setState(() {
-                    _remoteVideoFrames[senderId] = bytes;
-                  });
-                }
+              // Кадры зашифрованы ключом комнаты; без ключа или подделанные — пропускаем
+              final frameArgs = {
+                'kind': kind,
+                'senderId': senderId,
+                'keyId': (payload['room_key_id'] ?? '').toString(),
+                'iv': base64Decode((payload['iv_b64'] ?? '').toString()),
+                'ct': base64Decode(cipherB64),
+              };
+              if (kind == 'video_jpeg') {
+                _mediaChannel
+                    .invokeMethod<Uint8List>('decryptMedia', frameArgs)
+                    .then((bytes) {
+                  if (bytes != null && mounted) {
+                    setState(() => _remoteVideoFrames[senderId] = bytes);
+                  }
+                }).catchError((_) {});
               } else if (kind == 'audio_pcm16') {
-                _mediaChannel.invokeMethod('playPcm16', {'bytes': bytes});
+                _mediaChannel.invokeMethod('playEncryptedPcm16', frameArgs);
               }
             } else if (type == 'peer_left_sfu' && payload != null) {
               final peerId = payload['user_id'] as String?;
@@ -2106,7 +2118,38 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
     } catch (_) {}
   }
 
-  void _sendAudioPcmToSfu(Uint8List pcmBytes) {
+  /// Передаёт native ключи комнаты звонка: медиа шифруется и расшифровывается в Kotlin
+  void _syncMediaKeys(String roomId) {
+    final ring = _roomKeyrings[roomId];
+    final userId = _currentUser?['id']?.toString();
+    if (ring == null || userId == null) return;
+    _mediaChannel.invokeMethod('setMediaKeys', {
+      'roomId': roomId,
+      'userId': userId,
+      'activeKeyId': ring.activeKey.roomKeyId,
+      'keys': {
+        for (final entry in ring.keysById.entries) entry.key: entry.value.rawKeyB64,
+      },
+    }).catchError((_) => null);
+  }
+
+  void _sendEncryptedFrame(String kind, Map<dynamic, dynamic> frame) {
+    _sfuChannel?.sink.add(
+      jsonEncode({
+        'type': 'encrypted_media_frame',
+        'payload': {
+          'room_id': _currentRoom!['id'],
+          'kind': kind,
+          'ciphertext_b64': base64Encode(frame['ct'] as Uint8List),
+          'iv_b64': base64Encode(frame['iv'] as Uint8List),
+          'room_key_id': frame['keyId'],
+          'timestamp_ms': DateTime.now().millisecondsSinceEpoch,
+        },
+      }),
+    );
+  }
+
+  void _sendAudioPcmToSfu(Map<dynamic, dynamic> frame) {
     if (!_micEnabled ||
         _sfuChannel == null ||
         _currentRoom == null ||
@@ -2115,22 +2158,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
     }
 
     try {
-      final b64 = base64Encode(pcmBytes);
-      final iv = base64Encode(
-          utf8.encode('aud-${DateTime.now().millisecondsSinceEpoch}'));
-      _sfuChannel?.sink.add(
-        jsonEncode({
-          'type': 'encrypted_media_frame',
-          'payload': {
-            'room_id': _currentRoom!['id'],
-            'kind': 'audio_pcm16',
-            'ciphertext_b64': b64,
-            'iv_b64': iv,
-            'room_key_id': 'AES256',
-            'timestamp_ms': DateTime.now().millisecondsSinceEpoch,
-          },
-        }),
-      );
+      _sendEncryptedFrame('audio_pcm16', frame);
     } catch (_) {}
   }
 
@@ -2163,23 +2191,14 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
         }
       } catch (_) {}
 
-      final b64 = base64Encode(bytesToSend);
-      final iv = base64Encode(
-          utf8.encode('vid-${DateTime.now().millisecondsSinceEpoch}'));
-
-      _sfuChannel?.sink.add(
-        jsonEncode({
-          'type': 'encrypted_media_frame',
-          'payload': {
-            'room_id': _currentRoom!['id'],
-            'kind': 'video_jpeg',
-            'ciphertext_b64': b64,
-            'iv_b64': iv,
-            'room_key_id': 'AES256',
-            'timestamp_ms': DateTime.now().millisecondsSinceEpoch,
-          },
-        }),
+      final frame = await _mediaChannel.invokeMethod<Map<dynamic, dynamic>>(
+        'encryptMedia',
+        {'kind': 'video_jpeg', 'bytes': bytesToSend},
       );
+      // Ключа комнаты ещё нет — кадр не отправляем
+      if (frame != null && _sfuChannel != null && _currentRoom != null) {
+        _sendEncryptedFrame('video_jpeg', frame);
+      }
     } catch (_) {
     } finally {
       _sendingFrame = false;
@@ -2187,6 +2206,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
   }
 
   Future<void> _stopLocalMediaAndSfu() async {
+    _mediaChannel.invokeMethod('clearMediaKeys').catchError((_) => null);
     _videoFrameTimer?.cancel();
     _videoFrameTimer = null;
     _callDurationTimer?.cancel();

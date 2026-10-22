@@ -94,7 +94,7 @@ import type {
   UserRole,
 } from './types/protocol';
 
-const APP_VERSION = '0.2.1';
+const APP_VERSION = '0.2.2';
 const runtimeEnv = (import.meta as unknown as { env?: { VITE_CONTROL_URL?: string; DEV?: boolean } }).env;
 const DEFAULT_CONTROL_HTTP = (runtimeEnv?.VITE_CONTROL_URL ||
   ('__TAURI_INTERNALS__' in window ? 'http://127.0.0.1:4000'
@@ -1045,6 +1045,9 @@ export function App() {
       username: me.username,
       displayName: me.display_name,
       getRoomKey: () => roomKeyringsRef.current.get(room.id)?.activeKey ?? keyBundle,
+      getKeyById: (roomKeyId) =>
+        roomKeyringsRef.current.get(room.id)?.keysById[roomKeyId] ??
+        (keyBundle.roomKeyId === roomKeyId ? keyBundle : null),
       getJoinTicket: async () => {
         const res = await fetch(`${DEFAULT_CONTROL_HTTP}/api/rooms/${room.id}/sfu-ticket`, {
           method: 'POST',

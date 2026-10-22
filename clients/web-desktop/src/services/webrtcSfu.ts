@@ -3,6 +3,7 @@ import {
   bytesToBase64,
   type RoomSecretKeyBundle,
 } from '../crypto/e2ee';
+import { decryptMediaFrame, encryptMediaFrame } from '../crypto/mediaFrames';
 import type {
   ClientToNodeMsg,
   NodeToClientMsg,
@@ -34,6 +35,10 @@ export class SfuMediaNodeClient {
   private username: string;
   private displayName: string;
   private getRoomKey: () => RoomSecretKeyBundle | null;
+  private getKeyById: (roomKeyId: string) => RoomSecretKeyBundle | null;
+  // Шифрование и расшифровка асинхронные: цепочки сохраняют порядок кадров
+  private sendChain: Promise<void> = Promise.resolve();
+  private receiveChains = new Map<string, Promise<void>>();
   private getJoinTicket: () => Promise<string | null>;
   private localStream: MediaStream | null = null;
   private callbacks: SfuConnectionCallbacks;
@@ -62,6 +67,8 @@ export class SfuMediaNodeClient {
     username: string;
     displayName: string;
     getRoomKey: () => RoomSecretKeyBundle | null;
+    /** Ключ комнаты по id — чтобы расшифровать кадры, отправленные до или после ротации ключа */
+    getKeyById: (roomKeyId: string) => RoomSecretKeyBundle | null;
     /** Подписанный сервером управления допуск в медиа-комнату (null в режиме разработки) */
     getJoinTicket: () => Promise<string | null>;
     callbacks: SfuConnectionCallbacks;
@@ -72,6 +79,7 @@ export class SfuMediaNodeClient {
     this.username = params.username;
     this.displayName = params.displayName;
     this.getRoomKey = params.getRoomKey;
+    this.getKeyById = params.getKeyById;
     this.callbacks = params.callbacks;
   }
 
@@ -119,7 +127,7 @@ export class SfuMediaNodeClient {
           user_id: this.userId,
           username: this.username,
           display_name: this.displayName,
-          e2ee_enabled: false,
+          e2ee_enabled: true,
           room_key_id: key?.roomKeyId ?? 'AES256',
           ticket,
         },
@@ -251,22 +259,7 @@ export class SfuMediaNodeClient {
           const rms = Math.sqrt(sumSq / input.length);
           if (rms < 0.0015) return;
 
-          const bytes = new Uint8Array(pcm16.buffer);
-          const b64 = bytesToBase64(bytes);
-          this.encryptedCount += 1;
-          this.callbacks.onE2eeStatsUpdated(this.encryptedCount, this.decryptedCount);
-
-          this.send({
-            type: 'encrypted_media_frame',
-            payload: {
-              room_id: this.roomId,
-              kind: 'audio_pcm16',
-              ciphertext_b64: b64,
-              iv_b64: 'pcm16-16000-mono',
-              room_key_id: this.getRoomKey()?.roomKeyId ?? 'AES256',
-              timestamp_ms: Date.now(),
-            },
-          });
+          this.sendEncryptedMedia('audio_pcm16', new Uint8Array(pcm16.buffer));
         };
         this.micSource.connect(this.micProcessor);
         this.micProcessor.connect(this.audioCtx.destination);
@@ -330,31 +323,77 @@ export class SfuMediaNodeClient {
         const dataUrl = this.captureCanvas.toDataURL('image/jpeg', quality);
         const b64 = dataUrl.split(',')[1];
         if (!b64) return;
-
-        this.encryptedCount += 1;
-        this.callbacks.onE2eeStatsUpdated(this.encryptedCount, this.decryptedCount);
-
-        this.send({
-          type: 'encrypted_media_frame',
-          payload: {
-            room_id: this.roomId,
-            kind: 'video_jpeg',
-            ciphertext_b64: b64,
-            iv_b64: 'jpeg-hd',
-            room_key_id: this.getRoomKey()?.roomKeyId ?? 'AES256',
-            timestamp_ms: Date.now(),
-          },
-        });
+        this.sendEncryptedMedia('video_jpeg', base64ToBytes(b64));
       }, 1000 / VIDEO_FPS);
     }
   }
 
-  private playIncomingPcm16(b64: string): void {
+  /**
+   * Шифрует кадр ключом комнаты и отправляет. Пока ключа нет (собеседник ещё не прислал конверт),
+   * кадр пропускается: открытым текстом медиа не уходит никогда.
+   */
+  private sendEncryptedMedia(kind: 'audio_pcm16' | 'video_jpeg', plaintext: Uint8Array): void {
+    const key = this.getRoomKey();
+    if (!key) return;
+    this.sendChain = this.sendChain
+      .then(async () => {
+        const frame = await encryptMediaFrame({
+          key: key.cryptoKey,
+          roomKeyId: key.roomKeyId,
+          roomId: this.roomId,
+          senderId: this.userId,
+          kind,
+          plaintext,
+        });
+        this.encryptedCount += 1;
+        this.callbacks.onE2eeStatsUpdated(this.encryptedCount, this.decryptedCount);
+        this.send({
+          type: 'encrypted_media_frame',
+          payload: { room_id: this.roomId, kind, ...frame, timestamp_ms: Date.now() },
+        });
+      })
+      .catch(() => {});
+  }
+
+  private receiveEncryptedMedia(payload: {
+    from_peer_id: string;
+    kind: string;
+    ciphertext_b64: string;
+    iv_b64: string;
+    room_key_id: string;
+  }): void {
+    const key = this.getKeyById(payload.room_key_id);
+    // Ключа нет (конверт ещё в пути) или кадр не зашифрован — такой кадр не воспроизводим
+    if (!key) return;
+    const chainKey = `${payload.from_peer_id}:${payload.kind}`;
+    const prev = this.receiveChains.get(chainKey) ?? Promise.resolve();
+    const next = prev
+      .then(async () => {
+        const plaintext = await decryptMediaFrame({
+          key: key.cryptoKey,
+          roomId: this.roomId,
+          senderId: payload.from_peer_id,
+          kind: payload.kind,
+          ciphertextB64: payload.ciphertext_b64,
+          ivB64: payload.iv_b64,
+        });
+        this.decryptedCount += 1;
+        this.callbacks.onE2eeStatsUpdated(this.encryptedCount, this.decryptedCount);
+        if (payload.kind === 'audio_pcm16') {
+          this.playIncomingPcm16(plaintext);
+        } else if (payload.kind === 'video_jpeg') {
+          this.callbacks.onRemoteVideoFrame(payload.from_peer_id, `data:image/jpeg;base64,${bytesToBase64(plaintext)}`);
+        }
+      })
+      .catch(() => {});
+    this.receiveChains.set(chainKey, next);
+  }
+
+  private playIncomingPcm16(bytes: Uint8Array): void {
     this.initAudioContext();
     if (!this.audioCtx) return;
 
     try {
-      const bytes = base64ToBytes(b64);
       const sampleCount = Math.floor(bytes.byteLength / 2);
       if (sampleCount <= 0) return;
 
@@ -406,18 +445,7 @@ export class SfuMediaNodeClient {
       }
 
       case 'relayed_encrypted_media_frame': {
-        this.decryptedCount += 1;
-        this.callbacks.onE2eeStatsUpdated(this.encryptedCount, this.decryptedCount);
-
-        const { from_peer_id, kind, ciphertext_b64 } = msg.payload;
-        if (kind === 'audio_pcm16') {
-          this.playIncomingPcm16(ciphertext_b64);
-        } else if (kind === 'video_jpeg' || kind === 'video') {
-          this.callbacks.onRemoteVideoFrame(
-            from_peer_id,
-            `data:image/jpeg;base64,${ciphertext_b64}`
-          );
-        }
+        this.receiveEncryptedMedia(msg.payload);
         break;
       }
     }
