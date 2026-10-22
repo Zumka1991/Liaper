@@ -42,6 +42,9 @@ android {
 
     buildTypes {
         release {
+            // shared_preferences uses JNI lookups that R8 currently breaks in release builds.
+            isMinifyEnabled = false
+            isShrinkResources = false
             // Без key.properties релиз подписывается debug-ключом: такой APK не для распространения
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
