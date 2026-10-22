@@ -23,6 +23,7 @@ import {
   Smartphone,
   Sparkles,
   UserPlus,
+  Menu,
   Users,
   Video,
   X,
@@ -256,21 +257,21 @@ const AiDemo = () => {
   const tab = AI_TABS.find((t) => t.id === active) ?? AI_TABS[0];
   return (
     <div className="lp-reveal relative mt-10 grid gap-5 lg:grid-cols-[280px_1fr]">
-      <div role="tablist" aria-label="Возможности ИИ-помощника" className="flex gap-2 overflow-x-auto pb-1 lg:flex-col lg:overflow-visible">
+      <div role="tablist" aria-label="Возможности ИИ-помощника" className="grid grid-cols-2 gap-2 lg:flex lg:flex-col">
         {AI_TABS.map(({ id, icon: Icon, title }) => (
           <button
             key={id} type="button" role="tab" aria-selected={id === active} aria-controls="ai-panel"
             onClick={() => setActive(id)}
-            className={`flex shrink-0 items-center gap-3 rounded-xl px-4 py-3 text-left text-sm font-semibold transition ${id === active ? 'bg-white text-indigo-700 shadow-lg' : 'bg-white/10 text-white ring-1 ring-white/15 hover:bg-white/15'}`}
+            className={`flex min-w-0 items-center gap-2 rounded-xl px-3 py-2.5 text-left text-[13px] font-semibold leading-tight transition sm:gap-3 sm:px-4 sm:py-3 sm:text-sm ${id === active ? 'bg-white text-indigo-700 shadow-lg' : 'bg-white/10 text-white ring-1 ring-white/15 hover:bg-white/15'}`}
           >
-            <Icon className="h-5 w-5" />{title}
+            <Icon className="h-5 w-5 shrink-0" /><span className="min-w-0">{title}</span>
           </button>
         ))}
       </div>
       <div id="ai-panel" role="tabpanel" className="rounded-2xl bg-white/95 p-5 text-slate-800 shadow-2xl ring-1 ring-white/20 sm:p-6">
         <div className="flex items-center gap-3 rounded-xl bg-slate-100 px-4 py-3 text-sm text-slate-600">
           <Sparkles className="h-4 w-4 shrink-0 text-indigo-600" />
-          <span className="truncate">{tab.prompt}</span>
+          <span className="min-w-0">{tab.prompt}</span>
         </div>
         <ul key={tab.id} className="mt-4 space-y-2">
           {tab.output.map((line, i) => (
@@ -344,6 +345,7 @@ const DownloadCards: React.FC<{ controlBase: string }> = ({ controlBase }) => {
 export const Landing: React.FC<Props> = ({ onRegister, onLogin, controlBase }) => {
   const rootRef = useReveal();
   const [scrolled, setScrolled] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 480);
     onScroll();
@@ -369,8 +371,28 @@ export const Landing: React.FC<Props> = ({ onRegister, onLogin, controlBase }) =
           <div className="flex items-center gap-2">
             <button type="button" onClick={onLogin} className="rounded-xl px-3.5 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-100">Войти</button>
             <button type="button" onClick={() => onRegister()} className="hidden rounded-xl bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-indigo-600/25 hover:bg-indigo-500 sm:inline-flex">Создать аккаунт</button>
+            <button
+              type="button"
+              onClick={() => setMenuOpen((v) => !v)}
+              aria-expanded={menuOpen}
+              aria-controls="lp-mobile-menu"
+              aria-label={menuOpen ? 'Закрыть меню' : 'Открыть меню'}
+              className="grid h-10 w-10 place-items-center rounded-xl text-slate-700 hover:bg-slate-100 md:hidden"
+            >
+              {menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+            </button>
           </div>
         </div>
+        {menuOpen && (
+          <nav id="lp-mobile-menu" aria-label="Разделы" className="border-t border-slate-100 bg-white px-5 pb-5 pt-2 shadow-lg md:hidden">
+            {[['#features', 'Возможности'], ['#how', 'Как начать'], ['#ai', 'ИИ-помощник'], ['#download', 'Скачать'], ['#faq', 'Вопросы']].map(([href, label]) => (
+              <a key={href} href={href} onClick={() => setMenuOpen(false)} className="flex items-center justify-between rounded-xl px-3 py-3 text-base font-medium text-slate-800 hover:bg-slate-50">
+                {label}<ArrowRight className="h-4 w-4 text-slate-400" />
+              </a>
+            ))}
+            <button type="button" onClick={() => { setMenuOpen(false); onRegister(); }} className="mt-3 w-full rounded-xl bg-indigo-600 py-3 text-base font-semibold text-white">Создать аккаунт</button>
+          </nav>
+        )}
       </header>
 
       <main id="top">
