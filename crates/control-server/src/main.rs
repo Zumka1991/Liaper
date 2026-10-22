@@ -1162,12 +1162,13 @@ struct UpdateCheckQuery {
 }
 
 fn parse_platform(raw: &str) -> AppPlatform {
-    // Клиенты присылают и `android_arm64`, и `android-arm64`
-    match raw.trim().to_lowercase().replace('_', "-").as_str() {
-        "windows" | "windows-x86_64" | "win64" => AppPlatform::WindowsX86_64,
-        "linux" | "linux-x86_64" => AppPlatform::LinuxX86_64,
-        "android" | "android-arm64" | "android-aarch64" => AppPlatform::AndroidArm64,
-        "android-universal" => AppPlatform::AndroidUniversal,
+    // Клиенты присылают и `windows_x86_64`, и `windows-x86_64`. Приводим дефисы к подчёркиваниям:
+    // наоборот нельзя — подчёркивание внутри `x86_64` тоже заменилось бы
+    match raw.trim().to_lowercase().replace('-', "_").as_str() {
+        "windows" | "windows_x86_64" | "win64" => AppPlatform::WindowsX86_64,
+        "linux" | "linux_x86_64" => AppPlatform::LinuxX86_64,
+        "android" | "android_arm64" | "android_aarch64" => AppPlatform::AndroidArm64,
+        "android_universal" => AppPlatform::AndroidUniversal,
         _ => AppPlatform::Web,
     }
 }
@@ -1303,6 +1304,21 @@ async fn ws_upgrade_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_check_understands_every_platform_spelling() {
+        for raw in ["windows_x86_64", "windows-x86_64", "Windows", "win64"] {
+            assert_eq!(parse_platform(raw), AppPlatform::WindowsX86_64, "{raw}");
+        }
+        for raw in ["linux_x86_64", "linux-x86_64", "linux"] {
+            assert_eq!(parse_platform(raw), AppPlatform::LinuxX86_64, "{raw}");
+        }
+        for raw in ["android_arm64", "android-arm64", "android"] {
+            assert_eq!(parse_platform(raw), AppPlatform::AndroidArm64, "{raw}");
+        }
+        assert_eq!(parse_platform("android-universal"), AppPlatform::AndroidUniversal);
+        assert_eq!(parse_platform("что-то"), AppPlatform::Web);
+    }
 
     #[tokio::test]
     async fn release_publication_requires_configured_secret() {
