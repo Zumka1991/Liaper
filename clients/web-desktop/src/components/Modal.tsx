@@ -1,10 +1,12 @@
 import { useEffect, useRef, type ReactNode } from 'react';
 
 // Native dialog provides focus containment, Escape and focus restoration.
-export function Modal({ children, onClose, label }: {
+export function Modal({ children, onClose, label, className }: {
   children: ReactNode;
   onClose: () => void;
   label: string;
+  /** Замена стандартного оформления окна (белая карточка) */
+  className?: string;
 }) {
   const ref = useRef<HTMLDialogElement>(null);
   useEffect(() => {
@@ -14,7 +16,7 @@ export function Modal({ children, onClose, label }: {
   }, []);
   return (
     <dialog ref={ref} aria-label={label} onCancel={onClose}
-      className="app-dialog rounded-2xl border border-slate-200 bg-white p-6 shadow-xl">
+      className={className ?? 'app-dialog rounded-2xl border border-slate-200 bg-white p-6 shadow-xl'}>
       {children}
     </dialog>
   );

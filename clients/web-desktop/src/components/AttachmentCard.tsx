@@ -5,6 +5,7 @@ import {
   Download,
   FileText,
   Image as ImageIcon,
+  Maximize2,
   Mic,
   Pause,
   Play,
@@ -13,6 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import { toArrayBuffer } from '../crypto/e2ee';
+import { Modal } from './Modal';
 import {
   AttachmentExpiredError,
   decodeLpvnVideoNote,
@@ -212,6 +214,10 @@ export function AttachmentCard({
   const [videoNoteFrameUrl, setVideoNoteFrameUrl] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
   const [playElapsedMs, setPlayElapsedMs] = useState(0);
+  // Видеокружок: крупный просмотр и кнопка паузы, которая показывается только при движении мыши
+  const [videoNoteExpanded, setVideoNoteExpanded] = useState(false);
+  const [controlsVisible, setControlsVisible] = useState(false);
+  const controlsTimerRef = useRef<number | null>(null);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -279,9 +285,18 @@ export function AttachmentCard({
       if (animTimerRef.current !== null) {
         window.clearInterval(animTimerRef.current);
       }
+      if (controlsTimerRef.current !== null) {
+        window.clearTimeout(controlsTimerRef.current);
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [meta.id]);
+
+  function revealControls() {
+    setControlsVisible(true);
+    if (controlsTimerRef.current !== null) window.clearTimeout(controlsTimerRef.current);
+    controlsTimerRef.current = window.setTimeout(() => setControlsVisible(false), 1200);
+  }
 
   async function fetchDecrypted(saveAfterLoad: boolean): Promise<Uint8Array | null> {
     if (decryptedBytes) {
@@ -417,40 +432,75 @@ export function AttachmentCard({
   if (meta.kind === 'video_note') {
     const totalMs = videoNote?.durationMs || meta.duration_ms || 0;
     const ratio = loading ? progress : totalMs > 0 && playing ? Math.min(1, playElapsedMs / totalMs) : 0;
+    // Во время просмотра значок паузы не закрывает лицо: виден лишь секунду после движения мыши
+    const showCenterButton = !playing || controlsVisible;
+    const circle = (large: boolean) => (
+      <div
+        className="relative rounded-full p-[3px] shadow-md"
+        style={{
+          background: ratio > 0
+            ? `conic-gradient(#6366f1 ${ratio * 360}deg, #e2e8f0 0deg)`
+            : 'linear-gradient(135deg, #c7d2fe, #ddd6fe)',
+        }}
+      >
+        <div
+          className={`relative overflow-hidden rounded-full bg-slate-900 ${large ? '' : 'h-48 w-48'}`}
+          style={large ? { width: 'min(80vmin, 640px)', height: 'min(80vmin, 640px)' } : undefined}
+        >
+          {videoNoteFrameUrl ? (
+            <img src={videoNoteFrameUrl} alt="Видеокружок" className="h-full w-full object-cover" />
+          ) : (
+            <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-slate-800 to-slate-900 text-white/70">
+              <Video className="h-7 w-7" />
+              <span className="mt-1.5 text-xs">{loading ? `Загрузка ${pct}%` : 'Видеокружок'}</span>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => void togglePlayMedia()}
+            onPointerMove={() => { if (playing) revealControls(); }}
+            aria-label={playing ? 'Пауза видеокружка' : 'Воспроизвести видеокружок'}
+            className={`absolute inset-0 flex items-center justify-center text-white transition ${playing ? 'bg-transparent' : 'bg-black/10 hover:bg-black/25'}`}
+          >
+            <span className={`flex items-center justify-center rounded-full bg-white/90 text-slate-900 shadow-lg transition-opacity duration-300 ${large ? 'h-16 w-16' : 'h-12 w-12'} ${showCenterButton ? 'opacity-100' : 'opacity-0'}`}>
+              {playing ? <Pause className={large ? 'h-7 w-7' : 'h-5 w-5'} /> : <Play className={`ml-0.5 ${large ? 'h-7 w-7' : 'h-5 w-5'}`} />}
+            </span>
+          </button>
+          <span className={`pointer-events-none absolute left-1/2 -translate-x-1/2 rounded-full bg-black/55 px-2.5 py-0.5 font-mono text-white backdrop-blur-sm ${large ? 'bottom-6 text-sm' : 'bottom-3 text-xs'}`}>
+            {formatDurationMmSs(playing ? playElapsedMs : totalMs)}
+          </span>
+        </div>
+        {!large && videoNoteFrameUrl && (
+          <button
+            type="button"
+            onClick={() => setVideoNoteExpanded(true)}
+            aria-label="Развернуть видеокружок"
+            title="Развернуть"
+            className="absolute right-2 top-2 grid h-8 w-8 place-items-center rounded-full bg-black/55 text-white shadow backdrop-blur-sm transition hover:bg-black/75"
+          >
+            <Maximize2 className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+    );
     return (
       <div className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}>
-        <div
-          className="relative rounded-full p-[3px] shadow-md"
-          style={{
-            background: ratio > 0
-              ? `conic-gradient(#6366f1 ${ratio * 360}deg, #e2e8f0 0deg)`
-              : 'linear-gradient(135deg, #c7d2fe, #ddd6fe)',
-          }}
-        >
-          <div className="relative h-48 w-48 overflow-hidden rounded-full bg-slate-900">
-            {videoNoteFrameUrl ? (
-              <img src={videoNoteFrameUrl} alt="Видеокружок" className="h-full w-full object-cover" />
-            ) : (
-              <div className="flex h-full w-full flex-col items-center justify-center bg-gradient-to-br from-slate-800 to-slate-900 text-white/70">
-                <Video className="h-7 w-7" />
-                <span className="mt-1.5 text-xs">{loading ? `Загрузка ${pct}%` : 'Видеокружок'}</span>
-              </div>
-            )}
-            <button
-              type="button"
-              onClick={() => void togglePlayMedia()}
-              aria-label={playing ? 'Пауза видеокружка' : 'Воспроизвести видеокружок'}
-              className={`group absolute inset-0 flex items-center justify-center text-white transition ${playing ? 'bg-transparent' : 'bg-black/10 hover:bg-black/25'}`}
-            >
-              <span className={`flex h-12 w-12 items-center justify-center rounded-full bg-white/90 text-slate-900 shadow-lg transition group-hover:scale-105 ${playing ? 'opacity-0 group-hover:opacity-100' : ''}`}>
-                {playing ? <Pause className="h-5 w-5" /> : <Play className="ml-0.5 h-5 w-5" />}
-              </span>
-            </button>
-            <span className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full bg-black/55 px-2.5 py-0.5 font-mono text-xs text-white backdrop-blur-sm">
-              {formatDurationMmSs(playing ? playElapsedMs : totalMs)}
-            </span>
-          </div>
-        </div>
+        {circle(false)}
+        {videoNoteExpanded && (
+          <Modal label="Видеокружок" onClose={() => setVideoNoteExpanded(false)} className="video-note-dialog">
+            <div className="relative">
+              {circle(true)}
+              <button
+                type="button"
+                onClick={() => setVideoNoteExpanded(false)}
+                aria-label="Закрыть"
+                className="absolute -right-2 -top-2 grid h-10 w-10 place-items-center rounded-full bg-white text-slate-900 shadow-lg transition hover:bg-slate-100"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+          </Modal>
+        )}
 
         {objectUrl && (
           <audio

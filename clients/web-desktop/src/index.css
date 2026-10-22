@@ -75,6 +75,9 @@
 .notification-banner button { padding: 6px; }
 .app-dialog { margin: auto; width: min(520px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow-y: auto; }
 .app-dialog::backdrop { background: #0f172a88; backdrop-filter: blur(3px); }
+/* Видеокружок крупно: без карточки, только круг поверх затемнения */
+.video-note-dialog { margin: auto; padding: 0; border: 0; background: transparent; overflow: visible; max-width: none; max-height: none; }
+.video-note-dialog::backdrop { background: #020617d9; backdrop-filter: blur(4px); }
 
 /* Страница контактов: на широких экранах заменяет боковую панель и область урока */
 .contacts-page { display: none; flex: 1; min-width: 0; overflow-y: auto; }
