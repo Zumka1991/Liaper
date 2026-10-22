@@ -1,7 +1,7 @@
 # Сборка Linux-пакетов десктопа (.deb, .AppImage) в одноразовом контейнере.
 # docker build -f deploy/linux-build/Dockerfile -t liaper-linux-build . && docker run --rm \
 #   -e TAURI_SIGNING_PRIVATE_KEY -e TAURI_SIGNING_PRIVATE_KEY_PASSWORD -v "$PWD/out:/out" liaper-linux-build
-FROM rust:1.88-bookworm
+FROM rust:1.95-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
       libssl-dev patchelf file xdg-utils curl ca-certificates \
