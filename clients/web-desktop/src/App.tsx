@@ -69,6 +69,7 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { Modal } from './components/Modal';
 import { MessageMenu, type MessageMenuState } from './components/MessageMenu';
 import { Avatar } from './components/Avatar';
+import { LinkifiedText } from './components/LinkifiedText';
 import { Landing } from './components/Landing';
 import { LogoMark } from './components/Logo';
 import { StorageUsage } from './components/StorageUsage';
@@ -93,7 +94,7 @@ import type {
   UserRole,
 } from './types/protocol';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.2.1';
 const runtimeEnv = (import.meta as unknown as { env?: { VITE_CONTROL_URL?: string; DEV?: boolean } }).env;
 const DEFAULT_CONTROL_HTTP = (runtimeEnv?.VITE_CONTROL_URL ||
   ('__TAURI_INTERNALS__' in window ? 'http://127.0.0.1:4000'
@@ -431,7 +432,14 @@ export function App() {
   const [messageMenu, setMessageMenu] = useState<(MessageMenuState & { message: DecryptedChatMessage }) | null>(null);
   const [deletingMessage, setDeletingMessage] = useState<DecryptedChatMessage | null>(null);
   const closeMessageMenu = React.useCallback(() => setMessageMenu(null), []);
-  const chatInputRef = useRef<HTMLInputElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  // Поле сообщения растёт вместе с текстом (до ~8 строк), дальше — прокрутка внутри
+  useEffect(() => {
+    const el = chatInputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, [chatInput]);
 
   const EMOJI_CATEGORIES = [
     {
@@ -3413,7 +3421,7 @@ export function App() {
                                           : 'border border-slate-200 bg-white text-slate-800'
                                       }`}
                                     >
-                                      {m.text}
+                                      <LinkifiedText text={m.text} />
                                     </div>
                                   ) : null}
                                   {m.attachment && token && (
@@ -3617,7 +3625,7 @@ export function App() {
                                     }`}
                                   >
                                     {m.forwarded && <ForwardedLabel forwarded={m.forwarded} onAccent={isMine} />}
-                                    {m.plaintext}
+                                    <LinkifiedText text={m.plaintext} />
                                   </div>
                                 )}
 
@@ -3739,7 +3747,7 @@ export function App() {
                       </div>
                     </div>
                   )}
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-end gap-2">
                     <MediaRecorderBar
                       disabled={!activeChatRoomId || !connected}
                       onReadyAttachment={handleReadyAttachment}
@@ -3747,9 +3755,9 @@ export function App() {
                       onToggleEmoji={() => setShowEmojiPicker((v) => !v)}
                       emojiOpen={showEmojiPicker}
                     />
-                    <input
+                    <textarea
                       ref={chatInputRef}
-                      type="text"
+                      rows={1}
                       disabled={!activeChatRoomId || !connected}
                       placeholder={
                         activeChatRoomId
@@ -3760,7 +3768,15 @@ export function App() {
                       }
                       value={chatInput}
                       onChange={(e) => { setChatInput(e.target.value); if (activeChatRoomId) draftsRef.current[activeChatRoomId] = e.target.value; }}
-                      className="min-w-0 flex-1 rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm focus:border-indigo-500 focus:outline-none disabled:bg-slate-100"
+                      onKeyDown={(e) => {
+                        // Enter — отправить, Shift+Enter — новая строка (во время набора IME Enter не трогаем)
+                        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                          e.preventDefault();
+                          e.currentTarget.form?.requestSubmit();
+                        }
+                      }}
+                      title="Enter — отправить, Shift+Enter — новая строка"
+                      className="max-h-[200px] min-w-0 flex-1 resize-none overflow-y-auto rounded-xl border border-slate-300 px-3.5 py-2.5 text-sm leading-5 focus:border-indigo-500 focus:outline-none disabled:bg-slate-100"
                     />
                     <button
                       type="submit"

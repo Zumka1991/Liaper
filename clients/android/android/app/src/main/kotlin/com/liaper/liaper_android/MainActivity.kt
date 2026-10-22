@@ -312,6 +312,17 @@ class MainActivity : FlutterActivity() {
                     result.success(pending)
                 }
                 "getPushToken" -> fetchPushToken(result)
+                "openUrl" -> {
+                    // Ссылки из чата: только веб-адреса, во внешнем браузере
+                    val uri = Uri.parse(call.argument<String>("url") ?: "")
+                    val opened = (uri.scheme == "https" || uri.scheme == "http") && try {
+                        startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE))
+                        true
+                    } catch (_: Exception) {
+                        false
+                    }
+                    result.success(opened)
+                }
                 "stopRinging" -> {
                     callAlert.stop()
                     result.success(true)

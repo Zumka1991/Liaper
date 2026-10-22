@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Входящие звонки: системное уведомление и привлечение внимания к окну",
+  "description": "Входящие звонки (уведомление, внимание к окну) и ссылки из чата во внешнем браузере",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -10,6 +10,10 @@
     "core:window:allow-unminimize",
     "core:window:allow-show",
     "core:window:allow-is-focused",
-    "notification:default"
+    "notification:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+    }
   ]
 }

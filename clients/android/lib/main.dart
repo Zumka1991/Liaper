@@ -23,6 +23,7 @@ import 'services/lesson_archive.dart';
 import 'services/e2ee_attachments.dart';
 import 'services/pow.dart';
 import 'widgets/liaper_logo.dart';
+import 'widgets/linkified_text.dart';
 
 const SystemUiOverlayStyle kLiaperSystemUiStyle = SystemUiOverlayStyle(
   statusBarColor: Colors.transparent,
@@ -346,6 +347,11 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
       if (pending == 'accept') _acceptIncomingCall();
       if (pending == 'decline') _declineIncomingCall();
     }).catchError((_) => null);
+  }
+
+  // Ссылка из чата — в системном браузере (только http/https, проверяет и native)
+  void _openExternalUrl(String url) {
+    _mediaChannel.invokeMethod('openUrl', {'url': url}).catchError((_) => null);
   }
 
   // FCM-токен устройства: сервер будит им приложение при входящем звонке
@@ -6332,8 +6338,9 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
                                               if (m.forwarded != null)
                                                 _forwardedLabel(
                                                     m.forwarded!, isMe),
-                                              Text(
+                                              LinkifiedText(
                                                 m.text,
+                                                onOpen: _openExternalUrl,
                                                 style: TextStyle(
                                                   fontSize: 14,
                                                   color: isMe
@@ -6446,8 +6453,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
                   child: TextField(
                     controller: _chatInputCtrl,
                     enabled: targetRoomId != null && _wsConnected,
-                    textInputAction: TextInputAction.send,
-                    onSubmitted: (_) => _sendChatMessage(),
+                    // Многострочный ввод: вставленный текст сохраняет переносы,
+                    // поле растёт до 6 строк; отправка — кнопкой
+                    keyboardType: TextInputType.multiline,
+                    textInputAction: TextInputAction.newline,
+                    minLines: 1,
+                    maxLines: 6,
                     decoration: InputDecoration(
                       hintText: targetRoomId == null
                           ? 'Выберите контакт или начните урок'
@@ -6455,6 +6466,8 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen>
                                   _selectedChatContact != null
                               ? 'Сообщение для @${_selectedChatContact!['username']}...'
                               : 'Сообщение или подпись...',
+                      // Подсказка в одну строку, иначе многострочное поле растёт уже пустым
+                      hintMaxLines: 1,
                       isDense: true,
                       filled: true,
                       fillColor: const Color(0xFFF8FAFC),

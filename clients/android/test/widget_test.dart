@@ -114,7 +114,7 @@ void main() {
     expect(find.text('Архив (0)'), findsOneWidget);
     expect(find.text('Чужой архив'), findsNothing);
     final composer = find.byWidgetPredicate(
-        (w) => w is TextField && w.textInputAction == TextInputAction.send);
+        (w) => w is TextField && w.keyboardType == TextInputType.multiline);
     expect(tester.widget<TextField>(composer).enabled, isFalse);
     await tester.tap(find.text('Профиль'));
     await tester.pumpAndSettle();
