@@ -44,6 +44,7 @@ android {
         release {
             // Без key.properties релиз подписывается debug-ключом: такой APK не для распространения
             signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }

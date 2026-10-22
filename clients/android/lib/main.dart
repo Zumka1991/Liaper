@@ -2156,6 +2156,18 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   // Инициализация сессии и подключение к серверу управления
   // ===========================================================================
   Future<void> _initIdentityAndSession() async {
+    try {
+      await _initIdentityAndSessionUnsafe()
+          .timeout(const Duration(seconds: 20));
+    } catch (e) {
+      if (!mounted) return;
+      // Без ключей устройства вход невозможен — показываем причину вместо серой кнопки
+      setState(() => _authError =
+          'Не удалось подготовить ключи шифрования: $e. Перезапустите приложение.');
+    }
+  }
+
+  Future<void> _initIdentityAndSessionUnsafe() async {
     final prefs = await SharedPreferences.getInstance();
     final savedUrl = prefs.getString('liaper_server_url');
     if (savedUrl != null && savedUrl.isNotEmpty) {
