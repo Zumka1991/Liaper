@@ -3,7 +3,10 @@ package com.liaper.liaper_android
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -58,10 +61,39 @@ class MainActivity : FlutterActivity() {
     private var pendingPermResult: MethodChannel.Result? = null
     private var pendingFileResult: MethodChannel.Result? = null
 
+    // Рингтон, вибрация и уведомление о входящем звонке
+    private val callAlert by lazy { IncomingCallAlert(this) }
+    private val declineReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            callAlert.stop()
+            methodChannel?.invokeMethod("onCallNotificationAction", "decline")
+        }
+    }
+
     companion object {
         private const val REQ_PERMISSIONS = 1001
         private const val REQ_PICK_FILE = 1002
+        private const val REQ_NOTIFICATIONS = 1003
         private const val MAX_PLAIN_FILE_BYTES = 134_217_712L // 128 MiB - 16B GCM tag
+    }
+
+    override fun onResume() {
+        super.onResume()
+        callAlert.onForegroundChanged(true)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        callAlert.onForegroundChanged(false)
+    }
+
+    // Нажатия в уведомлении о звонке (activity singleTop — приходят сюда)
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == IncomingCallAlert.ACTION_ACCEPT) {
+            callAlert.stop()
+            methodChannel?.invokeMethod("onCallNotificationAction", "accept")
+        }
     }
 
     override fun onPostResume() {
@@ -80,6 +112,10 @@ class MainActivity : FlutterActivity() {
 
         val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
         methodChannel = channel
+        ContextCompat.registerReceiver(
+            this, declineReceiver, IntentFilter(IncomingCallAlert.ACTION_DECLINE),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
 
         channel.setMethodCallHandler { call, result ->
             when (call.method) {
@@ -205,6 +241,26 @@ class MainActivity : FlutterActivity() {
                     } else {
                         result.success(createFallbackSquareJpeg(targetSize, quality))
                     }
+                }
+                "startRinging" -> {
+                    callAlert.start(
+                        call.argument<String>("callerName") ?: "",
+                        call.argument<String>("roomTitle") ?: "",
+                        call.argument<Boolean>("withVideo") ?: false
+                    )
+                    result.success(true)
+                }
+                "stopRinging" -> {
+                    callAlert.stop()
+                    result.success(true)
+                }
+                "requestNotificationPermission" -> {
+                    if (android.os.Build.VERSION.SDK_INT >= 33 &&
+                        ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                    ) {
+                        ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+                    }
+                    result.success(true)
                 }
                 else -> result.notImplemented()
             }
@@ -643,6 +699,11 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        callAlert.stop()
+        try {
+            unregisterReceiver(declineReceiver)
+        } catch (_: Exception) {
+        }
         stopNoteAudioCapture(cancel = true)
         stopWavPlayer()
         stopAudioEngine()

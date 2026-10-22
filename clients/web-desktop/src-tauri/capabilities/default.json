@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Входящие звонки: системное уведомление и привлечение внимания к окну",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-request-user-attention",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "core:window:allow-show",
+    "core:window:allow-is-focused",
+    "notification:default"
+  ]
+}

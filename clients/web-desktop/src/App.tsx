@@ -76,6 +76,7 @@ import { downloadAndDecryptAttachment, uploadEncryptedAttachment } from './servi
 import { deriveArchiveKey, syncLessonArchives, mergeArchiveLists, type LessonArchive } from './services/lessonArchive';
 import { SfuMediaNodeClient } from './services/webrtcSfu';
 import { solvePow } from './services/pow';
+import { primeIncomingCallAlerts, startIncomingCallAlert, stopIncomingCallAlert } from './services/incomingCallAlert';
 import type {
   AppPlatform,
   AppReleaseManifest,
@@ -509,6 +510,26 @@ export function App() {
     };
     try { localStorage.setItem(VIEW_STORAGE_KEY, JSON.stringify(view)); } catch { /* не критично */ }
   }, [currentUser, panel, chatMode, selectedChatContact, selectedArchiveId]);
+
+  // Входящий звонок: рингтон, системное уведомление, мигание окна/вкладки
+  const hasUser = currentUser !== null;
+  useEffect(() => {
+    if (hasUser) primeIncomingCallAlerts();
+  }, [hasUser]);
+  useEffect(() => {
+    if (!incomingCall) {
+      stopIncomingCallAlert();
+      return;
+    }
+    startIncomingCallAlert({
+      key: incomingCall.room.id,
+      callerName: incomingCall.caller.display_name || `@${incomingCall.caller.username}`,
+      roomTitle: incomingCall.room.title,
+      withVideo: incomingCall.withVideo,
+    });
+  }, [incomingCall]);
+  useEffect(() => () => stopIncomingCallAlert(), []);
+
   // Ширина боковых панелей (перетаскиванием), запоминается на устройстве
   const [panelWidths, setPanelWidths] = useState<{ left: number; right: number }>(() => {
     try {

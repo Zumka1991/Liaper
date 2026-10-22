@@ -296,7 +296,29 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
   List<dynamic> _incomingRequests = [];
   List<dynamic> _outgoingRequests = [];
   Map<String, dynamic>? _currentRoom;
-  Map<String, dynamic>? _incomingCall;
+  Map<String, dynamic>? _incomingCallData;
+  bool _notificationPermissionAsked = false;
+
+  Map<String, dynamic>? get _incomingCall => _incomingCallData;
+  // Любая смена входящего звонка включает/выключает рингтон, вибрацию и уведомление
+  set _incomingCall(Map<String, dynamic>? call) {
+    final prevId = _incomingCallData?['room']?['id']?.toString();
+    final nextId = call?['room']?['id']?.toString();
+    _incomingCallData = call;
+    if (prevId == nextId) return;
+    if (call == null) {
+      _mediaChannel.invokeMethod('stopRinging').catchError((_) => null);
+      return;
+    }
+    final caller = call['caller'] as Map<String, dynamic>? ?? const {};
+    final displayName = (caller['display_name'] ?? '').toString();
+    _mediaChannel.invokeMethod('startRinging', {
+      'callerName':
+          displayName.isNotEmpty ? displayName : '@${caller['username'] ?? ''}',
+      'roomTitle': (call['room']?['title'] ?? '').toString(),
+      'withVideo': call['with_video'] == true,
+    }).catchError((_) => null);
+  }
   // Урок этого аккаунта, который сейчас идёт на другом устройстве
   Map<String, dynamic>? _otherDeviceCall;
   // true — это не другое устройство, а урок, из которого выбило перезапуском приложения
@@ -572,6 +594,13 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
         if (raw is Uint8List) {
           _sendAudioPcmToSfu(raw);
         }
+      } else if (call.method == 'onCallNotificationAction') {
+        if (_incomingCall == null) return;
+        if (call.arguments == 'accept') {
+          _acceptIncomingCall();
+        } else if (call.arguments == 'decline') {
+          _declineIncomingCall();
+        }
       }
     });
     _initIdentityAndSession();
@@ -585,6 +614,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     _noteFrameCaptureTimer?.cancel();
     _previewPlayTimer?.cancel();
     _token = null;
+    _mediaChannel.invokeMethod('stopRinging').catchError((_) => null);
     _mediaChannel.setMethodCallHandler(null);
     _stopNoteCameraStream();
     _stopLocalMediaAndSfu();
@@ -2244,6 +2274,12 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     switch (type) {
       case 'welcome':
         _reconnectFailures = 0;
+        if (!_notificationPermissionAsked) {
+          _notificationPermissionAsked = true;
+          _mediaChannel
+              .invokeMethod('requestNotificationPermission')
+              .catchError((_) => null);
+        }
         setState(() {
           _wsConnected = true;
           _currentUser = payload?['self_profile'] as Map<String, dynamic>?;
@@ -3442,10 +3478,42 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
     });
   }
 
+  void _acceptIncomingCall() {
+    final room = _incomingCall!['room'] as Map<String, dynamic>;
+    final withVideo = _incomingCall!['with_video'] == true;
+    setState(() {
+      _micEnabled = true;
+      _camEnabled = withVideo;
+      _incomingCall = null;
+      _selectedTabIndex = 1;
+    });
+    _sendWs({
+      'type': 'join_room',
+      'payload': {
+        'room_id': room['id'],
+        'audio_enabled': true,
+        'video_enabled': withVideo,
+      },
+    });
+  }
+
+  void _declineIncomingCall() {
+    final room = _incomingCall!['room'] as Map<String, dynamic>;
+    _sendWs({
+      'type': 'decline_call',
+      'payload': {
+        'room_id': room['id'],
+        'reason': 'busy',
+      },
+    });
+    setState(() {
+      _incomingCall = null;
+    });
+  }
+
   Widget _buildIncomingCallBanner() {
     final caller = _incomingCall!['caller'] as Map<String, dynamic>;
     final room = _incomingCall!['room'] as Map<String, dynamic>;
-    final withVideo = _incomingCall!['with_video'] == true;
 
     return Container(
       margin: const EdgeInsets.all(12),
@@ -3509,22 +3577,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
             children: [
               Expanded(
                 child: FilledButton.icon(
-                  onPressed: () {
-                    setState(() {
-                      _micEnabled = true;
-                      _camEnabled = withVideo;
-                      _incomingCall = null;
-                      _selectedTabIndex = 1;
-                    });
-                    _sendWs({
-                      'type': 'join_room',
-                      'payload': {
-                        'room_id': room['id'],
-                        'audio_enabled': true,
-                        'video_enabled': withVideo,
-                      },
-                    });
-                  },
+                  onPressed: _acceptIncomingCall,
                   style: FilledButton.styleFrom(
                     backgroundColor: const Color(0xFF10B981),
                     foregroundColor: Colors.white,
@@ -3540,18 +3593,7 @@ class _LiaperHomeScreenState extends State<LiaperHomeScreen> {
               const SizedBox(width: 10),
               Expanded(
                 child: OutlinedButton.icon(
-                  onPressed: () {
-                    _sendWs({
-                      'type': 'decline_call',
-                      'payload': {
-                        'room_id': room['id'],
-                        'reason': 'busy',
-                      },
-                    });
-                    setState(() {
-                      _incomingCall = null;
-                    });
-                  },
+                  onPressed: _declineIncomingCall,
                   style: OutlinedButton.styleFrom(
                     foregroundColor: Colors.white,
                     side: const BorderSide(color: Color(0xFF475569)),
